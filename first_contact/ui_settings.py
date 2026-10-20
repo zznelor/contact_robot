@@ -213,16 +213,20 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 <label class="field"><span>Часовой пояс</span><select name="tz">{opts}</select></label></div>
 <button class="primary">Сохранить</button></form>"""
 
-    @router.get("/settings", response_class=HTMLResponse)
-    async def settings(request: Request, msg: str = "", user=Depends(admin_dep)):
+    async def settings_page(request: Request, user, msg: str = "", new_link: str = ""):
         base = ctx.public_url(request)
         toc = "".join(f'<a href="#{a}">{t}</a>' for a, t in (
             ("robot", "Робот"), ("bitrix", "Битрикс"), ("orbita", "Орбита"), ("messages", "Сообщения"),
-            ("schedule", "Расписание")))
+            ("schedule", "Расписание"), ("team", "Команда")))
         body = (f'<h1>Настройки</h1><p class="muted">Изменения действуют сразу, перезапуск не нужен.</p>'
                 f'<div class="toc">{toc}</div>{await robot_section()}{await bitrix_section(base)}'
-                f'{await orbita_section(base)}{messages_section()}{schedule_section()}')
+                f'{await orbita_section(base)}{messages_section()}{schedule_section()}'
+                f'{team_section(user, new_link)}')
         return ctx.page(user, "Настройки", "settings", body, msg)
+
+    @router.get("/settings", response_class=HTMLResponse)
+    async def settings(request: Request, msg: str = "", user=Depends(admin_dep)):
+        return await settings_page(request, user, msg)
 
     # ---------- сохранение ----------
 
@@ -398,7 +402,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 
     # ---------- команда ----------
 
-    def team_page(user, msg: str = "", new_link: str = ""):
+    def team_section(user, new_link: str = "") -> str:
         rows = "".join(
             f'<tr><td>{e(u["email"])}</td><td>{e(u["name"])}</td><td>{ROLES[u["role"]]}</td>'
             f'<td class="num">{u["created_at"][:10]}</td><td>' +
@@ -412,35 +416,36 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         link = (f'<div class="card"><b>Ссылка-приглашение</b><p class="hint">Отправьте её человеку. Она показывается '
                 f'один раз, действует 7 дней и только для одной учётной записи.</p><p><code>{e(new_link)}</code></p></div>'
                 if new_link else "")
-        body = f"""<h1>Команда</h1><p class="muted">Кто может входить в панель. Администратор видит и меняет
+        return f"""<div class="card" id="team">
+<h2 style="margin-top:0">Команда</h2><p class="hint">Кто может входить в панель. Администратор видит и меняет
 настройки, оператор — только сделки и журнал.</p>{link}
 <div class="wrap"><table><tr><th>Почта</th><th>Имя</th><th>Роль</th><th>С</th><th></th></tr>{rows}</table></div>
-<h2>Пригласить</h2><form class="card bar" method="post" action="/team/invite">
+<h3>Пригласить</h3><form class="bar" method="post" action="/team/invite">
 <select name="role"><option value="operator">оператор</option><option value="admin">администратор</option></select>
-<button class="primary">Создать ссылку-приглашение</button></form>{inv}"""
-        return ctx.page(user, "Команда", "team", body, msg)
+<button class="primary">Создать ссылку-приглашение</button></form>{inv}</div>"""
 
-    @router.get("/team", response_class=HTMLResponse)
-    async def team(msg: str = "", user=Depends(admin_dep)):
-        return team_page(user, msg)
+    @router.get("/team")
+    async def team(user=Depends(admin_dep)):
+        return go("/settings#team", "")   # старый адрес отдельной страницы
 
     @router.post("/team/invite", response_class=HTMLResponse)
     async def invite(request: Request, role: str = Form("operator"), user=Depends(admin_dep)):
         if role not in ROLES:
-            return go("/team", "!Неизвестная роль")
+            return go("/settings#team", "!Неизвестная роль")
         token = users.new_invite(role, user["id"])
         worker.event(None, "выдано приглашение", f"{role}, {user['email']}")
-        return team_page(user, new_link=f"{ctx.public_url(request)}/invite/{token}")
+        return await settings_page(request, user, "Ссылка-приглашение создана — она внизу, в разделе «Команда»",
+                                   new_link=f"{ctx.public_url(request)}/invite/{token}")
 
     @router.post("/team/{user_id}/delete")
     async def delete_user(user_id: int, user=Depends(admin_dep)):
         target = users.by_id(user_id)
         if target is None or target["id"] == user["id"]:
-            return go("/team", "!Нельзя удалить себя")
+            return go("/settings#team", "!Нельзя удалить себя")
         if target["role"] == "admin" and users.admins() <= 1:
-            return go("/team", "!Это последний администратор")
+            return go("/settings#team", "!Это последний администратор")
         users.delete(user_id)
         worker.event(None, "пользователь удалён", f"{target['email']} ({user['email']})")
-        return go("/team", f"{target['email']} удалён")
+        return go("/settings#team", f"{target['email']} удалён")
 
     return router

@@ -157,6 +157,11 @@ check(db.deal(41)["status"] == "replied", "«клиент ответил» вр�
 r = c.post("/team/invite", data={"role": "operator"}, headers=H)
 link = re.search(r"/invite/([\w-]+)", r.text).group(1)
 check(len(link) > 20, "ссылка-приглашение выдана")
+check('id="team"' in r.text and "разделе «Команда»" in r.text, "приглашение показано в настройках, в разделе «Команда»")
+check('href="/team"' not in c.get("/").text and 'href="#team"' in c.get("/settings").text,
+      "«Команда» — раздел настроек, а не пункт верхнего меню")
+r = c.get("/team", follow_redirects=False)
+check(r.status_code == 303 and r.headers["location"] == "/settings#team", "старый адрес /team ведёт в настройки")
 op = TestClient(app)
 r = op.post(f"/invite/{link}", data={"email": "op@x.ru", "password": "operator1"}, headers=H, follow_redirects=False)
 check(users.by_email("op@x.ru")["role"] == "operator", "оператор зарегистрирован по приглашению")

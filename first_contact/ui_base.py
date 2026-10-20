@@ -173,7 +173,7 @@ class Ctx:
             "".join(f'<span class="chip alert">{e(t)}</span>' for t in alerts)
         links = [("/", "deals", "Сделки"), ("/events", "events", "Журнал"), ("/status", "status", "Проверка связи")]
         if user["role"] == "admin":
-            links += [("/settings", "settings", "Настройки"), ("/team", "team", "Команда")]
+            links += [("/settings", "settings", "Настройки")]
         nav = "".join(f'<a href="{h}" class="{"on" if k == active else ""}">{t}</a>' for h, k, t in links)
         me = (f'<div class="me"><a href="/account">{e(user["email"])}</a>'
               f'<form method="post" action="/logout" class="inline"><button>Выйти</button></form></div>')
