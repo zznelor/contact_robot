@@ -133,9 +133,18 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         status = ('<span class="badge b-ok">подключена</span>' if s.orbita_api_key
                   else '<span class="badge b-warn">не подключена</span>')
         disconnect = _disconnect_btn("/settings/orbita/disconnect", "Орбиту") if s.orbita_api_key else ""
-        checks = "".join(
-            f'<label class="check"><input type="checkbox" name="channels" value="{c}" '
-            f'{"checked" if c in s.orbita_channels else ""}> {CHANNEL_RU[c]}</label>' for c in CHANNELS)
+        # Строки в текущем порядке поиска, выключенные — в конце
+        rows = [*s.orbita_channels, *(c for c in CHANNELS if c not in s.orbita_channels)]
+
+        def place_select(c: str) -> str:
+            cur = s.orbita_channels.index(c) + 1 if c in s.orbita_channels else 0
+            opts = "".join(f'<option value="{n}" {"selected" if n == cur else ""}>{n}-й</option>'
+                           for n in range(1, len(CHANNELS) + 1))
+            off = f'<option value="" {"selected" if not cur else ""}>не искать</option>'
+            return (f'<label class="check" style="align-items:center"><select name="place_{c}" style="width:auto">'
+                    f'{opts}{off}</select> {CHANNEL_RU[c]}</label>')
+        checks = "".join(place_select(c) for c in rows)
+        order_now = " → ".join(CHANNEL_RU[c] for c in s.orbita_channels) or "не выбрано"
         return f"""<form class="card" id="orbita" method="post" action="/settings/orbita">
 <h2 style="margin-top:0">Орбита</h2><p>{status}</p>{live}
 <label class="field"><span>Ключ API</span>
@@ -143,8 +152,9 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 <span class="hint">Кабинет Орбиты → Разработчикам → Ключи API. Права: «Диалоги: чтение» (dialogs:read),
 «Ответ в существующий диалог» (messages:send), «Первое сообщение новому человеку» (dialogs:start).</span></label>
 <div class="field"><span>Где искать клиента</span>{checks}
-<span class="hint">Робот пробует мессенджеры по порядку: WhatsApp → Max → Telegram, пишет в первый, где нашёлся номер.
-Telegram последний: Орбита разрешает искать в нём не больше 30 номеров в сутки.</span></div>
+<span class="hint">Сейчас: {e(order_now)}. Робот ищет номер в мессенджерах по этому порядку и пишет в первый,
+где нашёл. «Не искать» — мессенджер пропускается. Telegram лучше ставить последним: Орбита разрешает искать
+в нём не больше 30 номеров в сутки.</span></div>
 <h3>Вебхуки Орбиты (рекомендуется)</h3>
 <p class="hint">Без них робот узнаёт об ответе клиента только при проверке истории (раз в 5 минут, если включён
 ответ по шаблону, иначе — перед напоминанием). Кабинет Орбиты → Разработчикам → Вебхуки → Добавить,
@@ -261,12 +271,17 @@ Telegram последний: Орбита разрешает искать в н�
 
     @router.post("/settings/orbita")
     async def save_orbita(api_key: str = Form(""), webhook_secret: str = Form(""), webhook_secret_clear: str = Form(""),
-                          channels: list[str] = Form([]), user=Depends(admin_dep)):
+                          place_whatsapp: str = Form(""), place_max: str = Form(""), place_telegram: str = Form(""),
+                          user=Depends(admin_dep)):
         s = worker.s
         changes: dict = {}
-        chosen = [c for c in CHANNELS if c in channels]
-        if not chosen:
-            return go("/settings#orbita", "!Отметьте хотя бы один мессенджер")
+        places = {"whatsapp": place_whatsapp, "max": place_max, "telegram": place_telegram}
+        picked = {c: int(p) for c, p in places.items() if p.strip().isdigit()}
+        if not picked:
+            return go("/settings#orbita", "!Выберите хотя бы один мессенджер")
+        if len(set(picked.values())) < len(picked):
+            return go("/settings#orbita", "!У двух мессенджеров одно место в очереди — поставьте разные")
+        chosen = sorted(picked, key=picked.get)
         changes["orbita_channels"] = chosen
         api_key = api_key.strip()
         if api_key:

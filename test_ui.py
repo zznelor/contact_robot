@@ -94,15 +94,24 @@ c.post("/settings/bitrix", data={"category": "3", "stage": "NO_MESSENGER"}, head
 check(s.deal_category_id == "3" and s.no_messenger_stage == "", "смена воронки сбрасывает этап")
 c.post("/settings/bitrix", data={"category": "3", "stage": "C3:LOST"}, headers=H)
 check(s.no_messenger_stage == "C3:LOST", "этап новой воронки выбран")
-r = c.post("/settings/orbita", data={"api_key": "bad", "channels": ["whatsapp"]}, headers=H, follow_redirects=False)
+r = c.post("/settings/orbita", data={"api_key": "bad", "place_whatsapp": "1"}, headers=H, follow_redirects=False)
 check(not s.orbita_api_key, "ключ, который Орбита не приняла, не сохранён")
-c.post("/settings/orbita", data={"api_key": "orb_pk_secret123456", "channels": ["whatsapp", "telegram"],
+c.post("/settings/orbita", data={"api_key": "orb_pk_secret123456", "place_whatsapp": "1", "place_telegram": "2",
                                  "webhook_secret": "whsec_1"}, headers=H)
 check(s.orbita_api_key == "orb_pk_secret123456" and s.orbita_channels == ["whatsapp", "telegram"]
       and s.orbita_webhook_secret == "whsec_1", "Орбита: ключ, каналы, секрет вебхука")
 r = c.get("/settings")
 check("orb_pk_secret123456" not in r.text and "orb_pk_sec…" in r.text, "ключ Орбиты показан только началом")
-c.post("/settings/orbita", data={"channels": ["whatsapp"], "webhook_secret_clear": "1"}, headers=H)
+c.post("/settings/orbita", data={"place_telegram": "1", "place_max": "2", "place_whatsapp": "3"}, headers=H)
+check(s.orbita_channels == ["telegram", "max", "whatsapp"], "порядок мессенджеров задаётся местами")
+r = c.get("/settings")
+check("Сейчас: Telegram → Max → WhatsApp" in r.text, "текущий порядок показан в панели")
+c.post("/settings/orbita", data={"place_telegram": "1", "place_max": "1"}, headers=H)
+check(s.orbita_channels == ["telegram", "max", "whatsapp"], "одинаковые места не сохраняются")
+c.post("/settings/orbita", data={}, headers=H)
+check(s.orbita_channels == ["telegram", "max", "whatsapp"], "все «не искать» не сохраняются")
+c.post("/settings/orbita", data={"place_whatsapp": "1", "webhook_secret_clear": "1"}, headers=H)
+check(s.orbita_channels == ["whatsapp"], "«не искать» убирает мессенджер")
 check(s.orbita_api_key == "orb_pk_secret123456" and s.orbita_webhook_secret == "", "пустое поле не стирает ключ, «стереть» стирает секрет")
 check(config.load(db).orbita_api_key == "orb_pk_secret123456", "настройки сохранены в базе")
 

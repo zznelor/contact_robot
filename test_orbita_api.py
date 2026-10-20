@@ -66,6 +66,13 @@ r = run(api.send_first("+7", "t", "k1"))
 check(r.status == "sent" and r.channel == "max", "нет в WhatsApp → написали в Max")
 check(not any(c[3] and c[3].get("channel") == "telegram" for c in calls), "telegram не подключён — не трогаем")
 
+calls.clear()
+api_max_first = OrbitaAPI("https://x/api/public/v1", "k", ["max", "whatsapp"])
+mock(make({"max": nf("max_not_found"), "whatsapp": (201, {"dialog": {"id": 8}})}))
+r = run(api_max_first.send_first("+7", "t", "k-order"))
+tried = [c[3]["channel"] for c in calls if c[1].endswith("/dialogs")]
+check(tried == ["max", "whatsapp"] and r.channel == "whatsapp", "порядок из настроек: сначала Max, потом WhatsApp")
+
 mock(make({"whatsapp": nf("not_on_whatsapp"), "max": nf("max_not_found")}))
 check(run(api.send_first("+7", "t", "k2")).status == "no_messenger", "нигде не найден → no_messenger")
 
