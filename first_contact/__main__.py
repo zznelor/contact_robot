@@ -20,7 +20,7 @@ from datetime import date
 from pathlib import Path
 
 from . import config
-from .auth import Users, password_problem
+from .auth import Users, email_problem, password_problem
 from .db import DB
 from .worker import Worker
 
@@ -38,7 +38,7 @@ async def check(w: Worker) -> None:
     if not w.bitrix:
         print("  не подключён (Настройки → Битрикс)")
     else:
-        cat = s.deal_category_id if s.deal_category_id is not None else "0"
+        cat = s.category
         stages = dict(await w.bitrix.stages(cat))
         print(f"  {s.portal}, воронка {cat}, этапов {len(stages)}")
         print(f"  этап «Не нашёл мессенджер»: "
@@ -91,6 +91,9 @@ def main() -> None:
         code = users.setup_code()
         print(f"Код первого входа: {code}" if code else "Администратор уже создан — код не нужен.")
     elif cmd == "create-admin" and len(args) > 1:
+        if problem := email_problem(args[1]):
+            print(problem)
+            sys.exit(1)
         if users.by_email(args[1]):
             print("Такой пользователь уже есть. Новый пароль: reset-password")
             sys.exit(1)
@@ -121,8 +124,10 @@ def main() -> None:
         import uvicorn
         from .app import create_app
         port = int(args[1]) if len(args) > 1 else w.env.port
-        # proxy_headers: за Caddy адрес клиента и https берём из X-Forwarded-*
-        uvicorn.run(create_app(w), host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
+        # proxy_headers: за Caddy адрес клиента и https берём из X-Forwarded-* — но только от доверенных адресов.
+        # По умолчанию слушаем только сам компьютер; в Docker HOST=0.0.0.0 (см. Dockerfile)
+        uvicorn.run(create_app(w), host=w.env.host, port=port, proxy_headers=True,
+                    forwarded_allow_ips=w.env.forwarded_allow_ips)
     else:
         print(__doc__)
 

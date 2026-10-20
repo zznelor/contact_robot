@@ -52,9 +52,10 @@ class OrbitaAPI:
             raise OrbitaError(f"{method} {path}: {type(e).__name__}: {e}") from e
         if r.status_code >= 400:
             try:
-                detail = r.json().get("detail")
+                body = r.json()
             except ValueError:
-                detail = r.text[:300]
+                body = None
+            detail = body.get("detail") if isinstance(body, dict) else r.text[:300]
             code = detail.get("code", "") if isinstance(detail, dict) else ""
             raise OrbitaAPIError(r.status_code, code, detail)
         return r.status_code, (r.json() if r.content else {})
@@ -101,7 +102,7 @@ class OrbitaAPI:
             if status == 202:
                 return FirstSendResult("pending", None, ch, data, request_key=data.get("request_key"))
             dialog = (data.get("dialog") or {}).get("id")
-            return FirstSendResult("sent", str(dialog), ch, data)
+            return FirstSendResult("sent", str(dialog) if dialog is not None else None, ch, data)
 
         if broken:
             # Хотя бы один канал не смог проверить номер — не утверждаем, что мессенджера нет

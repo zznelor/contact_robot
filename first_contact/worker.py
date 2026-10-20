@@ -32,6 +32,10 @@ REPLY_POLL = timedelta(minutes=5)
 REPLY_POLL_DAYS = timedelta(days=3)
 
 
+# Какие статусы можно вернуть в работу кнопкой «Повторить»
+RETRYABLE = {"error", "needs_check", "skipped", "no_messenger", "no_phone"}
+
+
 class UnknownOutcome(Exception):
     """Отправка могла уйти, а могла и нет. Повторять нельзя — нужен человек."""
 
@@ -105,7 +109,7 @@ class Worker:
     STEPS = {
         "poll": "Забрать новые сделки из Битрикса",
         "first": "Написать первым по новым сделкам",
-        "followup": "Отправить напоминания, срок которых наступил",
+        "followup": "Напоминания и итог по тем, кто молчит",
         "pending": "Проверить неподтверждённые отправки",
         "replies": "Проверить ответы клиентов в истории",
         "auto_reply": "Отправить ответы по шаблону",
@@ -136,6 +140,8 @@ class Worker:
         elif step == "followup":
             for row in self.db.by_status("sent_first"):
                 await self._guarded(row["deal_id"], self.followup)
+            for row in self.db.by_status("sent_followup"):
+                await self._guarded(row["deal_id"], self.after_followup)
         elif step == "pending":
             for row in self.db.by_status("pending_first"):
                 if datetime.now(timezone.utc) - _ts(row["updated_at"]) > PENDING_TIMEOUT:
@@ -169,12 +175,13 @@ class Worker:
             self.db.put("last_deal_id", start)
             self.event(None, "старт", f"сделки до ID {start} включительно не трогаем")
             return
-        for deal_id in await self.bitrix.deal_ids_after(int(last), self.s.deal_category_id):
+        for deal_id in await self.bitrix.deal_ids_after(int(last), self.s.category):
             if self.db.add_deal(deal_id):
                 self.event(deal_id, "новая сделка (опрос)")
             self.db.put("last_deal_id", deal_id)
 
     async def _guarded(self, deal_id: int, step) -> None:
+        before = self.db.deal(deal_id)
         try:
             await step(deal_id)
         except UnknownOutcome as e:
@@ -189,6 +196,36 @@ class Worker:
             self.event(deal_id, "ошибка", f"попытка {attempts}: {e}")
             if status == "error":
                 await self.note(deal_id, f"Не смог обработать заявку после {attempts} попыток: {e}")
+        else:
+            # Сделка продвинулась — прошлые сбои не должны копиться до «ошибки» на следующем шаге
+            after = self.db.deal(deal_id)
+            if before and after and after["attempts"] and after["status"] != before["status"]:
+                self.db.update(deal_id, attempts=0)
+
+    def retry(self, deal_id: int, who: str) -> str:
+        """«Повторить» из панели: вернуть сделку туда, где робот остановился. Возвращает новый статус.
+
+        Первое сообщение не ушло — снова в очередь, с новым ключом идемпотентности (иначе Орбита
+        вернёт прежний исход) и без проверки этапа «Не нашёл мессенджер» (его поставил сам робот).
+        Ушло — ждём напоминание или итог; клиент ответил — ответ по шаблону, если он ещё нужен.
+        """
+        row = self.db.deal(deal_id)
+        if row is None or row["status"] not in RETRYABLE:
+            raise ValueError("эту сделку сейчас нельзя повторить")
+        if row["client_replied_at"]:
+            status = "replied"
+        elif row["followup_sent_at"]:
+            status = "sent_followup"
+        elif row["first_sent_at"]:
+            status = "sent_first"
+        else:
+            status = "new"
+        fields: dict = {"status": status, "attempts": 0, "last_error": None}
+        if status == "new":
+            fields.update(retry_n=(row["retry_n"] or 0) + 1, retried_at=now())
+        self.db.update(deal_id, **fields)
+        self.event(deal_id, "вручную: повторить", f"{who} → {status}")
+        return status
 
     # ---------- первое сообщение и «нет мессенджера» ----------
 
@@ -196,7 +233,9 @@ class Worker:
         row = self.db.deal(deal_id)
         if row is None or row["status"] != "new":
             return
-        if datetime.now(timezone.utc) - _ts(row["created_at"]) > MAX_AGE:
+        # 48 ч — от появления заявки или от ручного повтора, что позже
+        seen = max(filter(None, (_ts(row["created_at"]), _ts(row["retried_at"]))))
+        if datetime.now(timezone.utc) - seen > MAX_AGE:
             self.db.update(deal_id, status="skipped", last_error="заявка старше 48 ч")
             self.event(deal_id, "пропущена", "заявка старше 48 ч")
             return
@@ -204,11 +243,12 @@ class Worker:
             return
 
         deal = await self.bitrix.get_deal(deal_id)
-        if self.s.deal_category_id is not None and deal.category_id != str(self.s.deal_category_id):
+        if deal.category_id != self.s.category:
             self.db.update(deal_id, status="skipped", last_error=f"другая воронка ({deal.category_id})")
             self.event(deal_id, "пропущена", f"другая воронка ({deal.category_id})")
             return
-        if deal.stage_semantic != "P" or deal.stage_id == self.s.no_messenger_stage:
+        manual = bool(row["retry_n"])      # человек нажал «Повторить» — этап робота не помеха
+        if deal.stage_semantic != "P" or (deal.stage_id == self.s.no_messenger_stage and not manual):
             self.db.update(deal_id, status="skipped", last_error=f"этап {deal.stage_id}")
             self.event(deal_id, "пропущена", f"этап {deal.stage_id}")
             return
@@ -227,9 +267,10 @@ class Worker:
             self.event(deal_id, "DRY_RUN: отправил бы первое", f"{phones} → {text!r}")
             return
 
+        suffix = f"-r{row['retry_n']}" if row["retry_n"] else ""
         for phone in phones:
             try:
-                res = await self.orbita.send_first(phone, text, f"deal-{deal_id}-first-{phone}", name or None)
+                res = await self.orbita.send_first(phone, text, f"deal-{deal_id}-first-{phone}{suffix}", name or None)
             except OrbitaError:
                 raise                                   # Орбита явно отказала — можно повторить
             except Exception as e:                      # непредвиденный сбой посреди отправки
@@ -278,6 +319,10 @@ class Worker:
         if self.s.followup_on and not self.in_window():
             return
 
+        if not row["dialog_id"]:
+            self.db.update(deal_id, status="needs_check", last_error="нет номера диалога Орбиты")
+            self.event(deal_id, "не понял, ответил ли клиент", "нет номера диалога")
+            return
         deal = await self.bitrix.get_deal(deal_id)
         if deal.stage_semantic != "P":
             self.db.update(deal_id, status="skipped", last_error=f"сделка закрыта ({deal.stage_id})")
@@ -311,6 +356,26 @@ class Worker:
                        followup_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         self.event(deal_id, "напоминание отправлено")
         await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч — отправил напоминание.")
+
+    async def after_followup(self, deal_id: int) -> None:
+        """Через followup_hours после напоминания — итог: ответил или нет. Иначе статус висит вечно."""
+        row = self.db.deal(deal_id)
+        if row is None or row["status"] != "sent_followup" or not row["followup_sent_at"]:
+            return
+        if datetime.now(timezone.utc) < _ts(row["followup_sent_at"]) + timedelta(hours=self.s.followup_hours):
+            return
+        replied = client_replied(await self.orbita.history(row["dialog_id"]), _ts(row["first_sent_at"])) \
+            if row["dialog_id"] else None
+        if replied:
+            await self._client_replied(deal_id, "по истории")
+            return
+        if replied is None:
+            self.db.update(deal_id, status="needs_check", last_error="не смог прочитать историю диалога")
+            self.event(deal_id, "не понял, ответил ли клиент на напоминание")
+            return
+        self.db.update(deal_id, status="no_reply", last_error=None)
+        self.event(deal_id, "клиент не ответил", "и на напоминание")
+        await self.note(deal_id, "Клиент не ответил и на напоминание — дальше вручную.")
 
     # ---------- клиент ответил ----------
 
@@ -372,7 +437,7 @@ class Worker:
             raise
         except Exception as e:
             raise UnknownOutcome(f"ответ по шаблону: {type(e).__name__}: {e}") from e
-        self.db.update(deal_id, reply_sent_at=now(), reply_due_at=None)
+        self.db.update(deal_id, reply_sent_at=now(), reply_due_at=None, attempts=0)
         self.event(deal_id, "ответ по шаблону отправлен")
         await self.note(deal_id, "Ответил клиенту по шаблону. Дальше — менеджер.")
 
@@ -400,7 +465,8 @@ class Worker:
                     return
                 deal_id = row["deal_id"]
                 if kind == "message.sent":
-                    self._mark_sent_first(deal_id, None, str(data.get("dialog_id")), row["channel"])
+                    dialog = data.get("dialog_id")
+                    self._mark_sent_first(deal_id, None, str(dialog) if dialog is not None else None, row["channel"])
                     await self.note(deal_id, f"Написал клиенту первым ({row['channel']}, {row['phone']}).")
                 else:
                     reason = data.get("reason_code") or "причина не указана"

@@ -78,6 +78,8 @@ MIGRATIONS = [
     ("deals", "reply_due_at", "TEXT"),
     ("deals", "reply_sent_at", "TEXT"),
     ("deals", "checked_at", "TEXT"),         # когда последний раз смотрели, не ответил ли клиент
+    ("deals", "retry_n", "INTEGER NOT NULL DEFAULT 0"),  # ручные повторы: входят в ключ идемпотентности
+    ("deals", "retried_at", "TEXT"),         # последний ручной повтор: от него считаются 48 ч
 ]
 
 
@@ -90,6 +92,8 @@ class DB:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)  # доступ только из одного event loop
         self.conn.row_factory = sqlite3.Row
+        # lower() в SQLite не знает кириллицу — для поиска по имени берём питоновский
+        self.conn.create_function("py_lower", 1, lambda v: v.lower() if isinstance(v, str) else v, deterministic=True)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         for table, col, typ in MIGRATIONS:
@@ -176,6 +180,25 @@ class DB:
     def counts(self) -> dict[str, int]:
         return {r["status"]: r["n"] for r in
                 self.conn.execute("SELECT status, COUNT(*) AS n FROM deals GROUP BY status")}
+
+    def find(self, status: str = "", q: str = "", limit: int = 300) -> tuple[list[sqlite3.Row], int]:
+        """Сделки по статусу и строке поиска (ID, имя, телефон) — по всей базе. (первые limit, всего)."""
+        where, args = [], []
+        if status:
+            where.append("status=?")
+            args.append(status)
+        if q.strip():
+            like = f"%{q.strip().lower()}%"
+            where.append("(CAST(deal_id AS TEXT) LIKE ? OR py_lower(coalesce(name,'')) LIKE ? OR coalesce(phone,'') LIKE ?)")
+            args += [like, like, like]
+        cond = f" WHERE {' AND '.join(where)}" if where else ""
+        total = self.conn.execute(f"SELECT COUNT(*) FROM deals{cond}", args).fetchone()[0]
+        rows = self.conn.execute(f"SELECT * FROM deals{cond} ORDER BY deal_id DESC LIMIT ?", (*args, limit)).fetchall()
+        return rows, total
+
+    def forget_event(self, event_id: str) -> None:
+        """Событие Орбиты не обработано — пусть повторная доставка пройдёт."""
+        self.conn.execute("DELETE FROM orbita_events WHERE id=?", (str(event_id),))
 
     def recent(self, limit: int = 200) -> list[sqlite3.Row]:
         return self.conn.execute(

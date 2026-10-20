@@ -57,6 +57,8 @@ class Env:
     port: int
     poll_seconds: int
     dry_run: bool          # ничего не отправлять и не менять в Битриксе (для отладки)
+    host: str = "127.0.0.1"            # на своём компьютере — только для него; в Docker — 0.0.0.0
+    forwarded_allow_ips: str = "127.0.0.1"   # чьим X-Forwarded-* верить (адрес клиента, https)
 
 
 def env() -> Env:
@@ -71,6 +73,8 @@ def env() -> Env:
         port=int(e("PORT", "8080")),
         poll_seconds=int(e("POLL_SECONDS", "60")),
         dry_run=e("DRY_RUN", "0") == "1",
+        host=e("HOST", "127.0.0.1"),
+        forwarded_allow_ips=e("FORWARDED_ALLOW_IPS", "127.0.0.1"),
     )
 
 
@@ -106,6 +110,11 @@ class Settings:
     @property
     def send_window(self) -> tuple[time, time]:
         return time.fromisoformat(self.window_start), time.fromisoformat(self.window_end)
+
+    @property
+    def category(self) -> str:
+        """Воронка, с которой работает робот. Не выбрана — основная («0»), как показывает панель."""
+        return str(self.deal_category_id) if self.deal_category_id not in (None, "") else "0"
 
     @property
     def tz(self) -> ZoneInfo:

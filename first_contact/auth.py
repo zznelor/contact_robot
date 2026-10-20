@@ -12,6 +12,7 @@
 
 import hashlib
 import hmac
+import re
 import secrets
 import time
 from collections import defaultdict
@@ -46,6 +47,17 @@ def check_password(password: str, stored: str) -> bool:
 
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+# Почта без кавычек, пробелов, скобок и угловых скобок: она выводится в панели, в том числе в подсказках
+_EMAIL = re.compile(r"[A-Za-z0-9.!#$%&*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
+
+
+def email_problem(email: str) -> str | None:
+    email = email.strip()
+    if len(email) > 254 or not _EMAIL.fullmatch(email):
+        return "почта выглядит неправильно — нужен адрес вида name@company.ru"
+    return None
 
 
 def password_problem(password: str) -> str | None:
@@ -101,6 +113,7 @@ class Users:
         return u if check_password(password, u["pw_hash"]) else None
 
     def new_session(self, user_id: int) -> str:
+        self.c.execute("DELETE FROM sessions WHERE expires_at<=?", (now(),))   # заодно чистим истёкшие
         token = secrets.token_urlsafe(32)
         exp = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
         self.c.execute("INSERT INTO sessions VALUES (?, ?, ?)",
@@ -123,6 +136,7 @@ class Users:
 
     def new_invite(self, role: str, created_by: int) -> str:
         assert role in ROLES
+        self.c.execute("DELETE FROM invites WHERE expires_at<=?", (now(),))
         token = secrets.token_urlsafe(24)
         exp = datetime.now(timezone.utc) + timedelta(days=INVITE_DAYS)
         self.c.execute("INSERT INTO invites (token_hash, role, created_by, expires_at) VALUES (?, ?, ?, ?)",
@@ -166,8 +180,11 @@ class RateLimit:
 
     def blocked(self, key: str) -> bool:
         t = time.monotonic()
-        self.fails[key] = [x for x in self.fails[key] if t - x < self.window]
-        return len(self.fails[key]) >= self.limit
+        for k in list(self.fails):                      # старые адреса не копятся в памяти
+            self.fails[k] = [x for x in self.fails[k] if t - x < self.window]
+            if not self.fails[k]:
+                del self.fails[k]
+        return len(self.fails.get(key, ())) >= self.limit
 
     def fail(self, key: str) -> None:
         self.fails[key].append(time.monotonic())

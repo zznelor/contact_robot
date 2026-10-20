@@ -4,16 +4,14 @@
 не попадают: у них своя проверка.
 """
 
-from datetime import datetime
-
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
-from .auth import MIN_PASSWORD, SESSION_COOKIE, SESSION_DAYS, RateLimit, password_problem, same_origin
+from .auth import (MIN_PASSWORD, SESSION_COOKIE, SESSION_DAYS, RateLimit, email_problem, password_problem,
+                   same_origin)
 from .ui_base import (ORDER, STATUS_RU, TONE, Ctx, badge, e, flash_html, go, shell, when)
-
-# Какие статусы можно вернуть в очередь кнопкой «Повторить»
-RETRYABLE = {"error", "needs_check", "skipped", "no_messenger", "no_phone"}
+from .db import now
+from .worker import RETRYABLE
 
 
 def _set_session(resp, request: Request, token: str) -> None:
@@ -101,7 +99,7 @@ def build_router(ctx: Ctx) -> APIRouter:
         if code.strip() != users.setup_code():
             limiter.fail(ip)
             return go("/setup", "!Код не подходит — возьмите его из лога сервиса")
-        if problem := password_problem(password):
+        if problem := email_problem(email) or password_problem(password):
             return go("/setup", f"!{problem}")
         uid = users.create(email, password, "admin", name)
         users.setup_code()                       # код больше не действует
@@ -135,7 +133,7 @@ def build_router(ctx: Ctx) -> APIRouter:
         inv = users.invite(token)
         if inv is None:
             return go(f"/invite/{token}")
-        if problem := password_problem(password):
+        if problem := email_problem(email) or password_problem(password):
             return go(f"/invite/{token}", f"!{problem}")
         if users.by_email(email):
             return go(f"/invite/{token}", "!Пользователь с такой почтой уже есть — просто войдите")
@@ -196,19 +194,14 @@ def build_router(ctx: Ctx) -> APIRouter:
                 warn = "warn" if TONE.get(st) == "warn" else ""
                 tiles.append(f'<a class="tile {warn} {"on" if st == status else ""}" href="/?status={st}">'
                              f'<div class="n">{counts[st]}</div><div class="l">{e(STATUS_RU[st])}</div></a>')
-        rows = db.recent(1000)
-        if status:
-            rows = [r for r in rows if r["status"] == status]
-        if q:
-            ql = q.lower().strip()
-            rows = [r for r in rows if ql in f'{r["deal_id"]} {r["name"] or ""} {r["phone"] or ""}'.lower()]
+        rows, found = db.find(status, q, limit=300)
         trs = "".join(
             f'<tr><td class="num"><a href="/deal/{r["deal_id"]}">{r["deal_id"]}</a></td>'
             f'<td>{e(r["name"])}</td><td class="num">{e(r["phone"])}</td><td>{badge(r["status"])}</td>'
             f'<td>{e(r["channel"])}</td><td class="num">{when(r["first_sent_at"])}</td>'
             f'<td class="num">{when(r["followup_sent_at"])}</td>'
             f'<td class="small muted">{e(r["last_error"])}</td></tr>'
-            for r in rows[:300]
+            for r in rows
         ) or '<tr><td colspan="8" class="muted">Заявок пока нет</td></tr>'
         body = f"""{onboarding(user)}<h1>Заявки</h1>
 <p class="muted">Новые сделки Битрикса, которым робот пишет первым. Оранжевым — где нужен человек.</p>
@@ -221,7 +214,7 @@ def build_router(ctx: Ctx) -> APIRouter:
 <button>Выполнить сейчас</button></form></div>
 <div class="wrap"><table><tr><th>Сделка</th><th>Имя</th><th>Телефон</th><th>Статус</th><th>Канал</th>
 <th>Первое</th><th>Напоминание</th><th>Комментарий</th></tr>{trs}</table></div>
-<p class="small muted">Показано {min(len(rows), 300)} из {len(rows)}.</p>"""
+<p class="small muted">Показано {len(rows)} из {found}.</p>"""
         return ctx.page(user, "Заявки", "deals", body, msg)
 
     @router.get("/deal/{deal_id}", response_class=HTMLResponse)
@@ -246,8 +239,12 @@ def build_router(ctx: Ctx) -> APIRouter:
         dl = "".join(f"<dt>{k}</dt><dd>{v or '—'}</dd>" for k, v in fields)
         actions = []
         if r["status"] in RETRYABLE:
-            actions.append(_btn(deal_id, "retry", "Повторить", "primary",
-                                "Вернуть в очередь: робот ещё раз попробует написать первым"))
+            hint = ("Робот продолжит с того места, где остановился" if r["first_sent_at"] else
+                    "Вернуть в очередь: робот ещё раз попробует написать первым")
+            if r["status"] == "needs_check" and not r["first_sent_at"]:
+                hint = ("Сначала откройте переписку в Орбите: если первое сообщение дошло, "
+                        "повтор отправит его второй раз")
+            actions.append(_btn(deal_id, "retry", "Повторить", "primary", hint))
         if r["status"] in ("sent_first", "sent_followup", "needs_check", "pending_first", "no_reply"):
             actions.append(_btn(deal_id, "replied", "Клиент ответил", "",
                                 "Робот больше не пишет, ответ по шаблону не отправляется"))
@@ -274,29 +271,32 @@ def build_router(ctx: Ctx) -> APIRouter:
 
     @router.post("/deal/{deal_id}/retry")
     async def retry(deal_id: int, user=Depends(user_dep)):
-        r = db.deal(deal_id)
-        if r is None or r["status"] not in RETRYABLE:
-            return back(deal_id, "!Эту сделку сейчас нельзя повторить")
         if not worker.s.enabled:
             return back(deal_id, "!Робот выключен — сначала включите его в настройках")
-        # created_at сдвигаем, иначе заявка старше 48 ч сразу снова уйдёт в «пропущена»
-        db.update(deal_id, status="new", attempts=0, last_error=None,
-                  created_at=datetime.now().astimezone().isoformat(timespec="seconds"))
-        worker.event(deal_id, "вручную: повторить", user["email"])
-        await worker.on_deal_added(deal_id)
+        try:
+            status = worker.retry(deal_id, user["email"])
+        except ValueError:
+            return back(deal_id, "!Эту сделку сейчас нельзя повторить")
+        if status == "new":
+            await worker.on_deal_added(deal_id)
         r = db.deal(deal_id)
         return back(deal_id, f"Готово. Статус: {STATUS_RU.get(r['status'], r['status'])}")
 
     @router.post("/deal/{deal_id}/replied")
     async def replied(deal_id: int, user=Depends(user_dep)):
-        db.update(deal_id, status="replied", reply_due_at=None)
+        r = db.deal(deal_id)
+        if r is None:
+            return back(deal_id, "!Сделки нет в базе робота")
+        db.update(deal_id, status="replied", reply_due_at=None, client_replied_at=r["client_replied_at"] or now())
         worker.event(deal_id, "вручную: клиент ответил", user["email"])
         return back(deal_id, "Отмечено: клиент ответил, робот больше не пишет")
 
     @router.post("/deal/{deal_id}/stop")
     async def stop(deal_id: int, user=Depends(user_dep)):
         r = db.deal(deal_id)
-        if r and r["status"] == "replied":
+        if r is None:
+            return back(deal_id, "!Сделки нет в базе робота")
+        if r["status"] == "replied":
             db.update(deal_id, reply_due_at=None)
         else:
             db.update(deal_id, status="skipped", last_error="остановлено вручную", reply_due_at=None)
@@ -317,6 +317,8 @@ def build_router(ctx: Ctx) -> APIRouter:
     async def tick(step: str = Form("all"), user=Depends(user_dep)):
         if not worker.s.enabled:
             return go("/", "!Робот выключен")
+        if not worker.s.configured:
+            return go("/", "!Робот не настроен: подключите Битрикс (с этапом) и Орбиту в «Настройках»")
         if step != "all" and step not in worker.STEPS:
             return go("/", "!Неизвестное действие")
         try:
@@ -358,7 +360,7 @@ def build_router(ctx: Ctx) -> APIRouter:
                 rows.append((name, False, f"{type(ex).__name__}: {ex}"))
 
         async def bitrix_info():
-            stages = dict(await worker.bitrix.stages(s.deal_category_id))
+            stages = dict(await worker.bitrix.stages(s.category))
             has = s.no_messenger_stage in stages
             return (f"последняя сделка {await worker.bitrix.max_deal_id()}; этап «Не нашёл мессенджер»: "
                     f"{stages.get(s.no_messenger_stage) if has else 'НЕ НАЙДЕН — выберите в настройках'}")

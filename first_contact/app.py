@@ -6,8 +6,9 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
 
-from .auth import Users
+from .auth import Users, same_origin
 from .orbita_api import verify_signature
 from .ui import build_router
 from .ui_base import Ctx, NeedLogin, e, go, shell
@@ -20,6 +21,21 @@ log = logging.getLogger("first_contact")
 def create_app(worker: Worker) -> FastAPI:
     users = Users(worker.db)
     ctx = Ctx(worker, users)
+    background: set[asyncio.Task] = set()   # ссылки на фоновые задачи, иначе их может собрать сборщик мусора
+
+    def spawn(coro) -> None:
+        task = asyncio.create_task(coro)
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    async def handle_orbita(ev: dict, event_id: str) -> None:
+        try:
+            await worker.on_orbita_event(ev)
+        except Exception as ex:  # noqa: BLE001
+            log.exception("вебхук Орбиты: ошибка обработки")
+            worker.event(None, "Орбита: ошибка обработки события", f"{ev.get('type')} #{event_id}: {ex}")
+            if event_id:
+                worker.db.forget_event(event_id)   # повторная доставка обработается заново
 
     async def loop():
         while True:
@@ -53,6 +69,19 @@ def create_app(worker: Worker) -> FastAPI:
         resp.status_code = exc.status_code
         return resp
 
+    @app.exception_handler(RequestValidationError)
+    async def bad_form(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith(("/bitrix/", "/orbita/")):
+            return Response(status_code=400)
+        ref = request.headers.get("referer", "")
+        back = ref if same_origin(request) and ref else "/"
+        names = ", ".join(sorted({str(err.get("loc", ["", "?"])[-1]) for err in exc.errors()}))
+        resp = shell("Ошибка", f'<h1>Проверьте форму</h1><p>Не заполнено или неверно: {e(names)}.</p>'
+                               f'<p><a href="{e(back)}">← назад</a> · <a href="/">На главную</a></p>',
+                     narrow=True)
+        resp.status_code = 400
+        return resp
+
     @app.post("/bitrix/deal-add")
     async def bitrix_deal_add(request: Request):
         # Битрикс шлёт form-urlencoded: event, data[FIELDS][ID], auth[application_token]
@@ -62,9 +91,11 @@ def create_app(worker: Worker) -> FastAPI:
             return Response(status_code=403)
         if form.get("event", "").upper() != "ONCRMDEALADD":
             return {"ok": True, "ignored": form.get("event")}
-        deal_id = int(form.get("data[FIELDS][ID]", 0))
-        if deal_id:
-            asyncio.create_task(worker.on_deal_added(deal_id))
+        raw_id = str(form.get("data[FIELDS][ID]", "")).strip()
+        if not raw_id.isdigit():
+            return Response(status_code=400)
+        if deal_id := int(raw_id):
+            spawn(worker.on_deal_added(deal_id))
         return {"ok": True}
 
     @app.post("/orbita/webhook")
@@ -79,11 +110,14 @@ def create_app(worker: Worker) -> FastAPI:
             ev = json.loads(body)
         except ValueError:
             return Response(status_code=400)
-        event_id = h.get("x-orbita-event-id") or str(ev.get("id", ""))
-        if not worker.db.first_seen_event(event_id, ev.get("type", "")):
+        if not isinstance(ev, dict):
+            return Response(status_code=400)
+        event_id = h.get("x-orbita-event-id") or str(ev.get("id") or "")
+        # Без номера дубль не распознать — обрабатываем (иначе все такие события после первого пропали бы)
+        if event_id and not worker.db.first_seen_event(event_id, ev.get("type", "")):
             return {"ok": True, "duplicate": True}
         # Отвечаем сразу, обработка — в фоне: Орбита ждёт 2xx, а у воркера может быть занят замок
-        asyncio.create_task(worker.on_orbita_event(ev))
+        spawn(handle_orbita(ev, event_id))
         return {"ok": True}
 
     @app.get("/health")

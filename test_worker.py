@@ -10,7 +10,7 @@ os.environ["DB_PATH"] = f"{tempfile.mkdtemp()}/w.sqlite3"
 from first_contact import config
 from first_contact.bitrix import Deal
 from first_contact.db import DB
-from first_contact.orbita import FirstSendResult, Message
+from first_contact.orbita import FirstSendResult, Message, OrbitaError
 from first_contact.worker import Worker
 
 ok = 0
@@ -22,17 +22,20 @@ UTC = timezone.utc
 def ago(**kw): return datetime.now(UTC) - timedelta(**kw)
 
 class FakeBitrix:
-    def __init__(self): self.notes, self.stages_set, self.max_id, self.new_ids, self.category = [], [], 100, [], "0"
+    def __init__(self): self.notes, self.stages_set, self.max_id, self.new_ids, self.category, self.stage = [], [], 100, [], "0", "NEW"
     async def max_deal_id(self): return self.max_id
     async def deal_ids_after(self, last, cat): return [i for i in self.new_ids if i > last]
-    async def get_deal(self, i): return Deal(i, "Заявка", "NEW", "P", self.category, 1)
+    async def get_deal(self, i): return Deal(i, "Заявка", self.stage, "P", self.category, 1)
     async def get_contact(self, c): return "Анна", ["+79990000001"]
-    async def set_stage(self, d, st): self.stages_set.append((d, st))
+    async def set_stage(self, d, st): self.stages_set.append((d, st)); self.stage = st
     async def comment(self, d, t): self.notes.append((d, t))
 
 class FakeOrbita:
-    def __init__(self): self.sent, self.history_items = [], {}
+    def __init__(self): self.sent, self.history_items, self.keys, self.mode = [], {}, [], "sent"
     async def send_first(self, phone, text, key, name=None):
+        self.keys.append(key)
+        if self.mode == "none": return FirstSendResult("no_messenger")
+        if self.mode == "boom": raise OrbitaError("HTTP 503: Орбита недоступна")
         self.sent.append(("first", phone, text)); return FirstSendResult("sent", "D1", "whatsapp")
     async def send_reply(self, dialog, text, key):
         self.sent.append(("reply", dialog, text, key)); return {}
@@ -139,6 +142,64 @@ run(w.run_step("first"))
 check(db.deal(111)["status"] == "sent_first" and len(orb.sent) == n + 1, "шаг «написать первым» отправляет")
 try: run(w.run_step("oops")); check(False, "x")
 except KeyError: check(True, "неизвестный шаг не выполняется")
+
+# 12. «Повторить» после «нет мессенджера»: этап робота не мешает, ключ идемпотентности новый
+s.reply_on = False; orb.history_items = {}
+orb.mode = "none"; bx.new_ids = [120]; run(w.tick())
+check(db.deal(120)["status"] == "no_messenger" and bx.stage == "NO_MESSENGER", "нет мессенджера → этап сменён")
+seen_at = db.deal(120)["created_at"]
+orb.mode = "sent"
+check(w.retry(120, "a@x.ru") == "new", "повтор без отправленного первого → в очередь")
+run(w.on_deal_added(120))
+check(db.deal(120)["status"] == "sent_first", "после «Повторить» робот написал, хотя этап «Не нашёл мессенджер»")
+check(orb.keys[-1].endswith("-r1") and orb.keys[-2] == "deal-120-first-+79990000001", "у повтора новый ключ идемпотентности")
+check(db.deal(120)["created_at"] == seen_at and db.deal(120)["retried_at"], "время появления заявки не затёрто")
+bx.stage = "NO_MESSENGER"; bx.new_ids = [121]; run(w.tick())
+check(db.deal(121)["status"] == "skipped", "без ручного повтора сделку на этапе «Не нашёл мессенджер» робот не трогает")
+bx.stage = "NEW"
+try: w.retry(120, "a@x.ru"); check(False, "x")
+except ValueError: check(True, "сделку в работе повторить нельзя")
+
+# 13. «Повторить» после сбоя напоминания не шлёт первое сообщение второй раз
+db.update(120, status="error", followup_due_at=ago(minutes=1).isoformat())
+n = len([x for x in orb.sent if x[0] == "first"])
+check(w.retry(120, "a@x.ru") == "sent_first", "первое уже ушло → повтор продолжает с напоминания")
+orb.history_items["D1"] = [Message("", "", ago(hours=1), True)]
+db.update(120, first_sent_at=ago(hours=1).isoformat())
+run(w.tick())
+check(db.deal(120)["status"] == "sent_followup" and len([x for x in orb.sent if x[0] == "first"]) == n,
+      "после повтора ушло напоминание, первое не повторилось")
+
+# 14. счётчик ошибок обнуляется, когда сделка продвинулась
+orb.mode = "boom"; bx.new_ids = [122]; run(w.tick())
+for _ in range(3): run(w._guarded(122, w.first_contact))
+check(db.deal(122)["attempts"] == 4 and db.deal(122)["status"] == "new", "4 сбоя — ещё в очереди")
+orb.mode = "sent"; run(w._guarded(122, w.first_contact))
+check(db.deal(122)["status"] == "sent_first" and db.deal(122)["attempts"] == 0, "отправлено → счётчик ошибок обнулён")
+
+# 15. итог после напоминания: «не ответил» или «ответил»
+db.update(120, followup_sent_at=ago(hours=25).isoformat())
+orb.history_items["D1"] = [Message("", "", ago(hours=1), True)]
+run(w.tick())
+check(db.deal(120)["status"] == "no_reply", "молчит и после напоминания → «не ответил»")
+db.update(122, status="sent_followup", followup_sent_at=ago(hours=25).isoformat(), first_sent_at=ago(hours=50).isoformat())
+orb.history_items["D1"] = [Message("", "", ago(hours=50), True), Message("", "", ago(hours=2), False)]
+run(w.tick())
+check(db.deal(122)["status"] == "replied", "ответил после напоминания → «ответил»")
+db.update(122, status="sent_followup", followup_sent_at=ago(hours=1).isoformat())
+run(w.tick())
+check(db.deal(122)["status"] == "sent_followup", "срок итога не наступил — ждём")
+
+# 16. воронка не выбрана → основная, как в панели
+s.deal_category_id = None; bx.category = "5"; bx.new_ids = [123]; run(w.tick())
+check(db.deal(123)["status"] == "skipped", "воронка не выбрана → сделка другой воронки пропущена")
+bx.category = "0"
+
+# 17. напоминание без номера диалога → проверить вручную, без запроса в Орбиту
+db.add_deal(124); db.update(124, status="sent_first", dialog_id=None, first_sent_at=ago(hours=25).isoformat(),
+                            followup_due_at=ago(minutes=1).isoformat())
+run(w.tick())
+check(db.deal(124)["status"] == "needs_check", "нет диалога → «проверить вручную»")
 
 # 11. выключение
 w.disable()

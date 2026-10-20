@@ -97,6 +97,13 @@ mock(boom)
 try: run(api.send_first("+7", "t", "k7")); check(False, "x")
 except OrbitaError: check(True, "обрыв связи → повторяемая ошибка (идемпотентно)")
 
+mock(make({"whatsapp": (201, {"message_id": 1})}))
+r = run(api.send_first("+7", "t", "k-nodialog"))
+check(r.status == "sent" and r.dialog_id is None, "201 без диалога → номер диалога пустой, а не «None»")
+mock(lambda req: httpx.Response(502, json=["bad gateway"]))
+try: run(api.account()); check(False, "x")
+except OrbitaError as e: check("502" in str(e), "ошибка не в виде объекта — понятное исключение")
+
 mock(make({}))
 msgs = run(api.history("501"))
 check([m.outgoing for m in msgs] == [False, True], "история: направления")
@@ -142,4 +149,21 @@ check(db.deal(11)["status"] == "sent_first" and db.deal(11)["dialog_id"] == "777
 send({"id": 4, "type": "message.failed", "data": {"request_key": "rk-10", "reason_code": "send_failed"}})
 check(db.deal(12)["status"] == "needs_check", "message.failed → проверить вручную")
 check(len(FakeBitrix.notes) == 3, "комментарии в сделки: 3")
+db.update(10, status="sent_first")
+def send_noid(ev):
+    body = json.dumps(ev).encode(); ts = str(int(time.time()))
+    sig = "v1=" + hmac.new(b"whsec_t", ts.encode()+b"."+body, hashlib.sha256).hexdigest()
+    r = client.post("/orbita/webhook", content=body, headers={"X-Orbita-Signature": sig, "X-Orbita-Timestamp": ts})
+    time.sleep(0.2); return r
+send_noid({"type": "channel.connected", "data": {"provider": "max"}})
+check(not send_noid({"type": "message.received", "data": {"dialog_id": 501, "direction": "incoming"}}).json().get("duplicate")
+      and db.deal(10)["status"] == "replied", "события без номера не считаются дублями друг друга")
+orig = w.on_orbita_event
+async def broken(ev): raise RuntimeError("сбой")
+w.on_orbita_event = broken
+send({"id": 50, "type": "message.received", "data": {}})
+check(any(e["event"] == "Орбита: ошибка обработки события" for e in db.events()), "сбой обработки вебхука — в журнале")
+w.on_orbita_event = orig
+check(not send({"id": 50, "type": "message.received", "data": {}}).json().get("duplicate"),
+      "после сбоя повторная доставка обрабатывается")
 print(f"\nВсе проверки пройдены: {ok}")

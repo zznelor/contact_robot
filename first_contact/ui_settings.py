@@ -4,6 +4,7 @@
 Секреты после сохранения не показываются целиком; пустое поле — «не менять».
 """
 
+import json
 import time
 from zoneinfo import ZoneInfo, available_timezones
 
@@ -84,7 +85,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         if worker.bitrix:
             try:
                 cats = await worker.bitrix.categories()
-                cat = s.deal_category_id if s.deal_category_id is not None else "0"
+                cat = s.category
                 stages = await worker.bitrix.stages(cat)
                 cat_opts = "".join(f'<option value="{e(i)}" {"selected" if i == cat else ""}>{e(n)}</option>'
                                    for i, n in cats)
@@ -126,7 +127,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
                 live = (f'<p>Аккаунт «{e(acc.get("name"))}», подписка '
                         f'{"<span class=ok>активна</span>" if acc.get("subscription_active") else "<span class=bad>неактивна</span>"}. '
                         "Каналы: " + ", ".join(
-                            f'{CHANNEL_RU.get(c, c)} — {"<span class=ok>подключён</span>" if ok else "<span class=muted>нет</span>"}'
+                            f'{e(CHANNEL_RU.get(c, c))} — {"<span class=ok>подключён</span>" if ok else "<span class=muted>нет</span>"}'
                             for c, ok in chs.items()) + "</p>")
             except Exception as ex:  # noqa: BLE001
                 live = f'<p class="bad">Орбита не отвечает: {e(type(ex).__name__)}: {e(ex)}</p>'
@@ -251,24 +252,33 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         elif app_token_clear:
             changes["bitrix_app_token"] = ""
         msg = "Сохранено"
-        current_cat = s.deal_category_id if s.deal_category_id is not None else "0"
-        if webhook:
-            # Новый адрес — списки воронок и этапов на странице были от старого; оставляем этап, если он есть и тут
-            stages = dict(await client.stages(current_cat))
-            if s.no_messenger_stage not in stages:
-                changes["no_messenger_stage"] = ""
-                msg = "Битрикс подключён. Теперь выберите этап «Не нашёл мессенджер»"
-        elif client and category is not None:
-            if category != current_cat:
-                changes["deal_category_id"] = category
-                changes["no_messenger_stage"] = ""
-                msg = "Воронка сменена — выберите этап «Не нашёл мессенджер» для неё"
-            elif stage:
-                if stage in dict(await client.stages(category)):
+        current_cat = s.category
+        try:
+            if webhook:
+                # Новый адрес — списки воронок и этапов на странице были от старого; оставляем этап, если он есть и тут
+                stages = dict(await client.stages(current_cat))
+                if s.no_messenger_stage not in stages:
+                    changes["no_messenger_stage"] = ""
+                    msg = "Битрикс подключён. Теперь выберите этап «Не нашёл мессенджер»"
+            elif client and category is not None:
+                if category != current_cat:
                     changes["deal_category_id"] = category
-                    changes["no_messenger_stage"] = stage
+                    changes["no_messenger_stage"] = ""
+                    msg = "Воронка сменена — выберите этап «Не нашёл мессенджер» для неё"
+                elif stage:
+                    if stage in dict(await client.stages(category)):
+                        changes["deal_category_id"] = category
+                        changes["no_messenger_stage"] = stage
+                    else:
+                        msg = "!Такого этапа нет в выбранной воронке"
                 else:
-                    msg = "!Такого этапа нет в выбранной воронке"
+                    msg = "!Выберите этап «Не нашёл мессенджер»" if not s.no_messenger_stage else msg
+        except Exception as ex:  # noqa: BLE001
+            if webhook:   # адрес рабочий (max_deal_id прошёл), а этапы не получили — сохраняем адрес, этап выберут позже
+                changes["no_messenger_stage"] = ""
+                msg = f"!Адрес сохранён, но Битрикс не отдал этапы воронки: {ex}. Обновите страницу и выберите этап"
+            else:
+                return go("/settings#bitrix", f"!Битрикс не отдал этапы воронки: {ex}")
         worker.save(**changes)
         worker.event(None, "настройки Битрикса изменены", user["email"])
         return go("/settings#bitrix", msg)
@@ -305,7 +315,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
     @router.post("/settings/messages")
     async def save_messages(tpl_first: str = Form(...), tpl_followup: str = Form(...), tpl_reply: str = Form(...),
                             tpl_no_name: str = Form(""), followup_on: str = Form(""), reply_on: str = Form(""),
-                            followup_hours: float = Form(24), reply_delay_minutes: float = Form(2),
+                            followup_hours: str = Form("24"), reply_delay_minutes: str = Form("2"),
                             user=Depends(admin_dep)):
         texts = {"tpl_first": tpl_first, "tpl_followup": tpl_followup, "tpl_reply": tpl_reply}
         titles = {"tpl_first": "первом сообщении", "tpl_followup": "напоминании", "tpl_reply": "ответе клиенту"}
@@ -318,6 +328,11 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
             except (KeyError, IndexError, ValueError) as ex:
                 return go("/settings#messages", f"!Ошибка в {titles[k]}: {ex}. Доступно только {{name}} и {{deal_title}}")
             texts[k] = v
+        try:   # «2,5» с запятой — тоже число
+            followup_hours = float(followup_hours.replace(",", ".").strip())
+            reply_delay_minutes = float(reply_delay_minutes.replace(",", ".").strip())
+        except ValueError:
+            return go("/settings#messages", "!Часы напоминания и паузу ответа укажите числом, например 24 или 2,5")
         if not (0.05 <= followup_hours <= 720) or not (0 <= reply_delay_minutes <= 60):
             return go("/settings#messages", "!Проверьте часы напоминания и паузу ответа")
         worker.save(**texts, tpl_no_name=tpl_no_name.strip() or "Здравствуйте",
@@ -408,7 +423,8 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
             f'<td class="num">{u["created_at"][:10]}</td><td>' +
             ("" if u["id"] == user["id"] else
              f'<form method="post" action="/team/{u["id"]}/delete" class="inline" '
-             f'onsubmit="return confirm(\'Удалить {e(u["email"])}?\')"><button class="danger">Удалить</button></form>') +
+             f'onsubmit="return confirm({e(json.dumps("Удалить " + u["email"] + "?", ensure_ascii=False))})">'
+             '<button class="danger">Удалить</button></form>') +
             "</td></tr>" for u in users.all())
         invites = users.open_invites()
         inv = (f'<p class="hint">Неиспользованных приглашений: {len(invites)} '

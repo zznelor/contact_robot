@@ -152,11 +152,21 @@ c.post("/deal/42/stop", headers=H)
 check(db.deal(42)["status"] == "replied" and not db.deal(42)["reply_due_at"], "«остановить» отменяет ответ по шаблону")
 c.post("/deal/41/replied", headers=H)
 check(db.deal(41)["status"] == "replied", "«клиент ответил» вручную")
-check('name="step"' in c.get("/").text and "Отправить напоминания" in c.get("/").text, "на главной список действий")
+check('name="step"' in c.get("/").text and "Напоминания и итог" in c.get("/").text, "на главной список действий")
 r = c.post("/actions/tick", data={"step": "pending"}, headers=H, follow_redirects=False)
 check(s.enabled and "msg=%D0%93%D0%BE%D1%82%D0%BE%D0%B2%D0%BE" in r.headers["location"], "один шаг выполнен по кнопке")
 r = c.post("/actions/tick", data={"step": "oops"}, headers=H, follow_redirects=False)
 check("msg=%21" in r.headers["location"], "неизвестное действие отклонено")
+check("Игорь" in c.get("/?q=игорь").text and "Сергей" not in c.get("/?q=игорь").text, "поиск по имени без учёта регистра")
+for i in range(1100, 2300): db.add_deal(i)
+check("Игорь" in c.get("/?q=игорь").text, "поиск находит сделку и за пределами последних 1000")
+check("Показано 300 из 1202" in c.get("/").text, "счётчик «показано из» — по всей базе")
+n = len(db.events(99999))
+r = c.post("/deal/99999/replied", headers=H, follow_redirects=False)
+check("msg=%21" in r.headers["location"] and len(db.events(99999)) == n, "«клиент ответил» на несуществующей сделке — отказ без записи")
+r = c.post("/deal/99999/stop", headers=H, follow_redirects=False)
+check("msg=%21" in r.headers["location"] and db.deal(99999) is None, "«остановить» на несуществующей сделке — отказ")
+check(db.deal(41)["client_replied_at"], "«клиент ответил» вручную ставит время ответа")
 
 # --- команда ---
 r = c.post("/team/invite", data={"role": "operator"}, headers=H)
@@ -168,6 +178,10 @@ check('href="/team"' not in c.get("/").text and 'href="#team"' in c.get("/settin
 r = c.get("/team", follow_redirects=False)
 check(r.status_code == 303 and r.headers["location"] == "/settings#team", "старый адрес /team ведёт в настройки")
 op = TestClient(app)
+evil = "x'-alert(1)-'@a.ru"
+r = op.post(f"/invite/{link}", data={"email": evil, "password": "operator1"}, headers=H, follow_redirects=False)
+check(users.by_email(evil) is None and "msg=%21" in r.headers["location"], "почта с кавычкой не принята")
+check(users.invite(link) is not None, "неудачная попытка не тратит приглашение")
 r = op.post(f"/invite/{link}", data={"email": "op@x.ru", "password": "operator1"}, headers=H, follow_redirects=False)
 check(users.by_email("op@x.ru")["role"] == "operator", "оператор зарегистрирован по приглашению")
 r = op.post(f"/invite/{link}", data={"email": "op2@x.ru", "password": "operator1"}, headers=H, follow_redirects=False)
@@ -175,6 +189,10 @@ check(users.by_email("op2@x.ru") is None, "приглашение однораз
 check(op.get("/").status_code == 200 and op.get("/settings").status_code == 403, "оператор видит сделки, но не настройки")
 check(op.post("/settings/disable", headers=H).status_code == 403 and s.enabled, "оператор не может выключить робота")
 check("Настройки" not in op.get("/").text, "у оператора нет пункта «Настройки»")
+check('confirm(&quot;Удалить op@x.ru?&quot;)' in c.get("/settings").text, "подтверждение удаления — JSON-строка")
+users.create("o'neil@x.ru", "password1", "operator")       # такой адрес мог появиться до проверки почты
+check("confirm(&quot;Удалить o&#x27;neil@x.ru?&quot;)" in c.get("/settings").text, "старая почта с кавычкой не ломает JS")
+users.delete(users.by_email("o'neil@x.ru")["id"])
 op.post("/logout", headers=H)
 check(op.get("/", follow_redirects=False).status_code == 303, "после выхода — снова вход")
 
@@ -190,6 +208,22 @@ check(r.headers["location"] == "/" and "fc_session" in r.cookies, "вход с �
 snap("login", anon.get("/login"))
 check(c.post("/team/1/delete", headers=H, follow_redirects=False).status_code == 303 and users.count() == 2,
       "себя удалить нельзя")
+# --- формы и события ---
+r = c.post("/settings/messages", data={**form, "followup_hours": "2,5"}, headers=H, follow_redirects=False)
+check(s.followup_hours == 2.5 and "msg=%21" not in r.headers["location"], "часы с запятой приняты")
+r = c.post("/settings/messages", data={**form, "followup_hours": "abc"}, headers=H, follow_redirects=False)
+check("msg=%21" in r.headers["location"] and s.followup_hours == 2.5, "часы не числом — понятная ошибка")
+r = c.post("/settings/schedule", data={"start": "10:00"}, headers=H)
+check(r.status_code == 400 and "text/html" in r.headers["content-type"] and "Проверьте форму" in r.text,
+      "неполная форма — страница с ошибкой, а не JSON")
+s.bitrix_app_token = "T"
+r = c.post("/bitrix/deal-add", data={"auth[application_token]": "T", "event": "ONCRMDEALADD", "data[FIELDS][ID]": "abc"})
+check(r.status_code == 400, "событие Битрикса с нечисловым ID → 400")
+s.no_messenger_stage = ""
+r = c.post("/actions/tick", data={"step": "all"}, headers=H, follow_redirects=False)
+check("%D0%BD%D0%B5%20%D0%BD%D0%B0%D1%81%D1%82%D1%80%D0%BE%D0%B5%D0%BD" in r.headers["location"],
+      "«Выполнить сейчас» без настройки — честное сообщение")
+s.no_messenger_stage = "C3:LOST"
 # --- отключение ---
 c.post("/settings/orbita/disconnect", headers=H)
 check(not s.orbita_api_key and not s.enabled, "«Отключить Орбиту» стирает ключ и выключает робота")
