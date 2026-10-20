@@ -215,7 +215,10 @@ def build_router(ctx: Ctx) -> APIRouter:
 <div class="tiles">{''.join(tiles)}</div>
 <div class="bar"><form class="bar" style="margin:0" method="get"><input type="hidden" name="status" value="{e(status)}">
 <input type="search" name="q" value="{e(q)}" placeholder="ID, имя или телефон"><button>Найти</button></form>
-<form method="post" action="/actions/tick"><button title="Не ждать минуту до следующего прохода">Пройти очередь сейчас</button></form></div>
+<form class="bar" style="margin:0" method="post" action="/actions/tick">
+<select name="step" title="Робот и так делает всё это сам раз в минуту"><option value="all">Всё сразу (как раз в минуту)</option>
+{''.join(f'<option value="{k}">{e(v)}</option>' for k, v in worker.STEPS.items())}</select>
+<button>Выполнить сейчас</button></form></div>
 <div class="wrap"><table><tr><th>Сделка</th><th>Имя</th><th>Телефон</th><th>Статус</th><th>Канал</th>
 <th>Первое</th><th>Напоминание</th><th>Комментарий</th></tr>{trs}</table></div>
 <p class="small muted">Показано {min(len(rows), 300)} из {len(rows)}.</p>"""
@@ -311,12 +314,18 @@ def build_router(ctx: Ctx) -> APIRouter:
         return back(deal_id, f"Статус: {STATUS_RU.get(r['status'], r['status'])}")
 
     @router.post("/actions/tick")
-    async def tick(user=Depends(user_dep)):
+    async def tick(step: str = Form("all"), user=Depends(user_dep)):
         if not worker.s.enabled:
             return go("/", "!Робот выключен")
+        if step != "all" and step not in worker.STEPS:
+            return go("/", "!Неизвестное действие")
         try:
-            await worker.tick()
-            msg = "Очередь пройдена"
+            if step == "all":
+                await worker.tick()
+            else:
+                await worker.run_step(step)
+            msg = f"Готово: {worker.STEPS.get(step, 'весь проход').lower()}"
+            worker.event(None, f"вручную: {worker.STEPS.get(step, 'весь проход').lower()}", user["email"])
         except Exception as ex:  # noqa: BLE001
             msg = f"!Ошибка: {type(ex).__name__}: {ex}"
         return go("/", msg)

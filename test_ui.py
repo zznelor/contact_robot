@@ -152,6 +152,11 @@ c.post("/deal/42/stop", headers=H)
 check(db.deal(42)["status"] == "replied" and not db.deal(42)["reply_due_at"], "«остановить» отменяет ответ по шаблону")
 c.post("/deal/41/replied", headers=H)
 check(db.deal(41)["status"] == "replied", "«клиент ответил» вручную")
+check('name="step"' in c.get("/").text and "Отправить напоминания" in c.get("/").text, "на главной список действий")
+r = c.post("/actions/tick", data={"step": "pending"}, headers=H, follow_redirects=False)
+check(s.enabled and "msg=%D0%93%D0%BE%D1%82%D0%BE%D0%B2%D0%BE" in r.headers["location"], "один шаг выполнен по кнопке")
+r = c.post("/actions/tick", data={"step": "oops"}, headers=H, follow_redirects=False)
+check("msg=%21" in r.headers["location"], "неизвестное действие отклонено")
 
 # --- команда ---
 r = c.post("/team/invite", data={"role": "operator"}, headers=H)

@@ -101,15 +101,42 @@ class Worker:
 
     # ---------- цикл ----------
 
+    # Шаги прохода — по порядку; в панели их можно запустить по одному
+    STEPS = {
+        "poll": "Забрать новые сделки из Битрикса",
+        "first": "Написать первым по новым сделкам",
+        "followup": "Отправить напоминания, срок которых наступил",
+        "pending": "Проверить неподтверждённые отправки",
+        "replies": "Проверить ответы клиентов в истории",
+        "auto_reply": "Отправить ответы по шаблону",
+    }
+
     async def tick(self) -> None:
         if not (self.s.enabled and self.s.configured):
             return
         async with self.lock:
+            for step in self.STEPS:
+                await self._step(step, manual=False)
+
+    async def run_step(self, step: str) -> None:
+        """Один шаг прохода по кнопке из панели."""
+        if step not in self.STEPS:
+            raise KeyError(step)
+        if not (self.s.enabled and self.s.configured):
+            return
+        async with self.lock:
+            await self._step(step, manual=True)
+
+    async def _step(self, step: str, manual: bool) -> None:
+        if step == "poll":
             await self.poll_new_deals()
+        elif step == "first":
             for row in self.db.by_status("new"):
                 await self._guarded(row["deal_id"], self.first_contact)
+        elif step == "followup":
             for row in self.db.by_status("sent_first"):
                 await self._guarded(row["deal_id"], self.followup)
+        elif step == "pending":
             for row in self.db.by_status("pending_first"):
                 if datetime.now(timezone.utc) - _ts(row["updated_at"]) > PENDING_TIMEOUT:
                     self.db.update(row["deal_id"], status="needs_check",
@@ -117,8 +144,11 @@ class Worker:
                     self.event(row["deal_id"], "нет подтверждения отправки", row["request_key"] or "")
                     await self.note(row["deal_id"], "Орбита не подтвердила, что первое сообщение ушло. "
                                                     "Проверьте переписку.")
-            if self.s.reply_on and not self.s.orbita_webhook_secret:
-                await self.poll_replies()
+        elif step == "replies":
+            # Сам — только без вебхуков и при ответе по шаблону; по кнопке — всегда и без паузы REPLY_POLL
+            if manual or (self.s.reply_on and not self.s.orbita_webhook_secret):
+                await self.poll_replies(force=manual)
+        elif step == "auto_reply":
             for row in self.db.replies_due(now()):
                 await self._guarded(row["deal_id"], self.auto_reply)
 
@@ -295,14 +325,14 @@ class Worker:
         self.event(deal_id, f"клиент ответил ({how})")
         await self.note(deal_id, "Клиент ответил в мессенджере.")
 
-    async def poll_replies(self) -> None:
-        """Без вебхуков Орбиты: раз в REPLY_POLL смотрим историю свежих диалогов."""
+    async def poll_replies(self, force: bool = False) -> None:
+        """Без вебхуков Орбиты: раз в REPLY_POLL смотрим историю свежих диалогов (force — не ждать паузу)."""
         edge = datetime.now(timezone.utc) - REPLY_POLL
         for row in self.db.by_status("sent_first", "sent_followup"):
             sent = _ts(row["first_sent_at"])
             if not row["dialog_id"] or not sent or datetime.now(timezone.utc) - sent > REPLY_POLL_DAYS:
                 continue
-            if row["checked_at"] and _ts(row["checked_at"]) > edge:
+            if not force and row["checked_at"] and _ts(row["checked_at"]) > edge:
                 continue
             self.db.update(row["deal_id"], checked_at=now())
             try:

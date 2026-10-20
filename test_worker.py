@@ -131,6 +131,15 @@ bx.new_ids = [109]; run(w.tick())
 check(db.deal(109)["status"] == "skipped", "сделка другой воронки пропущена")
 bx.category = "0"
 
+# 10a. шаги по одному (кнопка в панели)
+n = len(orb.sent)
+bx.new_ids = [111]; run(w.run_step("poll"))
+check(db.deal(111)["status"] == "new" and len(orb.sent) == n, "шаг «забрать сделки» только ставит в очередь")
+run(w.run_step("first"))
+check(db.deal(111)["status"] == "sent_first" and len(orb.sent) == n + 1, "шаг «написать первым» отправляет")
+try: run(w.run_step("oops")); check(False, "x")
+except KeyError: check(True, "неизвестный шаг не выполняется")
+
 # 11. выключение
 w.disable()
 bx.new_ids = [110]; run(w.tick())
