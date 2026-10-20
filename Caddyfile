@@ -1,0 +1,4 @@
+# Адрес берётся из DOMAIN в .env. Сертификат HTTPS Caddy получит и продлит сам.
+{$DOMAIN} {
+	reverse_proxy app:8080
+}

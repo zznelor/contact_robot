@@ -1,0 +1,15 @@
+[project]
+name = "first-contact"
+version = "1.0.0"
+description = "Робот первого контакта: пишет клиенту в мессенджер по новой сделке Битрикс24 через Орбиту"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
+]
+
+[tool.uv]
+package = false

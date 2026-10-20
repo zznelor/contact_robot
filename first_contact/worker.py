@@ -1,0 +1,386 @@
+"""Логика первого контакта.
+
+1. Новая сделка → первое сообщение клиенту в мессенджер через Орбиту.
+2. Мессенджер не найден → этап сделки «Не нашёл мессенджер».
+3. Клиент молчит N часов → напоминание (если включено).
+4. Клиент ответил → один ответ по шаблону (если включён), дальше работает менеджер.
+"""
+
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
+
+from . import config
+from .bitrix import Bitrix
+from .config import Env, Settings
+from .db import DB, now
+from .orbita import OrbitaError, answered_after, client_replied, first_incoming
+from .orbita_api import OrbitaAPI
+
+log = logging.getLogger("first_contact")
+
+MAX_ATTEMPTS = 5
+# Сделки, которые ждали дольше (робот был выключен или лежала Орбита), не трогаем:
+# писать «вы оставили заявку» через неделю — плохо.
+MAX_AGE = timedelta(hours=48)
+# Орбита ответила 202 на «написать первым», а вебхука с исходом нет так долго — зовём человека
+PENDING_TIMEOUT = timedelta(minutes=30)
+# Ответ по шаблону имеет смысл, только пока клиент ещё в разговоре
+REPLY_MAX_LATE = timedelta(minutes=30)
+# Без вебхуков Орбиты ответ клиента ищем опросом истории — не чаще, чем раз в столько
+REPLY_POLL = timedelta(minutes=5)
+REPLY_POLL_DAYS = timedelta(days=3)
+
+
+class UnknownOutcome(Exception):
+    """Отправка могла уйти, а могла и нет. Повторять нельзя — нужен человек."""
+
+
+def _ts(iso: str | None) -> datetime | None:
+    return datetime.fromisoformat(iso) if iso else None
+
+
+class Worker:
+    def __init__(self, env: Env, s: Settings, db: DB, bitrix=None, orbita=None):
+        self.env, self.s, self.db = env, s, db
+        self.bitrix, self.orbita = bitrix, orbita
+        self.lock = asyncio.Lock()
+        if bitrix is None and orbita is None:
+            self.reconnect()
+
+    def reconnect(self) -> None:
+        """Пересобрать клиенты после смены настроек в панели."""
+        s = self.s
+        self.bitrix = Bitrix(s.bitrix_webhook) if s.bitrix_webhook else None
+        self.orbita = OrbitaAPI(s.orbita_api_url, s.orbita_api_key, s.orbita_channels) if s.orbita_api_key else None
+
+    def save(self, **changes) -> None:
+        config.save(self.db, self.s, **changes)
+        if changes.keys() & {"bitrix_webhook", "orbita_api_key", "orbita_api_url", "orbita_channels"}:
+            self.reconnect()
+
+    @property
+    def dry_run(self) -> bool:
+        return self.env.dry_run
+
+    # ---------- общее ----------
+
+    def in_window(self) -> bool:
+        t = datetime.now(self.s.tz).time()
+        start, end = self.s.send_window
+        return start <= t < end
+
+    def render(self, key: str, name: str, deal_title: str = "") -> str:
+        tpl = {"first": self.s.tpl_first, "followup": self.s.tpl_followup, "reply": self.s.tpl_reply}[key]
+        return render(tpl, name or self.s.tpl_no_name, deal_title)
+
+    async def note(self, deal_id: int, text: str) -> None:
+        """Комментарий в ленту сделки. Ошибка комментария не должна ломать основное действие."""
+        if self.dry_run or self.bitrix is None:
+            return
+        try:
+            await self.bitrix.comment(deal_id, f"[Робот первого контакта] {text}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("сделка %s: не удалось оставить комментарий: %s", deal_id, e)
+
+    def event(self, deal_id: int | None, name: str, detail: str = "") -> None:
+        log.info("сделка %s: %s %s", deal_id, name, detail)
+        self.db.log(deal_id, name, detail)
+
+    async def enable(self) -> int:
+        """Включить робота. Сделки, созданные до включения, не трогаем."""
+        start = await self.bitrix.max_deal_id()
+        self.db.put("last_deal_id", start)
+        self.save(enabled=True)
+        self.event(None, "робот включён", f"сделки до ID {start} включительно не трогаем")
+        return start
+
+    def disable(self) -> None:
+        self.save(enabled=False)
+        self.event(None, "робот выключен")
+
+    # ---------- цикл ----------
+
+    async def tick(self) -> None:
+        if not (self.s.enabled and self.s.configured):
+            return
+        async with self.lock:
+            await self.poll_new_deals()
+            for row in self.db.by_status("new"):
+                await self._guarded(row["deal_id"], self.first_contact)
+            for row in self.db.by_status("sent_first"):
+                await self._guarded(row["deal_id"], self.followup)
+            for row in self.db.by_status("pending_first"):
+                if datetime.now(timezone.utc) - _ts(row["updated_at"]) > PENDING_TIMEOUT:
+                    self.db.update(row["deal_id"], status="needs_check",
+                                   last_error="нет подтверждения отправки от Орбиты")
+                    self.event(row["deal_id"], "нет подтверждения отправки", row["request_key"] or "")
+                    await self.note(row["deal_id"], "Орбита не подтвердила, что первое сообщение ушло. "
+                                                    "Проверьте переписку.")
+            if self.s.reply_on and not self.s.orbita_webhook_secret:
+                await self.poll_replies()
+            for row in self.db.replies_due(now()):
+                await self._guarded(row["deal_id"], self.auto_reply)
+
+    async def on_deal_added(self, deal_id: int) -> None:
+        """Событие ONCRMDEALADD из Битрикса: обработать сразу, не дожидаясь опроса."""
+        if not (self.s.enabled and self.s.configured):
+            return
+        async with self.lock:
+            if self.db.add_deal(deal_id):
+                self.event(deal_id, "новая сделка (событие)")
+            await self._guarded(deal_id, self.first_contact)
+
+    async def poll_new_deals(self) -> None:
+        """Подстраховка к событиям: события Битрикса теряются, опрос — нет."""
+        last = self.db.get("last_deal_id")
+        if last is None:
+            start = await self.bitrix.max_deal_id()
+            self.db.put("last_deal_id", start)
+            self.event(None, "старт", f"сделки до ID {start} включительно не трогаем")
+            return
+        for deal_id in await self.bitrix.deal_ids_after(int(last), self.s.deal_category_id):
+            if self.db.add_deal(deal_id):
+                self.event(deal_id, "новая сделка (опрос)")
+            self.db.put("last_deal_id", deal_id)
+
+    async def _guarded(self, deal_id: int, step) -> None:
+        try:
+            await step(deal_id)
+        except UnknownOutcome as e:
+            self.db.update(deal_id, status="needs_check", last_error=str(e))
+            self.event(deal_id, "исход отправки неизвестен", str(e))
+            await self.note(deal_id, "Не уверен, ушло ли сообщение клиенту. Проверьте переписку в Орбите.")
+        except Exception as e:  # noqa: BLE001
+            row = self.db.deal(deal_id)
+            attempts = (row["attempts"] if row else 0) + 1
+            status = "error" if attempts >= MAX_ATTEMPTS else (row["status"] if row else "new")
+            self.db.update(deal_id, attempts=attempts, last_error=f"{type(e).__name__}: {e}", status=status)
+            self.event(deal_id, "ошибка", f"попытка {attempts}: {e}")
+            if status == "error":
+                await self.note(deal_id, f"Не смог обработать заявку после {attempts} попыток: {e}")
+
+    # ---------- первое сообщение и «нет мессенджера» ----------
+
+    async def first_contact(self, deal_id: int) -> None:
+        row = self.db.deal(deal_id)
+        if row is None or row["status"] != "new":
+            return
+        if datetime.now(timezone.utc) - _ts(row["created_at"]) > MAX_AGE:
+            self.db.update(deal_id, status="skipped", last_error="заявка старше 48 ч")
+            self.event(deal_id, "пропущена", "заявка старше 48 ч")
+            return
+        if not self.in_window():
+            return
+
+        deal = await self.bitrix.get_deal(deal_id)
+        if self.s.deal_category_id is not None and deal.category_id != str(self.s.deal_category_id):
+            self.db.update(deal_id, status="skipped", last_error=f"другая воронка ({deal.category_id})")
+            self.event(deal_id, "пропущена", f"другая воронка ({deal.category_id})")
+            return
+        if deal.stage_semantic != "P" or deal.stage_id == self.s.no_messenger_stage:
+            self.db.update(deal_id, status="skipped", last_error=f"этап {deal.stage_id}")
+            self.event(deal_id, "пропущена", f"этап {deal.stage_id}")
+            return
+
+        name, phones = ("", [])
+        if deal.contact_id:
+            name, phones = await self.bitrix.get_contact(deal.contact_id)
+        if not phones:
+            await self._no_messenger(deal_id, "no_phone", "в контакте нет телефона")
+            return
+
+        text = self.render("first", name, deal.title)
+        self.db.update(deal_id, name=name, phone=", ".join(phones), first_text=text)
+        if self.dry_run:
+            self.db.update(deal_id, status="skipped", last_error="DRY_RUN")
+            self.event(deal_id, "DRY_RUN: отправил бы первое", f"{phones} → {text!r}")
+            return
+
+        for phone in phones:
+            try:
+                res = await self.orbita.send_first(phone, text, f"deal-{deal_id}-first-{phone}", name or None)
+            except OrbitaError:
+                raise                                   # Орбита явно отказала — можно повторить
+            except Exception as e:                      # непредвиденный сбой посреди отправки
+                raise UnknownOutcome(f"{phone}: {type(e).__name__}: {e}") from e
+
+            if res.status == "sent":
+                self._mark_sent_first(deal_id, phone, res.dialog_id, res.channel)
+                await self.note(deal_id, f"Написал клиенту первым ({res.channel or 'мессенджер'}, {phone}).")
+                return
+            if res.status == "pending":
+                self.db.update(deal_id, status="pending_first", phone=phone, channel=res.channel,
+                               request_key=res.request_key, last_error=None)
+                self.event(deal_id, "первое сообщение передано, ждём подтверждения",
+                           f"{phone} {res.channel} {res.request_key}")
+                return
+            self.event(deal_id, "нет мессенджера на номере", phone)
+
+        await self._no_messenger(deal_id, "no_messenger", f"мессенджер не найден: {', '.join(phones)}")
+
+    def _mark_sent_first(self, deal_id: int, phone: str | None, dialog_id: str | None,
+                         channel: str | None) -> None:
+        due = datetime.now(timezone.utc) + timedelta(hours=self.s.followup_hours)
+        fields = dict(status="sent_first", dialog_id=dialog_id, channel=channel,
+                      first_sent_at=datetime.now(timezone.utc).isoformat(),
+                      followup_due_at=due.isoformat(timespec="seconds"), last_error=None)
+        if phone:
+            fields["phone"] = phone
+        self.db.update(deal_id, **fields)
+        self.event(deal_id, "первое сообщение отправлено", f"{phone or ''} {channel or ''}")
+
+    async def _no_messenger(self, deal_id: int, status: str, reason: str) -> None:
+        if not self.dry_run:
+            await self.bitrix.set_stage(deal_id, self.s.no_messenger_stage)
+        self.db.update(deal_id, status=status, last_error=reason)
+        self.event(deal_id, "этап → «Не нашёл мессенджер»", reason)
+        await self.note(deal_id, f"Не смог написать клиенту: {reason}. Нужен звонок менеджера.")
+
+    # ---------- напоминание ----------
+
+    async def followup(self, deal_id: int) -> None:
+        row = self.db.deal(deal_id)
+        if row is None or row["status"] != "sent_first":
+            return
+        if datetime.now(timezone.utc) < _ts(row["followup_due_at"]):
+            return
+        if self.s.followup_on and not self.in_window():
+            return
+
+        deal = await self.bitrix.get_deal(deal_id)
+        if deal.stage_semantic != "P":
+            self.db.update(deal_id, status="skipped", last_error=f"сделка закрыта ({deal.stage_id})")
+            self.event(deal_id, "напоминание не нужно", f"сделка закрыта ({deal.stage_id})")
+            return
+
+        replied = client_replied(await self.orbita.history(row["dialog_id"]), _ts(row["first_sent_at"]))
+        if replied is None:
+            self.db.update(deal_id, status="needs_check", last_error="не смог прочитать историю диалога")
+            self.event(deal_id, "не понял, ответил ли клиент")
+            await self.note(deal_id, "Не смог проверить, ответил ли клиент. Напоминание не отправлял.")
+            return
+        if replied:
+            await self._client_replied(deal_id, "по истории")
+            return
+        if not self.s.followup_on:
+            self.db.update(deal_id, status="no_reply")
+            self.event(deal_id, "клиент не ответил", "напоминание выключено")
+            await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч. "
+                                     "Напоминание выключено — дальше вручную.")
+            return
+
+        text = self.render("followup", row["name"] or "", deal.title)
+        try:
+            await self.orbita.send_reply(row["dialog_id"], text, f"deal-{deal_id}-followup")
+        except OrbitaError:
+            raise
+        except Exception as e:
+            raise UnknownOutcome(f"напоминание: {type(e).__name__}: {e}") from e
+        self.db.update(deal_id, status="sent_followup",
+                       followup_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        self.event(deal_id, "напоминание отправлено")
+        await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч — отправил напоминание.")
+
+    # ---------- клиент ответил ----------
+
+    async def _client_replied(self, deal_id: int, how: str) -> None:
+        """Клиент написал после нашего сообщения: робот больше не пишет, кроме ответа по шаблону."""
+        row = self.db.deal(deal_id)
+        fields: dict = {"status": "replied", "client_replied_at": now()}
+        if self.s.reply_on and not row["reply_sent_at"] and not self.dry_run:
+            due = datetime.now(timezone.utc) + timedelta(minutes=self.s.reply_delay_minutes)
+            fields["reply_due_at"] = due.isoformat(timespec="seconds")
+        self.db.update(deal_id, **fields)
+        self.event(deal_id, f"клиент ответил ({how})")
+        await self.note(deal_id, "Клиент ответил в мессенджере.")
+
+    async def poll_replies(self) -> None:
+        """Без вебхуков Орбиты: раз в REPLY_POLL смотрим историю свежих диалогов."""
+        edge = datetime.now(timezone.utc) - REPLY_POLL
+        for row in self.db.by_status("sent_first", "sent_followup"):
+            sent = _ts(row["first_sent_at"])
+            if not row["dialog_id"] or not sent or datetime.now(timezone.utc) - sent > REPLY_POLL_DAYS:
+                continue
+            if row["checked_at"] and _ts(row["checked_at"]) > edge:
+                continue
+            self.db.update(row["deal_id"], checked_at=now())
+            try:
+                replied = client_replied(await self.orbita.history(row["dialog_id"]), sent)
+            except Exception as e:  # noqa: BLE001
+                log.warning("сделка %s: история недоступна: %s", row["deal_id"], e)
+                continue
+            if replied:
+                await self._client_replied(row["deal_id"], "опрос")
+
+    async def auto_reply(self, deal_id: int) -> None:
+        """Ответ клиенту по шаблону: один раз, если менеджер не успел ответить сам."""
+        row = self.db.deal(deal_id)
+        if row is None or row["status"] != "replied" or row["reply_sent_at"] or not row["reply_due_at"]:
+            return
+        if not self.s.reply_on:
+            self.db.update(deal_id, reply_due_at=None)
+            return
+        history = await self.orbita.history(row["dialog_id"])
+        client_msg = first_incoming(history, _ts(row["first_sent_at"]))
+        if client_msg is None:
+            self.db.update(deal_id, reply_due_at=None)
+            self.event(deal_id, "ответ по шаблону не нужен", "не нашёл сообщение клиента в истории")
+            return
+        if answered_after(history, client_msg.at):
+            self.db.update(deal_id, reply_due_at=None)
+            self.event(deal_id, "ответ по шаблону не нужен", "менеджер уже ответил")
+            return
+        if datetime.now(timezone.utc) - client_msg.at > REPLY_MAX_LATE:
+            self.db.update(deal_id, reply_due_at=None)
+            self.event(deal_id, "ответ по шаблону не отправлен", "клиент написал больше 30 мин назад")
+            return
+        text = self.render("reply", row["name"] or "")
+        try:
+            await self.orbita.send_reply(row["dialog_id"], text, f"deal-{deal_id}-reply")
+        except OrbitaError:
+            raise
+        except Exception as e:
+            raise UnknownOutcome(f"ответ по шаблону: {type(e).__name__}: {e}") from e
+        self.db.update(deal_id, reply_sent_at=now(), reply_due_at=None)
+        self.event(deal_id, "ответ по шаблону отправлен")
+        await self.note(deal_id, "Ответил клиенту по шаблону. Дальше — менеджер.")
+
+    # ---------- вебхуки Орбиты ----------
+
+    async def on_orbita_event(self, ev: dict) -> None:
+        """Событие вебхука Орбиты (подпись уже проверена, дубли отсечены).
+
+        message.received — клиент ответил: напоминание больше не нужно, сразу, без ожидания.
+        message.sent / message.failed — исход отправки, на которую API ответил 202.
+        Остальное только пишем в журнал.
+        """
+        kind, data = ev.get("type", ""), ev.get("data") or {}
+        if ev.get("is_test"):
+            self.event(None, "Орбита: тестовое событие", kind)
+            return
+        async with self.lock:
+            if kind == "message.received" and data.get("direction", "incoming") == "incoming":
+                row = self.db.deal_by("dialog_id", data.get("dialog_id"))
+                if row and row["status"] in ("sent_first", "sent_followup", "no_reply"):
+                    await self._client_replied(row["deal_id"], "вебхук")
+            elif kind in ("message.sent", "message.failed") and data.get("request_key"):
+                row = self.db.deal_by("request_key", data["request_key"])
+                if not row or row["status"] != "pending_first":
+                    return
+                deal_id = row["deal_id"]
+                if kind == "message.sent":
+                    self._mark_sent_first(deal_id, None, str(data.get("dialog_id")), row["channel"])
+                    await self.note(deal_id, f"Написал клиенту первым ({row['channel']}, {row['phone']}).")
+                else:
+                    reason = data.get("reason_code") or "причина не указана"
+                    self.db.update(deal_id, status="needs_check", last_error=f"не доставлено: {reason}")
+                    self.event(deal_id, "первое сообщение не доставлено", reason)
+                    await self.note(deal_id, f"Первое сообщение не доставлено ({reason}). Нужен звонок менеджера.")
+            elif kind in ("channel.disconnected", "channel.connected"):
+                self.event(None, f"Орбита: {kind}", str(data.get("provider") or data.get("id") or ""))
+
+
+def render(tpl: str, name: str, deal_title: str = "") -> str:
+    """Подстановка {name} и {deal_title}. Ошибка в шаблоне — KeyError / ValueError / IndexError."""
+    return tpl.strip().format(name=name, deal_title=deal_title)

@@ -1,0 +1,431 @@
+"""Панель: настройки (робот, Битрикс, Орбита, сообщения, расписание) и команда. Только для администратора.
+
+Всё, что меняется здесь, хранится в базе и действует сразу, без перезапуска.
+Секреты после сохранения не показываются целиком; пустое поле — «не менять».
+"""
+
+import time
+from zoneinfo import ZoneInfo, available_timezones
+
+from fastapi import APIRouter, Depends, Form, Request
+from fastapi.responses import HTMLResponse
+
+from .auth import ROLES
+from .bitrix import Bitrix, normalize_phone
+from .config import CHANNEL_RU, CHANNELS
+from .orbita_api import OrbitaAPI
+from .ui_base import Ctx, e, go, mask
+from .worker import render
+
+TIMEZONES = ["Europe/Kaliningrad", "Europe/Moscow", "Europe/Samara", "Asia/Yekaterinburg", "Asia/Omsk",
+             "Asia/Novosibirsk", "Asia/Krasnoyarsk", "Asia/Irkutsk", "Asia/Yakutsk", "Asia/Vladivostok",
+             "Asia/Magadan", "Asia/Kamchatka", "Europe/Minsk", "Asia/Almaty", "Asia/Tashkent", "Europe/Istanbul",
+             "Asia/Dubai", "Asia/Shanghai"]
+SAMPLE_NAME, SAMPLE_TITLE = "Анна", "Заявка с сайта"
+
+
+def _secret_input(name: str, current: str, placeholder: str, clearable: bool = False) -> str:
+    hint = (f'<span class="hint">Сохранён: <code>{e(mask(current))}</code> — оставьте поле пустым, чтобы не менять.</span>'
+            if current else "")
+    clear = (f'<label class="check"><input type="checkbox" name="{name}_clear" value="1"> стереть</label>'
+             if clearable and current else "")
+    return (f'<input type="password" name="{name}" placeholder="{e(placeholder)}" autocomplete="off">'
+            f'{hint}{clear}')
+
+
+def _disconnect_btn(action: str, what: str) -> str:
+    return (f'<button class="danger" formaction="{action}" formnovalidate '
+            f'onclick="return confirm(\'Отключить {what}? Робот будет выключен, сохранённые ключи сотрутся.\')">'
+            f'Отключить</button>')
+
+
+def build_settings_router(ctx: Ctx) -> APIRouter:
+    worker, users = ctx.worker, ctx.users
+    db = worker.db
+    router = APIRouter()
+    admin_dep = ctx.admin_dep()
+
+    # ---------- страница ----------
+
+    async def robot_section() -> str:
+        s = worker.s
+        steps = [(s.bitrix_ok, "Битрикс подключён, этап «Не нашёл мессенджер» выбран", "#bitrix"),
+                 (s.orbita_ok, "Орбита подключена", "#orbita"),
+                 (bool(db.get("test_sent_at")), "Тестовое сообщение отправлено", "#test")]
+        lis = "".join(f'<li><span class="m {"ok" if done else "muted"}">{"✓" if done else "○"}</span>'
+                      f'<a href="{href}">{e(t)}</a></li>' for done, t, href in steps)
+        if s.enabled:
+            state = ('<p><span class="badge b-ok">включён</span> Робот пишет клиентам по новым сделкам.</p>'
+                     '<form method="post" action="/settings/disable"><button class="danger">Выключить робота</button>'
+                     ' <span class="hint">Новые сделки перестанут обрабатываться. Уже начатые диалоги тоже замрут.</span></form>')
+        elif s.configured:
+            state = ('<p><span class="badge b-off">выключен</span></p>'
+                     '<form method="post" action="/settings/enable"><button class="primary">Включить робота</button>'
+                     ' <span class="hint">Робот начнёт писать по сделкам, созданным после включения. '
+                     'Старые сделки не тронет.</span></form>')
+        else:
+            state = '<p><span class="badge b-off">выключен</span> Сначала подключите Битрикс и Орбиту.</p>'
+        last_test = db.get("test_result") or ""
+        test_disabled = "" if s.orbita_ok else "disabled"
+        return f"""<div class="card" id="robot"><h2 style="margin-top:0">Робот</h2>{state}
+<ol class="steps">{lis}</ol></div>
+<div class="card" id="test"><h2 style="margin-top:0">Тестовое сообщение</h2>
+<p class="muted">Отправит первое сообщение по текущему шаблону на указанный номер — как будто пришла заявка.
+Сделка в Битриксе не создаётся. Берите свой номер или номер коллеги.</p>
+<form method="post" action="/settings/test" class="bar">
+<input type="tel" name="phone" placeholder="+7 900 000-00-00" required {test_disabled}>
+<input type="text" name="name" placeholder="Имя (по желанию)" {test_disabled}>
+<button class="primary" {test_disabled}>Отправить</button></form>
+{f'<p class="hint">Последний тест: {e(last_test)}</p>' if last_test else ''}</div>"""
+
+    async def bitrix_section(base: str) -> str:
+        s = worker.s
+        live = ""
+        if worker.bitrix:
+            try:
+                cats = await worker.bitrix.categories()
+                cat = s.deal_category_id if s.deal_category_id is not None else "0"
+                stages = await worker.bitrix.stages(cat)
+                cat_opts = "".join(f'<option value="{e(i)}" {"selected" if i == cat else ""}>{e(n)}</option>'
+                                   for i, n in cats)
+                st_opts = '<option value="">— выберите —</option>' + "".join(
+                    f'<option value="{e(i)}" {"selected" if i == s.no_messenger_stage else ""}>{e(n)}</option>'
+                    for i, n in stages)
+                live = f"""<label class="field"><span>Воронка</span><select name="category">{cat_opts}</select>
+<span class="hint">Робот пишет только по сделкам этой воронки.</span></label>
+<label class="field"><span>Этап «Не нашёл мессенджер»</span><select name="stage">{st_opts}</select>
+<span class="hint">Куда переносить сделку, если номера клиента нет ни в одном мессенджере. Нет такого этапа —
+создайте его в Битриксе (CRM → Сделки → Настроить воронку) и обновите страницу.
+После смены воронки сохраните и выберите этап заново.</span></label>"""
+            except Exception as ex:  # noqa: BLE001
+                live = f'<p class="bad">Битрикс не отвечает: {e(type(ex).__name__)}: {e(ex)}</p>'
+        status = (f'<span class="badge b-ok">подключён</span> <span class="muted">{e(s.portal)}</span>'
+                  if s.bitrix_webhook else '<span class="badge b-warn">не подключён</span>')
+        disconnect = _disconnect_btn("/settings/bitrix/disconnect", "Битрикс") if s.bitrix_webhook else ""
+        return f"""<form class="card" id="bitrix" method="post" action="/settings/bitrix">
+<h2 style="margin-top:0">Битрикс</h2><p>{status}</p>
+<label class="field"><span>Адрес входящего вебхука</span>
+{_secret_input("webhook", s.bitrix_webhook, "https://ваш-портал.bitrix24.ru/rest/1/abc123…/")}
+<span class="hint">Битрикс → Разработчикам → Другое → Входящий вебхук, права «CRM (crm)». Подробно — docs/НАСТРОЙКА.md.</span></label>
+{live}
+<h3>События о новых сделках (по желанию)</h3>
+<p class="hint">Без них робот проверяет Битрикс раз в минуту. С ними — пишет клиенту в ту же секунду.
+Битрикс → Разработчикам → Другое → Исходящий вебхук, событие «Создание сделки» (ONCRMDEALADD), адрес:</p>
+<p><code>{e(base)}/bitrix/deal-add</code></p>
+<label class="field"><span>Токен приложения (application_token) исходящего вебхука</span>
+{_secret_input("app_token", s.bitrix_app_token, "токен из настроек исходящего вебхука", clearable=True)}</label>
+<div class="bar"><button class="primary">Сохранить</button>{disconnect}</div></form>"""
+
+    async def orbita_section(base: str) -> str:
+        s = worker.s
+        live = ""
+        if worker.orbita:
+            try:
+                acc = await worker.orbita.account()
+                chs = {c["канал"]: c["подключён"] for c in await worker.orbita.channels()}
+                live = (f'<p>Аккаунт «{e(acc.get("name"))}», подписка '
+                        f'{"<span class=ok>активна</span>" if acc.get("subscription_active") else "<span class=bad>неактивна</span>"}. '
+                        "Каналы: " + ", ".join(
+                            f'{CHANNEL_RU.get(c, c)} — {"<span class=ok>подключён</span>" if ok else "<span class=muted>нет</span>"}'
+                            for c, ok in chs.items()) + "</p>")
+            except Exception as ex:  # noqa: BLE001
+                live = f'<p class="bad">Орбита не отвечает: {e(type(ex).__name__)}: {e(ex)}</p>'
+        status = ('<span class="badge b-ok">подключена</span>' if s.orbita_api_key
+                  else '<span class="badge b-warn">не подключена</span>')
+        disconnect = _disconnect_btn("/settings/orbita/disconnect", "Орбиту") if s.orbita_api_key else ""
+        checks = "".join(
+            f'<label class="check"><input type="checkbox" name="channels" value="{c}" '
+            f'{"checked" if c in s.orbita_channels else ""}> {CHANNEL_RU[c]}</label>' for c in CHANNELS)
+        return f"""<form class="card" id="orbita" method="post" action="/settings/orbita">
+<h2 style="margin-top:0">Орбита</h2><p>{status}</p>{live}
+<label class="field"><span>Ключ API</span>
+{_secret_input("api_key", s.orbita_api_key, "orb_pk_…")}
+<span class="hint">Кабинет Орбиты → Разработчикам → Ключи API. Права: «Диалоги: чтение» (dialogs:read),
+«Ответ в существующий диалог» (messages:send), «Первое сообщение новому человеку» (dialogs:start).</span></label>
+<div class="field"><span>Где искать клиента</span>{checks}
+<span class="hint">Робот пробует мессенджеры по порядку: WhatsApp → Max → Telegram, пишет в первый, где нашёлся номер.
+Telegram последний: Орбита разрешает искать в нём не больше 30 номеров в сутки.</span></div>
+<h3>Вебхуки Орбиты (рекомендуется)</h3>
+<p class="hint">Без них робот узнаёт об ответе клиента только при проверке истории (раз в 5 минут, если включён
+ответ по шаблону, иначе — перед напоминанием). Кабинет Орбиты → Разработчикам → Вебхуки → Добавить,
+события message.received, message.sent, message.failed, адрес:</p>
+<p><code>{e(base)}/orbita/webhook</code></p>
+<label class="field"><span>Секрет подписки</span>
+{_secret_input("webhook_secret", s.orbita_webhook_secret, "whsec_…", clearable=True)}</label>
+<div class="bar"><button class="primary">Сохранить</button>{disconnect}</div></form>"""
+
+    def messages_section() -> str:
+        s = worker.s
+
+        def preview(tpl: str) -> str:
+            try:
+                return e(render(tpl, SAMPLE_NAME, SAMPLE_TITLE))
+            except (KeyError, IndexError, ValueError) as ex:
+                return f'<span class="bad">Ошибка в шаблоне: {e(ex)}</span>'
+
+        def block(key: str, title: str, text: str, toggle: str | None, on: bool, help_: str) -> str:
+            sw = (f'<label class="check"><input type="checkbox" name="{toggle}" value="1" {"checked" if on else ""}>'
+                  f' отправлять</label>') if toggle else '<p class="hint">Отправляется всегда, пока робот включён.</p>'
+            return f"""<div class="grid2" style="margin-bottom:16px"><div><h3>{title}</h3>{sw}
+<textarea name="{key}">{e(text)}</textarea><p class="hint">{help_}</p></div>
+<div><h3 class="muted">Как увидит клиент</h3><div class="preview">{preview(text)}</div></div></div>"""
+
+        return f"""<form class="card" id="messages" method="post" action="/settings/messages">
+<h2 style="margin-top:0">Сообщения</h2>
+<p class="hint">Подстановки: <code>{{name}}</code> — имя клиента из контакта Битрикса, <code>{{deal_title}}</code> —
+название сделки. Фигурные скобки для других целей пишите двойными: <code>{{{{</code> и <code>}}}}</code>.</p>
+{block("tpl_first", "1. Первое сообщение", s.tpl_first, None, True,
+       "Уходит клиенту, как только в Битриксе появилась сделка (в пределах окна отправки).")}
+{block("tpl_followup", "2. Напоминание, если клиент молчит", s.tpl_followup, "followup_on", s.followup_on,
+       "Уходит один раз, если клиент не ответил на первое сообщение.")}
+<label class="field" style="max-width:280px"><span>Через сколько часов напоминать</span>
+<input type="number" name="followup_hours" min="0.05" max="720" step="0.05" value="{s.followup_hours:g}"></label>
+{block("tpl_reply", "3. Ответ на первое сообщение клиента", s.tpl_reply, "reply_on", s.reply_on,
+       "Уходит один раз, когда клиент впервые написал в ответ. Не уходит, если менеджер успел ответить сам "
+       "за время паузы, и если клиент написал больше 30 минут назад. {deal_title} здесь пустой.")}
+<label class="field" style="max-width:280px"><span>Пауза перед ответом, минут</span>
+<input type="number" name="reply_delay_minutes" min="0" max="60" step="0.5" value="{s.reply_delay_minutes:g}"></label>
+<label class="field" style="max-width:420px"><span>Обращение, если в контакте нет имени</span>
+<input type="text" name="tpl_no_name" value="{e(s.tpl_no_name)}">
+<span class="hint">Подставляется вместо {{name}}. Например: «Здравствуйте».</span></label>
+<button class="primary">Сохранить</button></form>"""
+
+    def schedule_section() -> str:
+        s = worker.s
+        zones = TIMEZONES if s.tz_name in TIMEZONES else [s.tz_name, *TIMEZONES]
+        opts = "".join(f'<option value="{z}" {"selected" if z == s.tz_name else ""}>{z}</option>' for z in zones)
+        return f"""<form class="card" id="schedule" method="post" action="/settings/schedule">
+<h2 style="margin-top:0">Расписание</h2>
+<p class="hint">Первое сообщение и напоминание уходят только в это время. Заявка ночью получит сообщение утром
+(если ей ещё нет 48 часов). Ответ по шаблону уходит в любое время — клиент только что написал сам.</p>
+<div class="bar"><label class="field"><span>С</span><input type="time" name="start" value="{e(s.window_start)}"></label>
+<label class="field"><span>До</span><input type="time" name="end" value="{e(s.window_end)}"></label>
+<label class="field"><span>Часовой пояс</span><select name="tz">{opts}</select></label></div>
+<button class="primary">Сохранить</button></form>"""
+
+    @router.get("/settings", response_class=HTMLResponse)
+    async def settings(request: Request, msg: str = "", user=Depends(admin_dep)):
+        base = ctx.public_url(request)
+        toc = "".join(f'<a href="#{a}">{t}</a>' for a, t in (
+            ("robot", "Робот"), ("bitrix", "Битрикс"), ("orbita", "Орбита"), ("messages", "Сообщения"),
+            ("schedule", "Расписание")))
+        body = (f'<h1>Настройки</h1><p class="muted">Изменения действуют сразу, перезапуск не нужен.</p>'
+                f'<div class="toc">{toc}</div>{await robot_section()}{await bitrix_section(base)}'
+                f'{await orbita_section(base)}{messages_section()}{schedule_section()}')
+        return ctx.page(user, "Настройки", "settings", body, msg)
+
+    # ---------- сохранение ----------
+
+    @router.post("/settings/bitrix")
+    async def save_bitrix(webhook: str = Form(""), app_token: str = Form(""), app_token_clear: str = Form(""),
+                          category: str = Form(None), stage: str = Form(None), user=Depends(admin_dep)):
+        s = worker.s
+        changes: dict = {}
+        webhook = webhook.strip()
+        client = worker.bitrix
+        if webhook:
+            if "/rest/" not in webhook or not webhook.startswith("https://"):
+                return go("/settings#bitrix", "!Адрес вебхука должен выглядеть как https://портал.bitrix24.ru/rest/1/код/")
+            client = Bitrix(webhook)
+            try:
+                await client.max_deal_id()
+            except Exception as ex:  # noqa: BLE001
+                return go("/settings#bitrix", f"!Битрикс не принял адрес: {ex}. Проверьте, что у вебхука есть права crm.")
+            changes["bitrix_webhook"] = webhook.rstrip("/") + "/"
+        if app_token.strip():
+            changes["bitrix_app_token"] = app_token.strip()
+        elif app_token_clear:
+            changes["bitrix_app_token"] = ""
+        msg = "Сохранено"
+        current_cat = s.deal_category_id if s.deal_category_id is not None else "0"
+        if webhook:
+            # Новый адрес — списки воронок и этапов на странице были от старого; оставляем этап, если он есть и тут
+            stages = dict(await client.stages(current_cat))
+            if s.no_messenger_stage not in stages:
+                changes["no_messenger_stage"] = ""
+                msg = "Битрикс подключён. Теперь выберите этап «Не нашёл мессенджер»"
+        elif client and category is not None:
+            if category != current_cat:
+                changes["deal_category_id"] = category
+                changes["no_messenger_stage"] = ""
+                msg = "Воронка сменена — выберите этап «Не нашёл мессенджер» для неё"
+            elif stage:
+                if stage in dict(await client.stages(category)):
+                    changes["deal_category_id"] = category
+                    changes["no_messenger_stage"] = stage
+                else:
+                    msg = "!Такого этапа нет в выбранной воронке"
+        worker.save(**changes)
+        worker.event(None, "настройки Битрикса изменены", user["email"])
+        return go("/settings#bitrix", msg)
+
+    @router.post("/settings/orbita")
+    async def save_orbita(api_key: str = Form(""), webhook_secret: str = Form(""), webhook_secret_clear: str = Form(""),
+                          channels: list[str] = Form([]), user=Depends(admin_dep)):
+        s = worker.s
+        changes: dict = {}
+        chosen = [c for c in CHANNELS if c in channels]
+        if not chosen:
+            return go("/settings#orbita", "!Отметьте хотя бы один мессенджер")
+        changes["orbita_channels"] = chosen
+        api_key = api_key.strip()
+        if api_key:
+            try:
+                await OrbitaAPI(s.orbita_api_url, api_key, chosen).account()
+            except Exception as ex:  # noqa: BLE001
+                return go("/settings#orbita", f"!Орбита не приняла ключ: {ex}")
+            changes["orbita_api_key"] = api_key
+        if webhook_secret.strip():
+            changes["orbita_webhook_secret"] = webhook_secret.strip()
+        elif webhook_secret_clear:
+            changes["orbita_webhook_secret"] = ""
+        worker.save(**changes)
+        worker.event(None, "настройки Орбиты изменены", user["email"])
+        return go("/settings#orbita", "Сохранено")
+
+    @router.post("/settings/messages")
+    async def save_messages(tpl_first: str = Form(...), tpl_followup: str = Form(...), tpl_reply: str = Form(...),
+                            tpl_no_name: str = Form(""), followup_on: str = Form(""), reply_on: str = Form(""),
+                            followup_hours: float = Form(24), reply_delay_minutes: float = Form(2),
+                            user=Depends(admin_dep)):
+        texts = {"tpl_first": tpl_first, "tpl_followup": tpl_followup, "tpl_reply": tpl_reply}
+        titles = {"tpl_first": "первом сообщении", "tpl_followup": "напоминании", "tpl_reply": "ответе клиенту"}
+        for k, v in texts.items():
+            v = v.replace("\r\n", "\n").strip()
+            if not v:
+                return go("/settings#messages", f"!Пустой текст в {titles[k]}")
+            try:
+                render(v, SAMPLE_NAME, SAMPLE_TITLE)
+            except (KeyError, IndexError, ValueError) as ex:
+                return go("/settings#messages", f"!Ошибка в {titles[k]}: {ex}. Доступно только {{name}} и {{deal_title}}")
+            texts[k] = v
+        if not (0.05 <= followup_hours <= 720) or not (0 <= reply_delay_minutes <= 60):
+            return go("/settings#messages", "!Проверьте часы напоминания и паузу ответа")
+        worker.save(**texts, tpl_no_name=tpl_no_name.strip() or "Здравствуйте",
+                    followup_on=bool(followup_on), reply_on=bool(reply_on),
+                    followup_hours=followup_hours, reply_delay_minutes=reply_delay_minutes)
+        worker.event(None, "шаблоны изменены", user["email"])
+        return go("/settings#messages", "Сохранено, действует для следующих сообщений")
+
+    @router.post("/settings/schedule")
+    async def save_schedule(start: str = Form(...), end: str = Form(...), tz: str = Form(...),
+                            user=Depends(admin_dep)):
+        if tz not in available_timezones():
+            return go("/settings#schedule", "!Неизвестный часовой пояс")
+        try:
+            from datetime import time as dtime
+            if dtime.fromisoformat(start) >= dtime.fromisoformat(end):
+                return go("/settings#schedule", "!Начало окна должно быть раньше конца")
+        except ValueError:
+            return go("/settings#schedule", "!Время в формате ЧЧ:ММ")
+        ZoneInfo(tz)
+        worker.save(window_start=start[:5], window_end=end[:5], tz_name=tz)
+        worker.event(None, "расписание изменено", f"{start}–{end} {tz}, {user['email']}")
+        return go("/settings#schedule", "Сохранено")
+
+    @router.post("/settings/bitrix/disconnect")
+    async def disconnect_bitrix(user=Depends(admin_dep)):
+        if worker.s.enabled:
+            worker.disable()
+        worker.save(bitrix_webhook="", bitrix_app_token="", no_messenger_stage="", deal_category_id=None)
+        worker.event(None, "Битрикс отключён", user["email"])
+        return go("/settings#bitrix", "Битрикс отключён, робот выключен")
+
+    @router.post("/settings/orbita/disconnect")
+    async def disconnect_orbita(user=Depends(admin_dep)):
+        if worker.s.enabled:
+            worker.disable()
+        worker.save(orbita_api_key="", orbita_webhook_secret="")
+        worker.event(None, "Орбита отключена", user["email"])
+        return go("/settings#orbita", "Орбита отключена, робот выключен")
+
+    # ---------- робот ----------
+
+    @router.post("/settings/enable")
+    async def enable(user=Depends(admin_dep)):
+        if not worker.s.configured:
+            return go("/settings#robot", "!Сначала подключите Битрикс (с этапом) и Орбиту")
+        try:
+            start = await worker.enable()
+        except Exception as ex:  # noqa: BLE001
+            return go("/settings#robot", f"!Не получилось включить: Битрикс не ответил ({ex})")
+        return go("/settings#robot", f"Робот включён. Сделки до ID {start} он не тронет.")
+
+    @router.post("/settings/disable")
+    async def disable(user=Depends(admin_dep)):
+        worker.disable()
+        return go("/settings#robot", "Робот выключен")
+
+    @router.post("/settings/test")
+    async def test_send(phone: str = Form(...), name: str = Form(""), user=Depends(admin_dep)):
+        p = normalize_phone(phone)
+        if not p:
+            return go("/settings#test", "!Не похоже на номер телефона")
+        if worker.orbita is None:
+            return go("/settings#test", "!Сначала подключите Орбиту")
+        text = worker.render("first", name.strip(), SAMPLE_TITLE)
+        try:
+            res = await worker.orbita.send_first(p, text, f"test-{int(time.time())}-{p}", name.strip() or None)
+        except Exception as ex:  # noqa: BLE001
+            worker.event(None, "тест: ошибка", f"{p}: {ex}")
+            return go("/settings#test", f"!Не отправлено: {ex}")
+        if res.status == "no_messenger":
+            result = f"{p}: номера нет ни в одном из выбранных мессенджеров"
+            db.put("test_result", result)
+            worker.event(None, "тест: мессенджер не найден", p)
+            return go("/settings#test", "!" + result + ". Проверьте номер или отметьте другие мессенджеры.")
+        result = (f"{p}: отправлено в {CHANNEL_RU.get(res.channel, res.channel)}" if res.status == "sent"
+                  else f"{p}: передано в {CHANNEL_RU.get(res.channel, res.channel)}, ждём подтверждения")
+        db.put("test_sent_at", int(time.time()))
+        db.put("test_result", result)
+        worker.event(None, "тест: сообщение отправлено", f"{p} {res.channel} ({user['email']})")
+        return go("/settings#test", result + ". Проверьте телефон.")
+
+    # ---------- команда ----------
+
+    def team_page(user, msg: str = "", new_link: str = ""):
+        rows = "".join(
+            f'<tr><td>{e(u["email"])}</td><td>{e(u["name"])}</td><td>{ROLES[u["role"]]}</td>'
+            f'<td class="num">{u["created_at"][:10]}</td><td>' +
+            ("" if u["id"] == user["id"] else
+             f'<form method="post" action="/team/{u["id"]}/delete" class="inline" '
+             f'onsubmit="return confirm(\'Удалить {e(u["email"])}?\')"><button class="danger">Удалить</button></form>') +
+            "</td></tr>" for u in users.all())
+        invites = users.open_invites()
+        inv = (f'<p class="hint">Неиспользованных приглашений: {len(invites)} '
+               f'(истекают через 7 дней после выдачи).</p>') if invites else ""
+        link = (f'<div class="card"><b>Ссылка-приглашение</b><p class="hint">Отправьте её человеку. Она показывается '
+                f'один раз, действует 7 дней и только для одной учётной записи.</p><p><code>{e(new_link)}</code></p></div>'
+                if new_link else "")
+        body = f"""<h1>Команда</h1><p class="muted">Кто может входить в панель. Администратор видит и меняет
+настройки, оператор — только сделки и журнал.</p>{link}
+<div class="wrap"><table><tr><th>Почта</th><th>Имя</th><th>Роль</th><th>С</th><th></th></tr>{rows}</table></div>
+<h2>Пригласить</h2><form class="card bar" method="post" action="/team/invite">
+<select name="role"><option value="operator">оператор</option><option value="admin">администратор</option></select>
+<button class="primary">Создать ссылку-приглашение</button></form>{inv}"""
+        return ctx.page(user, "Команда", "team", body, msg)
+
+    @router.get("/team", response_class=HTMLResponse)
+    async def team(msg: str = "", user=Depends(admin_dep)):
+        return team_page(user, msg)
+
+    @router.post("/team/invite", response_class=HTMLResponse)
+    async def invite(request: Request, role: str = Form("operator"), user=Depends(admin_dep)):
+        if role not in ROLES:
+            return go("/team", "!Неизвестная роль")
+        token = users.new_invite(role, user["id"])
+        worker.event(None, "выдано приглашение", f"{role}, {user['email']}")
+        return team_page(user, new_link=f"{ctx.public_url(request)}/invite/{token}")
+
+    @router.post("/team/{user_id}/delete")
+    async def delete_user(user_id: int, user=Depends(admin_dep)):
+        target = users.by_id(user_id)
+        if target is None or target["id"] == user["id"]:
+            return go("/team", "!Нельзя удалить себя")
+        if target["role"] == "admin" and users.admins() <= 1:
+            return go("/team", "!Это последний администратор")
+        users.delete(user_id)
+        worker.event(None, "пользователь удалён", f"{target['email']} ({user['email']})")
+        return go("/team", f"{target['email']} удалён")
+
+    return router

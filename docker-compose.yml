@@ -1,0 +1,30 @@
+# Робот первого контакта: приложение + Caddy (HTTPS-сертификат Let's Encrypt автоматически).
+# Запуск: заполнить .env (DOMAIN=…) и выполнить `docker compose up -d`. Подробно — УСТАНОВКА.md.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - data:/data                 # база: сделки, настройки, пользователи
+    ports:
+      - "127.0.0.1:8080:8080"      # только для самого сервера (проверка, SSH-туннель); снаружи — через Caddy
+
+  caddy:
+    image: caddy:2.8
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data           # сертификаты
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  data:
+  caddy_data:
+  caddy_config:
