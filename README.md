@@ -29,7 +29,7 @@
 **Попробовать на своём компьютере** (нужен [Docker Desktop](https://www.docker.com/products/docker-desktop/)):
 
 ```bash
-git clone <адрес репозитория> first-contact && cd first-contact
+git clone https://github.com/zznelor/contact_robot.git first-contact && cd first-contact
 cp .env.example .env
 docker compose up -d app
 docker compose exec app python -m first_contact setup-code
@@ -40,7 +40,7 @@ docker compose exec app python -m first_contact setup-code
 **Для постоянной работы — на сервере** (1 ядро, 1 ГБ памяти, Docker) с доменом или поддоменом:
 
 ```bash
-git clone <адрес репозитория> /opt/first-contact && cd /opt/first-contact
+git clone https://github.com/zznelor/contact_robot.git /opt/first-contact && cd /opt/first-contact
 cp .env.example .env          # впишите DOMAIN=robot.ваша-компания.ru
 docker compose up -d
 docker compose logs app | grep "Код первого входа"
