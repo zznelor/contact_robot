@@ -1,0 +1,19 @@
+# Разработка: робот из исходников, без Caddy и HTTPS, панель на http://127.0.0.1:8080.
+# Запуск: docker compose -f docker-compose.local.yml up -d --build
+# Клиентская установка (с Caddy и доменом) — docker-compose.yml, см. docs/УСТАНОВКА.md.
+name: first-contact-local
+
+services:
+  app:
+    build: .
+    environment:
+      - PORT=8080
+      - POLL_SECONDS=60
+      - DRY_RUN=1                  # ничего не отправлять и не менять в Битриксе; 0 — по-настоящему
+    volumes:
+      - data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  data:

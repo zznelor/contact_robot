@@ -44,7 +44,7 @@ def build_router(ctx: Ctx) -> APIRouter:
 <label class="field"><span>Пароль</span><input type="password" name="password" required autocomplete="current-password"></label>
 <button class="primary">Войти</button></form>
 <p class="hint">Забыли пароль — попросите администратора панели выдать новое приглашение, или администратор
-сервера выполнит <code>reset-password</code> (см. УСТАНОВКА.md).</p>""", narrow=True)
+сервера выполнит <code>reset-password</code> (см. docs/УСТАНОВКА.md).</p>""", narrow=True)
 
     @router.post("/login")
     async def login(request: Request, email: str = Form(...), password: str = Form(...)):

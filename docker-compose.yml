@@ -1,5 +1,5 @@
 # Робот первого контакта: приложение + Caddy (HTTPS-сертификат Let's Encrypt автоматически).
-# Запуск: заполнить .env (DOMAIN=…) и выполнить `docker compose up -d`. Подробно — УСТАНОВКА.md.
+# Запуск: заполнить .env (DOMAIN=…) и выполнить `docker compose up -d`. Подробно — docs/УСТАНОВКА.md.
 services:
   app:
     build: .

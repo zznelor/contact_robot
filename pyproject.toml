@@ -11,5 +11,18 @@ dependencies = [
     "python-multipart>=0.0.9",
 ]
 
-[tool.uv]
-package = false
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "mutmut>=3",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/first_contact"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

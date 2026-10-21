@@ -18,7 +18,8 @@ from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-ROOT = Path(__file__).resolve().parent.parent
+# Корень репозитория: src/first_contact/config.py → три уровня вверх. Там .env и data/ при запуске без Docker
+ROOT = Path(__file__).resolve().parents[2]
 ENV_FILES = [ROOT / ".env"]
 
 CHANNELS = ["whatsapp", "max", "telegram"]   # что умеет «написать первым» в Орбите
