@@ -191,6 +191,9 @@ class DB:
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.conn.executescript(INDEXES)
+        # Первое сообщение, переданное с 202 версией до pending_at: ожидание началось с последней записи строки
+        # (тогда это и была запись pending_first). Без него поздний message.sent не узнал бы свою отправку
+        self.conn.execute("UPDATE deals SET pending_at=updated_at WHERE status='pending_first' AND pending_at IS NULL")
         # Статус версий с MCP: сделка ждала действия «написать первым» — теперь оно есть
         self.conn.execute("UPDATE deals SET status='new' WHERE status='waiting_orbita'")
 

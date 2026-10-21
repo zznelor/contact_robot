@@ -323,8 +323,7 @@ def test_bitrix_down_does_not_stop_other_steps(replying, bitrix, orbita):
     """Опрос Битрикса падает — ответ по шаблону и таймаут неподтверждённой отправки всё равно идут."""
     client_writes(replying, bitrix, orbita, 170, lambda first: [out(first), inc(datetime.now(UTC))])
     replying.db.add_deal(171)
-    replying.db.update(171, status="pending_first", request_key="rk-171")
-    replying.db.conn.execute("UPDATE deals SET updated_at=? WHERE deal_id=171", (ago(hours=1).isoformat(),))
+    replying.db.update(171, status="pending_first", request_key="rk-171", pending_at=ago(hours=1).isoformat())
 
     async def down(*a):
         raise RuntimeError("Битрикс недоступен")

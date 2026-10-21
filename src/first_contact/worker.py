@@ -373,7 +373,7 @@ class Worker:
         row = self.db.deal(deal_id)
         if row is None or row["status"] != "pending_first":
             return
-        if datetime.now(timezone.utc) - _ts(row["pending_at"] or row["updated_at"]) <= PENDING_TIMEOUT:
+        if datetime.now(timezone.utc) - _ts(row["pending_at"]) <= PENDING_TIMEOUT:
             return
         self.db.update(deal_id, status="needs_check", last_error="нет подтверждения отправки от Орбиты")
         self.event(deal_id, "нет подтверждения отправки", row["request_key"] or "")
