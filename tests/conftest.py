@@ -352,11 +352,13 @@ class PanelBitrix:
 
 
 class PanelOrbita:
-    """Орбита для панели: ключ «bad» не принимается; номер на «1» есть в WhatsApp, остальные — нигде."""
-    sent: list = []
+    """Орбита для панели: ключ «bad» не принимается; номер на «1» есть в WhatsApp, остальные — нигде.
+    sent — тестовые отправки этого клиента (worker.orbita.sent). Не атрибут класса: модуль теста, импортированный
+    в прошлой сессии pytest того же процесса (так гоняет mutmut), держал бы класс прошлого conftest."""
 
     def __init__(self, url="", key="", channels=()):
         self.key = key
+        self.sent: list[tuple[str, str, str]] = []
 
     async def account(self):
         if self.key == "bad":
@@ -370,7 +372,7 @@ class PanelOrbita:
         return {"whatsapp": True, "max": None, "telegram": False}
 
     async def send_first(self, phone, text, key, name=None):
-        PanelOrbita.sent.append((phone, text, key))
+        self.sent.append((phone, text, key))
         return FirstSendResult("sent", "9", "whatsapp") if phone.endswith("1") else FirstSendResult("no_messenger")
 
 
@@ -380,7 +382,6 @@ def panel(db, monkeypatch):
     monkeypatch.setattr(ui_settings, "OrbitaAPI", PanelOrbita)
     monkeypatch.setattr(worker_mod, "Bitrix", PanelBitrix)
     monkeypatch.setattr(worker_mod, "OrbitaAPI", PanelOrbita)
-    monkeypatch.setattr(PanelOrbita, "sent", [])
     s = config.load(db)
     w = Worker(config.env(), s, db)
     app = create_app(w)

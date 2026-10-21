@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from conftest import PanelOrbita, run
+from conftest import run
 from first_contact import config
 
 from test_ui_auth import is_error
@@ -152,7 +152,7 @@ def test_schedule(panel, admin):
 def test_test_message_sent(configured, admin):
     r = admin.post("/settings/test", data={"phone": "8 999 000-00-01"}, follow_redirects=False)
     assert not is_error(r) and configured.db.get("test_sent_at")
-    assert [p for p, _, _ in PanelOrbita.sent] == ["+79990000001"]
+    assert [p for p, _, _ in configured.worker.orbita.sent] == ["+79990000001"]
 
 
 def test_test_message_number_nowhere(configured, admin):
@@ -187,4 +187,4 @@ def test_test_message_not_sent_in_dry_run(configured, admin, monkeypatch):
     monkeypatch.setattr(configured.worker.env, "dry_run", True)
     r = admin.post("/settings/test", data={"phone": "8 999 000-00-01"}, follow_redirects=False)
     assert is_error(r)
-    assert PanelOrbita.sent == [] and not configured.db.get("test_sent_at")
+    assert configured.worker.orbita.sent == [] and not configured.db.get("test_sent_at")
