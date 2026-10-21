@@ -45,7 +45,12 @@ RETRYABLE = {"error", "needs_check", "skipped", "no_messenger", "no_phone"}
 
 
 class UnknownOutcome(Exception):
-    """Отправка могла уйти, а могла и нет. Повторять нельзя — нужен человек."""
+    """Отправка могла уйти, а могла и нет. Повторять нельзя — нужен человек. fields — что записать той же записью,
+    что ставит «проверить вручную»."""
+
+    def __init__(self, message: str, **fields):
+        super().__init__(message)
+        self.fields = fields
 
 
 @dataclass
@@ -262,7 +267,7 @@ class Worker:
         try:
             await step(deal_id)
         except UnknownOutcome as e:
-            self.db.update(deal_id, status="needs_check", last_error=str(e))
+            self.db.update(deal_id, status="needs_check", last_error=str(e), **e.fields)
             self.event(deal_id, "исход отправки неизвестен", str(e))
             await self.note(deal_id, "Не уверен, ушло ли сообщение клиенту. Проверьте переписку в Орбите.")
         except Exception as e:  # noqa: BLE001
@@ -313,8 +318,9 @@ class Worker:
         else:
             status = "new"
         # Решение человека — продолжить: ручная остановка снимается
+        # Человек проверил переписку (панель предупреждала о втором сообщении): отметка об отвергнутом ключе снимается
         fields: dict = {"status": status, "attempts": 0, "last_error": None, "next_attempt_at": None,
-                        "manual_stop_at": None}
+                        "manual_stop_at": None, "reused_key_step": None}
         # Повтор шага после определённого отказа — новый ключ идемпотентности этого шага (-r<n>): с прежним
         # Орбита вернула бы исход прошлой попытки и сообщение не ушло бы. Исход прошлой попытки неизвестен
         # (сохранён followup_key / reply_key) — тот же ключ: если сообщение дошло, Орбита второе не отправит.
@@ -699,8 +705,11 @@ class Worker:
         try:
             return await self.orbita.send_reply(row["dialog_id"], text, key)
         except OrbitaAPIError as e:
-            if e.key_reused:        # прежний запрос с этим ключом мог отправить — исход выясняет человек
-                raise UnknownOutcome(f"{title}: {e}") from e
+            if e.key_reused:
+                # Ключ уже приходил с другим телом: прежний запрос мог отправить — исход выясняет человек. Исход нашего
+                # тела этот ключ не вернёт никогда, хранить его незачем: снимается той же записью, что ставит
+                # «проверить вручную», и «Повторить» пойдёт новым -r<n> (панель предупредит о втором сообщении)
+                raise UnknownOutcome(f"{title}: {e}", **{key_col: None, text_col: None, "reused_key_step": step}) from e
             if e.definite:
                 self.db.update(deal_id, **{key_col: None, text_col: None})
             raise

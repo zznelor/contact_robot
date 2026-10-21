@@ -255,6 +255,10 @@ def build_router(ctx: Ctx) -> APIRouter:
             if not r["first_sent_at"] and (r["status"] == "needs_check" or r["request_key"]):
                 hint = ("Сначала откройте переписку в Орбите: если первое сообщение дошло, "
                         "повтор отправит его второй раз")
+            elif r["reused_key_step"]:
+                # Орбита отвергла ключ шага (idempotency_key_reused): повтор идёт новым ключом
+                what = "напоминание дошло" if r["reused_key_step"] == "followup" else "ответ по шаблону дошёл"
+                hint = f"Сначала откройте переписку в Орбите: если {what}, повтор отправит его второй раз"
             actions.append(_btn(deal_id, "retry", "Повторить", "primary", hint))
         if r["status"] in ("sent_first", "sent_followup", "needs_check", "pending_first", "no_reply"):
             actions.append(_btn(deal_id, "replied", "Клиент ответил", "",

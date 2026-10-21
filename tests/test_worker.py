@@ -876,19 +876,20 @@ def test_retry_with_same_key_repeats_original_text(running, bitrix, orbita, step
 
 
 @pytest.mark.parametrize("step", ["followup", "reply"])
-def test_key_reused_is_not_a_definite_failure(running, bitrix, orbita, step):
-    """422 idempotency_key_reused: этот ключ уже приходил в Орбиту — прошлый запрос мог отправить сообщение.
-    Это не отказ: человек проверяет переписку, намерение остаётся, «Повторить» — тем же ключом."""
+def test_key_reused_needs_check_and_retry_goes_with_new_key(running, bitrix, orbita, step):
+    """422 idempotency_key_reused: ключ уже приходил в Орбиту с другим телом — прошлый запрос мог отправить
+    сообщение, но исход нашего тела этот ключ не вернёт никогда. Человек проверяет переписку («проверить вручную»),
+    «Повторить» идёт новым ключом, а не по кругу тем же."""
     lost_step_answer(running, bitrix, orbita, step, 173)
     run(running.retry(173, "a@x.ru"))
     orbita.reply_mode = "reused"
     run(running.tick())
-    row = running.db.deal(173)
-    assert row["status"] == "needs_check" and row[f"{step}_key"] == f"deal-173-{step}"
+    assert running.db.deal(173)["status"] == "needs_check"
     orbita.reply_mode = "sent"
     run(running.retry(173, "a@x.ru"))
     run(running.tick())
-    assert [k for _, _, k in orbita.replies] == [f"deal-173-{step}"] * 3
+    assert [k for _, _, k in orbita.replies] == [f"deal-173-{step}"] * 2 + [f"deal-173-{step}-r1"]
+    assert running.db.deal(173)[f"{step}_sent_at"]
 
 
 def test_template_reply_202_then_failed_needs_check_and_retry_resends(replying, bitrix, orbita):

@@ -4,7 +4,8 @@ import re
 
 import pytest
 
-from conftest import run
+from conftest import FakeBitrix, FakeOrbita, ago, midday_tz, run
+from first_contact.orbita import Message
 
 from test_ui_auth import is_error
 
@@ -97,3 +98,29 @@ def test_retry_warns_of_second_first_message_while_send_unconfirmed(deals, admin
     db.add_deal(45)
     db.update(45, status="skipped", last_error="другая воронка")
     assert retry_hint(admin, 44) == retry_hint(admin, 43) != retry_hint(admin, 45)
+
+
+@pytest.mark.parametrize("step", ["followup", "reply"])
+def test_retry_warns_of_second_message_after_key_reused(deals, admin, step):
+    """Напоминание или ответ по шаблону: Орбита ответила idempotency_key_reused — «Повторить» пойдёт новым ключом,
+    панель предупреждает о возможном втором сообщении; после доказанного отказа шага — нет."""
+    w, db = deals.worker, deals.db
+    w.bitrix, w.orbita = FakeBitrix(), FakeOrbita()
+    w.orbita.reply_mode = "reused"
+    w.s.reply_on, w.s.reply_delay_minutes = True, 0
+    w.s.window_start, w.s.window_end, w.s.tz_name = "06:00", "18:00", midday_tz()
+    first = ago(hours=25)
+    w.orbita.history_items["D1"] = [Message("", "", first, True), Message("", "", ago(minutes=1), False)] \
+        if step == "reply" else [Message("", "", first, True)]
+    db.add_deal(46)
+    db.update(46, status="sent_first", dialog_id="D1", first_sent_at=first.isoformat(timespec="seconds"),
+              followup_due_at=ago(minutes=1).isoformat(timespec="seconds"))
+    if step == "reply":
+        db.update(46, status="replied", client_replied_at=ago(minutes=1).isoformat(timespec="seconds"),
+                  reply_due_at=ago(minutes=1).isoformat(timespec="seconds"))
+    run(w.tick())
+    assert db.deal(46)["status"] == "needs_check" and w.orbita.replies
+    db.add_deal(47)
+    db.update(47, status="needs_check", dialog_id="D1", first_sent_at=first.isoformat(timespec="seconds"),
+              last_error="не доставлено: send_failed")
+    assert retry_hint(admin, 46) != retry_hint(admin, 47)

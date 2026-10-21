@@ -120,3 +120,20 @@ def test_old_unconfirmed_first_message_in_needs_check_accepts_late_confirmation(
                                                             "sent_at": sent}}))
     row = w.db.deal(302)
     assert (row["status"], row["dialog_id"], row["first_sent_at"]) == ("sent_first", "6", sent)
+
+
+def test_old_install_reminder_key_reused_retries_with_new_key(bitrix, orbita):
+    """Установка 1b52a60, клиент молчит сутки. Орбита отвергла ключ напоминания (idempotency_key_reused): после
+    обновления «Повторить» идёт новым ключом — колонки, которыми это помечается, появляются сами."""
+    day_ago = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(timespec="seconds")
+    old_install(deal_id=303, status="sent_first", dialog_id="D1", phone=PHONE, first_sent_at=day_ago,
+                followup_due_at=day_ago, created_at=day_ago, updated_at=day_ago)
+    orbita.history_items["D1"] = [Message("", "", datetime.fromisoformat(day_ago), True)]
+    orbita.reply_mode = "reused"
+    w = robot_on(bitrix, orbita)
+    run(w.tick())
+    assert w.db.deal(303)["status"] == "needs_check"
+    orbita.reply_mode = "sent"
+    run(w.retry(303, "a@x.ru"))
+    run(w.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-303-followup", "deal-303-followup-r1"]
