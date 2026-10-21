@@ -678,6 +678,23 @@ def test_late_failure_between_retry_and_resend_sends_with_new_key(running, bitri
     assert running.db.deal(176)[f"{step}_sent_at"]
 
 
+@pytest.mark.parametrize("action", ["stop", "mark_replied"])
+def test_manual_decision_survives_unconfirmed_template_reply(running, bitrix, orbita, clock, action):
+    """Ответ по шаблону передан (202), оператор нажал «Остановить робота» / «Клиент ответил». Ни таймаут
+    подтверждения, ни поздний message.failed не возвращают сделку роботу: нет «проверить вручную», ответ
+    заново не планируется."""
+    passed_without_confirmation(running, bitrix, orbita, "reply", 177)
+    run(getattr(running, action)(177, "a@x.ru"))
+    clock.advance(minutes=31)
+    run(running.tick())
+    assert running.db.deal(177)["status"] == "replied"
+    run(running.on_orbita_event(event("message.failed", request_key="rk-deal-177-reply", reason_code="send_failed")))
+    run(running.tick())
+    row = running.db.deal(177)
+    assert row["status"] == "replied" and not row["reply_due_at"]
+    assert len(orbita.replies) == 1
+
+
 def test_late_reminder_confirmation_does_not_undo_client_reply(running, bitrix, orbita, clock):
     """Напоминание и ответ по шаблону переданы (202), клиент между ними ответил; ответ по шаблону не подтвердили
     за 30 минут. Позднее подтверждение напоминания не возвращает сделку в «отправлено напоминание»."""

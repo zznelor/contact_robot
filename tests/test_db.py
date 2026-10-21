@@ -87,10 +87,11 @@ def test_old_unconfirmed_first_message_accepts_late_confirmation(bitrix, orbita)
 
 
 def test_step_key_saved_without_text_is_repeated(bitrix, orbita):
-    """База версии, где у намерения напоминания был только ключ (без текста): исход прошлой отправки неизвестен,
-    «Повторить» идёт тем же ключом; текст этой отправки запоминается для следующих повторов."""
+    """База версии, где у намерения напоминания был только ключ (без текста и без признака ручной остановки):
+    исход прошлой отправки неизвестен, «Повторить» идёт тем же ключом; текст этой отправки запоминается для
+    следующих повторов."""
     db = DB(config.env().db_path)
-    for col in ("followup_text", "reply_text"):
+    for col in ("followup_text", "reply_text", "manual_stop_at"):
         db.conn.execute(f"ALTER TABLE deals DROP COLUMN {col}")
     db.add_deal(301)
     day_ago = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(timespec="seconds")

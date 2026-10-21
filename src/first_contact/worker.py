@@ -304,7 +304,9 @@ class Worker:
             status = "sent_first"
         else:
             status = "new"
-        fields: dict = {"status": status, "attempts": 0, "last_error": None, "next_attempt_at": None}
+        # Решение человека — продолжить: ручная остановка снимается
+        fields: dict = {"status": status, "attempts": 0, "last_error": None, "next_attempt_at": None,
+                        "manual_stop_at": None}
         # Повтор шага после определённого отказа — новый ключ идемпотентности этого шага (-r<n>): с прежним
         # Орбита вернула бы исход прошлой попытки и сообщение не ушло бы. Исход прошлой попытки неизвестен
         # (сохранён followup_key / reply_key) — тот же ключ: если сообщение дошло, Орбита второе не отправит.
@@ -342,9 +344,10 @@ class Worker:
             if row is None:
                 return False
             if row["status"] == "replied":
-                self.db.update(deal_id, reply_due_at=None)
+                self.db.update(deal_id, reply_due_at=None, manual_stop_at=now())
             else:
-                self.db.update(deal_id, status="skipped", last_error="остановлено вручную", reply_due_at=None)
+                self.db.update(deal_id, status="skipped", last_error="остановлено вручную", reply_due_at=None,
+                               manual_stop_at=now())
             self.event(deal_id, "вручную: остановить", who)
             return True
 
@@ -354,7 +357,7 @@ class Worker:
             row = self.db.deal(deal_id)
             if row is None:
                 return False
-            self.db.update(deal_id, status="replied", reply_due_at=None,
+            self.db.update(deal_id, status="replied", reply_due_at=None, manual_stop_at=now(),
                            client_replied_at=row["client_replied_at"] or now())
             self.event(deal_id, "вручную: клиент ответил", who)
             return True
@@ -385,8 +388,8 @@ class Worker:
         """202 на напоминание или ответ по шаблону, а исхода так и нет — зовём человека, как у первого сообщения.
         Ключи остаются: поздний вебхук ещё применится, «Повторить» пойдёт тем же ключом, новой отправки нет."""
         row = self.db.deal(deal_id)
-        if row is None:
-            return
+        if row is None or row["manual_stop_at"]:
+            return                                      # оператор уже решил: робот по сделке больше не работает
         for status, column, at, title, text in (
                 ("sent_followup", "followup_request_key", "followup_sent_at", "напоминание", "напоминание ушло"),
                 ("replied", "reply_request_key", "reply_sent_at", "ответ по шаблону", "ответ по шаблону ушёл")):
@@ -892,8 +895,9 @@ class Worker:
                 continue
             deal_id = row["deal_id"]
             waiting = "sent_followup" if step == "followup" else "replied"
-            # Напоминание после ответа клиента значения не имеет: его исход — только в журнал
-            mine = step == "reply" or not row["client_replied_at"]
+            # Напоминание после ответа клиента значения не имеет; после ручной остановки исход любой отправки
+            # решение оператора не отменяет — только в журнал
+            mine = (step == "reply" or not row["client_replied_at"]) and not row["manual_stop_at"]
             # «Повторить» после таймаута уже нажат, а повтор той же отправки ещё не ушёл: статус вернулся туда,
             # откуда шаг отправляется, момент отправки стёрт, request_key прежней отправки сохранён (_retry)
             retrying = mine and not row[f"{step}_sent_at"] and \
