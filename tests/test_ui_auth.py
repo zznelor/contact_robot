@@ -1,13 +1,18 @@
 """Панель: первый запуск, вход, приглашения, роли, команда."""
 
+import asyncio
 import html
 import json
 import re
+import threading
+
+import httpx
 
 import pytest
 from fastapi.testclient import TestClient
 
 from conftest import ORIGIN, login_client, run
+from first_contact import auth
 from first_contact.auth import SESSION_COOKIE
 
 
@@ -148,3 +153,27 @@ def test_team_is_settings_section_not_top_menu(admin):
     assert 'href="#team"' in admin.get("/settings").text
     r = admin.get("/team", follow_redirects=False)
     assert (r.status_code, r.headers["location"]) == (303, "/settings#team")
+
+
+def test_login_password_check_does_not_block_event_loop(panel, monkeypatch):
+    """Пока считается scrypt входа, цикл событий обслуживает остальных (вебхуки, проход робота)."""
+    panel.users.create("a@x.ru", "password1", "admin")
+    started, released, outcome = threading.Event(), threading.Event(), []
+    real = auth.hashlib.scrypt
+
+    def scrypt(*a, **kw):
+        started.set()
+        outcome.append(released.wait(5))   # дождался ли другой корутины, пока шёл расчёт
+        return real(*a, **kw)
+    monkeypatch.setattr(auth.hashlib, "scrypt", scrypt)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=panel.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver", headers=ORIGIN) as c:
+            login = asyncio.create_task(c.post("/login", data={"email": "a@x.ru", "password": "password1"}))
+            await asyncio.to_thread(started.wait, 5)
+            released.set()                 # выполнится, только если цикл событий не занят расчётом
+            return await login
+    r = run(scenario())
+    assert outcome == [True]
+    assert r.status_code == 303 and r.headers["location"] == "/"

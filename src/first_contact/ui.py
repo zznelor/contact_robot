@@ -52,7 +52,7 @@ def build_router(ctx: Ctx) -> APIRouter:
         ip = client_ip(request)
         if limiter.blocked(ip):
             return go("/login", "!Слишком много попыток. Подождите 15 минут.")
-        user = users.login(email, password)
+        user = await users.login_async(email, password)
         if user is None:
             limiter.fail(ip)
             return go("/login", "!Неверная почта или пароль")
@@ -101,7 +101,7 @@ def build_router(ctx: Ctx) -> APIRouter:
             return go("/setup", "!Код не подходит — возьмите его из лога сервиса")
         if problem := email_problem(email) or password_problem(password):
             return go("/setup", f"!{problem}")
-        uid = users.create(email, password, "admin", name)
+        uid = await users.create_async(email, password, "admin", name)
         users.setup_code()                       # код больше не действует
         worker.event(None, "создан администратор", email)
         resp = go("/settings", "Администратор создан. Теперь подключите Битрикс и Орбиту.")
@@ -137,7 +137,7 @@ def build_router(ctx: Ctx) -> APIRouter:
             return go(f"/invite/{token}", f"!{problem}")
         if users.by_email(email):
             return go(f"/invite/{token}", "!Пользователь с такой почтой уже есть — просто войдите")
-        uid = users.create(email, password, inv["role"], name)
+        uid = await users.create_async(email, password, inv["role"], name)
         users.use_invite(token)
         worker.event(None, "новый пользователь по приглашению", f"{email} ({inv['role']})")
         resp = go("/")
@@ -159,11 +159,11 @@ def build_router(ctx: Ctx) -> APIRouter:
 
     @router.post("/account/password")
     async def change_password(old: str = Form(...), new: str = Form(...), user=Depends(user_dep)):
-        if users.login(user["email"], old) is None:
+        if await users.login_async(user["email"], old) is None:
             return go("/account", "!Текущий пароль не подходит")
         if problem := password_problem(new):
             return go("/account", f"!{problem}")
-        users.set_password(user["id"], new)
+        await users.set_password_async(user["id"], new)
         return go("/login", "Пароль изменён, войдите с новым")
 
     # ---------- сделки ----------

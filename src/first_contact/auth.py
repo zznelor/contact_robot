@@ -10,6 +10,7 @@
 Роли: admin — всё, включая настройки и команду; operator — сделки и журнал.
 """
 
+import asyncio
 import hashlib
 import hmac
 import re
@@ -85,16 +86,33 @@ class Users:
     def by_id(self, user_id: int):
         return self.c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
 
-    def create(self, email: str, password: str, role: str, name: str = "") -> int:
-        assert role in ROLES
+    def create(self, email: str, password: str, role: str, name: str = "", *, pw_hash: str | None = None) -> int:
+        if role not in ROLES:
+            raise ValueError(role)
         cur = self.c.execute(
             "INSERT INTO users (email, name, role, pw_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-            (email.strip().lower(), name.strip(), role, hash_password(password), now()))
+            (email.strip().lower(), name.strip(), role, pw_hash or hash_password(password), now()))
         return cur.lastrowid
 
-    def set_password(self, user_id: int, password: str) -> None:
-        self.c.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_password(password), user_id))
+    def set_password(self, user_id: int, password: str, *, pw_hash: str | None = None) -> None:
+        self.c.execute("UPDATE users SET pw_hash=? WHERE id=?", (pw_hash or hash_password(password), user_id))
         self.c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+    # scrypt — десятки миллисекунд процессора. В обработчиках панели он идёт в потоке (asyncio.to_thread),
+    # чтобы не останавливать цикл событий: вебхуки, проход робота, другие страницы. База — в цикле событий.
+
+    async def create_async(self, email: str, password: str, role: str, name: str = "") -> int:
+        return self.create(email, password, role, name, pw_hash=await asyncio.to_thread(hash_password, password))
+
+    async def set_password_async(self, user_id: int, password: str) -> None:
+        self.set_password(user_id, password, pw_hash=await asyncio.to_thread(hash_password, password))
+
+    async def login_async(self, email: str, password: str):
+        u = self.by_email(email)
+        if u is None:
+            await asyncio.to_thread(hash_password, password)   # одинаковое время ответа
+            return None
+        return u if await asyncio.to_thread(check_password, password, u["pw_hash"]) else None
 
     def delete(self, user_id: int) -> None:
         self.c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
@@ -135,7 +153,8 @@ class Users:
     # ---------- приглашения ----------
 
     def new_invite(self, role: str, created_by: int) -> str:
-        assert role in ROLES
+        if role not in ROLES:
+            raise ValueError(role)
         self.c.execute("DELETE FROM invites WHERE expires_at<=?", (now(),))
         token = secrets.token_urlsafe(24)
         exp = datetime.now(timezone.utc) + timedelta(days=INVITE_DAYS)
