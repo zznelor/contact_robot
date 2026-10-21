@@ -882,11 +882,13 @@ class Worker:
                 continue
             deal_id = row["deal_id"]
             waiting = "sent_followup" if step == "followup" else "replied"
+            # Напоминание после ответа клиента значения не имеет: его исход — только в журнал
+            mine = step == "reply" or not row["client_replied_at"]
             if ok:
                 fields: dict = {column: None}
-                if row["status"] == "needs_check":
-                    # «Проверить вручную» по таймауту этой отправки (другого needs_check при неснятом ключе нет):
-                    # подтверждение пришло позже — шаг сделан, сделка возвращается туда, где ждала
+                if row["status"] == "needs_check" and mine:
+                    # «Проверить вручную» по таймауту этой отправки (другого needs_check при неснятом ключе шага
+                    # нет): подтверждение пришло позже — шаг сделан, сделка возвращается туда, где ждала
                     fields.update(status=waiting, last_error=None)
                 self.db.update(deal_id, **fields)
                 self.event(deal_id, f"{title}: мессенджер подтвердил доставку")
@@ -894,7 +896,8 @@ class Worker:
             # Сообщение не ушло: шаг не сделан, намерение снято. Человек решает, повторять ли («Повторить» —
             # с новым ключом). Итог «не ответил» по недоставленному напоминанию тоже снимается
             fields = {column: None, f"{step}_key": None}
-            act = row["status"] in (waiting, "needs_check") or (step == "followup" and row["status"] == "no_reply")
+            act = mine and (row["status"] in (waiting, "needs_check")
+                            or (step == "followup" and row["status"] == "no_reply"))
             if act:
                 fields.update(status="needs_check", last_error=f"{title} не доставлен(о): {reason}")
                 if step == "followup":

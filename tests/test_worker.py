@@ -639,6 +639,22 @@ def test_late_confirmation_after_timeout_returns_deal(running, bitrix, orbita, c
     assert row["status"] == expected and not row[f"{step}_request_key"]
 
 
+def test_late_reminder_confirmation_does_not_undo_client_reply(running, bitrix, orbita, clock):
+    """Напоминание и ответ по шаблону переданы (202), клиент между ними ответил; ответ по шаблону не подтвердили
+    за 30 минут. Позднее подтверждение напоминания не возвращает сделку в «отправлено напоминание»."""
+    passed_without_confirmation(running, bitrix, orbita, "followup", 171)
+    running.s.reply_on, running.s.reply_delay_minutes = True, 0
+    orbita.history_items["D1"] = [out(ago(hours=25)), inc(datetime.now(UTC))]
+    run(running.on_orbita_event(event("message.received", dialog_id="D1", direction="incoming")))
+    run(running.tick())
+    assert len(orbita.replies) == 2
+    clock.advance(minutes=31)
+    run(running.tick())
+    assert running.db.deal(171)["status"] == "needs_check"
+    run(running.on_orbita_event(event("message.sent", request_key="rk-deal-171-followup", dialog_id="D1")))
+    assert running.db.deal(171)["status"] == "needs_check"
+
+
 def test_late_failed_reminder_after_followup_pause_needs_check(running, orbita, clock):
     """Пауза итога короче подтверждения: итог «молчит» по неподтверждённому напоминанию не выносится,
     а поздний message.failed по нему зовёт человека."""
