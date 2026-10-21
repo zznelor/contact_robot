@@ -19,7 +19,7 @@ from first_contact.app import create_app
 from first_contact.auth import SESSION_COOKIE, Users
 from first_contact.bitrix import Deal
 from first_contact.db import DB
-from first_contact.orbita import FirstSendResult, OrbitaError
+from first_contact.orbita import FirstSendResult, OrbitaError, ReplyResult
 from first_contact.worker import Worker
 
 UTC = timezone.utc
@@ -124,6 +124,7 @@ class FakeOrbita:
 
     def __init__(self):
         self.mode = "sent"
+        self.reply_mode = "sent"
         self.connected = set(config.CHANNELS)
         self.answers: dict[str, str] = {}
         self.first: list[tuple[str, str, str]] = []     # (телефон, текст, ключ) — ушедшие первые
@@ -148,8 +149,11 @@ class FakeOrbita:
         return FirstSendResult("sent", "D1", channel)
 
     async def send_reply(self, dialog_id, text, key):
+        """reply_mode: sent — 201 (Telegram подтвердил); pending — 202, исход придёт вебхуком с request_key."""
         self.replies.append((dialog_id, text, key))
-        return {}
+        if self.reply_mode == "pending":
+            return ReplyResult("pending", f"rk-{key}")
+        return ReplyResult("sent")
 
     async def history(self, dialog_id):
         self.history_calls.append(dialog_id)

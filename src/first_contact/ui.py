@@ -230,10 +230,14 @@ def build_router(ctx: Ctx) -> APIRouter:
                   ("Канал", e(r["channel"])), ("Диалог Орбиты", e(r["dialog_id"])),
                   ("Первое сообщение", when(r["first_sent_at"])),
                   ("Напоминание запланировано", when(r["followup_due_at"]) if r["status"] == "sent_first" else ""),
-                  ("Напоминание отправлено", when(r["followup_sent_at"])),
+                  ("Напоминание отправлено", when(r["followup_sent_at"]) +
+                   (" (передано, ждём подтверждения мессенджера)" if r["followup_request_key"] else "")),
                   ("Клиент ответил", when(r["client_replied_at"])),
-                  ("Ответ по шаблону", when(r["reply_sent_at"]) or
-                   (f"запланирован на {when(r['reply_due_at'])}" if r["reply_due_at"] else "")),
+                  ("Ответ по шаблону", (when(r["reply_sent_at"]) +
+                                        (" (передан, ждём подтверждения мессенджера)" if r["reply_request_key"] else ""))
+                   if r["reply_sent_at"] else
+                   (f"запланирован на {when(r['reply_due_at'])}" if r["reply_due_at"] and r["status"] == "replied"
+                    else "не отправлен — «Повторить» отправит" if r["reply_due_at"] else "")),
                   ("Попыток с ошибкой", str(r["attempts"] or 0)), ("Комментарий", e(r["last_error"])),
                   ("Увидели заявку", when(r["created_at"])), ("Обновлено", when(r["updated_at"]))]
         dl = "".join(f"<dt>{k}</dt><dd>{v or '—'}</dd>" for k, v in fields)

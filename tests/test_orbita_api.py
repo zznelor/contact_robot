@@ -155,10 +155,17 @@ def test_history_directions_and_client_reply(http):
     assert client_replied(msgs, datetime(2026, 10, 20, 10, 30, tzinfo=UTC)) is None, "старая реплика — не ответ"
 
 
-def test_send_reply_202_ok_with_idempotency_key(http):
+def test_send_reply_202_pending_with_request_key(http):
     calls = http(orbita())
-    assert run(OrbitaAPI(URL, "k", ALL).send_reply("501", "второе", "k8"))["request_key"] == "rk"
+    r = run(OrbitaAPI(URL, "k", ALL).send_reply("501", "второе", "k8"))
+    assert (r.status, r.request_key) == ("pending", "rk"), "202 — команда передана, исход придёт вебхуком"
     assert calls[-1][:4] == ("POST", "/api/public/v1/dialogs/501/messages", "k8", {"text": "второе"})
+
+
+def test_send_reply_201_sent(http):
+    http(lambda req: httpx.Response(201, json={"id": 9, "dialog_id": 501, "channel": "telegram",
+                                               "direction": "outgoing"}))
+    assert run(OrbitaAPI(URL, "k", ALL).send_reply("501", "второе", "k8")).status == "sent"
 
 
 # ---------- подпись вебхука ----------

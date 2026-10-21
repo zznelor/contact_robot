@@ -98,6 +98,12 @@ MIGRATIONS = [
     ("deals", "intent_phone", "TEXT"),
     ("deals", "intent_channel", "TEXT"),
     ("deals", "intent_key", "TEXT"),
+    # Напоминание и ответ по шаблону: request_key отправки, на которую Орбита ответила 202, — пока не пришёл
+    # message.sent / message.failed; номер ручного повтора шага входит в ключ идемпотентности, 21.10.2026
+    ("deals", "followup_request_key", "TEXT"),
+    ("deals", "reply_request_key", "TEXT"),
+    ("deals", "followup_retry_n", "INTEGER NOT NULL DEFAULT 0"),
+    ("deals", "reply_retry_n", "INTEGER NOT NULL DEFAULT 0"),
     # Вебхуки Орбиты — durable inbox, 21.10.2026. Строки старых версий (тела нет) — уже обработанные: done
     ("orbita_events", "body", "TEXT"),
     ("orbita_events", "state", "TEXT NOT NULL DEFAULT 'done'"),
@@ -167,7 +173,8 @@ class DB:
         self.conn.execute(f"UPDATE deals SET {cols} WHERE deal_id=?", (*fields.values(), deal_id))
 
     def deal_by(self, column: str, value) -> sqlite3.Row | None:
-        assert column in ("dialog_id", "request_key")
+        if column not in ("dialog_id", "request_key", "followup_request_key", "reply_request_key"):
+            raise ValueError(column)
         return self.conn.execute(
             f"SELECT * FROM deals WHERE {column}=? ORDER BY deal_id DESC LIMIT 1", (str(value),)
         ).fetchone()

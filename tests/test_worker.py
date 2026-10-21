@@ -186,7 +186,7 @@ def test_retry_after_failed_followup_does_not_resend_first(running, bitrix, orbi
 
     assert running.db.deal(120)["status"] == "sent_followup"
     assert len(orbita.first) == 1
-    assert [k for _, _, k in orbita.replies] == ["deal-120-followup"]
+    assert [k for _, _, k in orbita.replies] == ["deal-120-followup-r1"], "повтор шага — новый ключ"
 
 
 # ---------- напоминание и итог ----------
@@ -365,6 +365,58 @@ def test_message_failed_needs_check(worker, bitrix):
     run(worker.on_orbita_event(event("message.failed", request_key="rk-10", reason_code="send_failed")))
     assert worker.db.deal(12)["status"] == "needs_check"
     assert bitrix.noted(12)
+
+
+def due_followup(w, orbita, deal_id):
+    """Первое ушло сутки назад, клиент молчит — пора напоминание."""
+    w.db.add_deal(deal_id)
+    w.db.update(deal_id, status="sent_first", dialog_id="D1", first_sent_at=ago(hours=25).isoformat(),
+                followup_due_at=ago(minutes=1).isoformat())
+    orbita.history_items["D1"] = [out(ago(hours=25))]
+
+
+def test_followup_202_then_failed_needs_check(running, bitrix, orbita):
+    orbita.reply_mode = "pending"
+    due_followup(running, orbita, 160)
+    run(running.tick())
+    (_, _, key), = orbita.replies
+    run(running.on_orbita_event(event("message.failed", request_key=f"rk-{key}", reason_code="send_failed")))
+    row = running.db.deal(160)
+    assert row["status"] == "needs_check" and not row["followup_sent_at"]
+    assert bitrix.noted(160)
+
+
+def test_followup_202_then_sent_stays_sent_followup(running, orbita):
+    orbita.reply_mode = "pending"
+    due_followup(running, orbita, 161)
+    run(running.tick())
+    (_, _, key), = orbita.replies
+    run(running.on_orbita_event(event("message.sent", request_key=f"rk-{key}", dialog_id="D1")))
+    row = running.db.deal(161)
+    assert row["status"] == "sent_followup" and row["followup_sent_at"]
+
+
+def test_retry_after_failed_followup_resends_with_new_key(running, orbita):
+    orbita.reply_mode = "pending"
+    due_followup(running, orbita, 162)
+    run(running.tick())
+    run(running.on_orbita_event(event("message.failed", request_key="rk-deal-162-followup")))
+    assert run(running.retry(162, "a@x.ru")) == "sent_first"
+    run(running.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-162-followup", "deal-162-followup-r1"]
+
+
+def test_template_reply_202_then_failed_needs_check_and_retry_resends(replying, bitrix, orbita):
+    orbita.reply_mode = "pending"
+    client_writes(replying, bitrix, orbita, 163, lambda first: [out(first), inc(datetime.now(UTC))])
+    run(replying.tick())
+    run(replying.on_orbita_event(event("message.failed", request_key="rk-deal-163-reply")))
+    row = replying.db.deal(163)
+    assert row["status"] == "needs_check" and not row["reply_sent_at"]
+
+    assert run(replying.retry(163, "a@x.ru")) == "replied"
+    run(replying.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-163-reply", "deal-163-reply-r1"]
 
 
 def test_test_event_changes_nothing(worker):

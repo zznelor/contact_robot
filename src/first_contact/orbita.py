@@ -26,6 +26,12 @@ class FirstSendResult:
 
 
 @dataclass
+class ReplyResult:
+    status: str                # sent (201, мессенджер подтвердил) | pending (202, исход придёт вебхуком)
+    request_key: str | None = None
+
+
+@dataclass
 class Message:
     author: str
     text: str

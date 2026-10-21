@@ -19,7 +19,7 @@ from datetime import datetime
 import httpx
 
 from .config import CHANNELS
-from .orbita import FirstSendResult, Message, OrbitaError, _parse_time
+from .orbita import FirstSendResult, Message, OrbitaError, ReplyResult, _parse_time
 
 # Номера нет в этом мессенджере (или человек запретил писать ему) — пробуем следующий канал
 NOT_FOUND_CODES = {"not_on_whatsapp", "max_not_found", "telegram_recipient_not_found",
@@ -148,10 +148,14 @@ class OrbitaAPI:
             raise OrbitaError(f"не найден в {not_found or '—'}, не проверен: {'; '.join(unchecked)}")
         return FirstSendResult("no_messenger", raw={"проверены каналы": not_found})
 
-    async def send_reply(self, dialog_id: str, text: str, idempotency_key: str) -> dict:
-        # 201 — подтверждено; 202 — для WhatsApp/Max обычный ответ («команда передана»)
-        return (await self._request("POST", f"/dialogs/{dialog_id}/messages", json={"text": text},
-                                    idempotency_key=idempotency_key))[1]
+    async def send_reply(self, dialog_id: str, text: str, idempotency_key: str) -> ReplyResult:
+        """201 — мессенджер подтвердил; 202 — команда передана (для WhatsApp/Max обычный ответ), исход придёт
+        вебхуком message.sent / message.failed с request_key."""
+        status, data = await self._request("POST", f"/dialogs/{dialog_id}/messages", json={"text": text},
+                                           idempotency_key=idempotency_key)
+        if status == 202:
+            return ReplyResult("pending", data.get("request_key"))
+        return ReplyResult("sent")
 
     # ---------- история ----------
 

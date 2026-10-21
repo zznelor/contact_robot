@@ -262,6 +262,12 @@ class Worker:
         else:
             status = "new"
         fields: dict = {"status": status, "attempts": 0, "last_error": None}
+        # Повтор шага после ошибки — новый ключ идемпотентности этого шага (-r<n>): с прежним Орбита вернула
+        # бы исход прошлой попытки и сообщение не ушло бы
+        if status == "sent_first":
+            fields["followup_retry_n"] = (row["followup_retry_n"] or 0) + 1
+        if status == "replied" and not row["reply_sent_at"] and row["reply_due_at"] and self.s.reply_on:
+            fields.update(reply_retry_n=(row["reply_retry_n"] or 0) + 1, reply_due_at=now())
         if status == "new":
             fields.update(retry_n=(row["retry_n"] or 0) + 1, retried_at=now())
             if row["status"] == "needs_check":
@@ -505,16 +511,23 @@ class Worker:
             return
 
         text = self.render("followup", row["name"] or "", deal.title)
+        key = f"deal-{deal_id}-followup" + (f"-r{row['followup_retry_n']}" if row["followup_retry_n"] else "")
         try:
-            await self.orbita.send_reply(row["dialog_id"], text, f"deal-{deal_id}-followup")
+            res = await self.orbita.send_reply(row["dialog_id"], text, key)
         except OrbitaError:
             raise
         except Exception as e:
             raise UnknownOutcome(f"напоминание: {type(e).__name__}: {e}") from e
-        self.db.update(deal_id, status="sent_followup",
+        pending = res.status == "pending"
+        self.db.update(deal_id, status="sent_followup", followup_request_key=res.request_key if pending else None,
                        followup_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-        self.event(deal_id, "напоминание отправлено")
-        await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч — отправил напоминание.")
+        if pending:
+            self.event(deal_id, "напоминание передано, ждём подтверждения", res.request_key or "")
+            await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч — передал напоминание "
+                                     "в мессенджер.")
+        else:
+            self.event(deal_id, "напоминание отправлено")
+            await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч — отправил напоминание.")
 
     async def after_followup(self, deal_id: int) -> None:
         """Через followup_hours после напоминания — итог: ответил или нет. Иначе статус висит вечно."""
@@ -597,15 +610,22 @@ class Worker:
             self.event(deal_id, "ответ по шаблону не отправлен", "клиент написал больше 30 мин назад")
             return
         text = self.render("reply", row["name"] or "")
+        key = f"deal-{deal_id}-reply" + (f"-r{row['reply_retry_n']}" if row["reply_retry_n"] else "")
         try:
-            await self.orbita.send_reply(row["dialog_id"], text, f"deal-{deal_id}-reply")
+            res = await self.orbita.send_reply(row["dialog_id"], text, key)
         except OrbitaError:
             raise
         except Exception as e:
             raise UnknownOutcome(f"ответ по шаблону: {type(e).__name__}: {e}") from e
-        self.db.update(deal_id, reply_sent_at=now(), reply_due_at=None, attempts=0)
-        self.event(deal_id, "ответ по шаблону отправлен")
-        await self.note(deal_id, "Ответил клиенту по шаблону. Дальше — менеджер.")
+        pending = res.status == "pending"
+        self.db.update(deal_id, reply_sent_at=now(), reply_due_at=None, attempts=0,
+                       reply_request_key=res.request_key if pending else None)
+        if pending:
+            self.event(deal_id, "ответ по шаблону передан, ждём подтверждения", res.request_key or "")
+            await self.note(deal_id, "Передал клиенту ответ по шаблону. Дальше — менеджер.")
+        else:
+            self.event(deal_id, "ответ по шаблону отправлен")
+            await self.note(deal_id, "Ответил клиенту по шаблону. Дальше — менеджер.")
 
     # ---------- вебхуки Орбиты ----------
 
@@ -653,21 +673,52 @@ class Worker:
                 if row and row["status"] in ("sent_first", "sent_followup", "no_reply"):
                     await self._client_replied(row["deal_id"], "вебхук")
             elif kind in ("message.sent", "message.failed") and data.get("request_key"):
-                row = self.db.deal_by("request_key", data["request_key"])
-                if not row or row["status"] != "pending_first":
-                    return
-                deal_id = row["deal_id"]
-                if kind == "message.sent":
-                    dialog = data.get("dialog_id")
-                    self._mark_sent_first(deal_id, None, str(dialog) if dialog is not None else None, row["channel"])
-                    await self.note(deal_id, f"Написал клиенту первым ({row['channel']}, {row['phone']}).")
-                else:
-                    reason = data.get("reason_code") or "причина не указана"
-                    self.db.update(deal_id, status="needs_check", last_error=f"не доставлено: {reason}")
-                    self.event(deal_id, "первое сообщение не доставлено", reason)
-                    await self.note(deal_id, f"Первое сообщение не доставлено ({reason}). Нужен звонок менеджера.")
+                await self._send_outcome(kind == "message.sent", data)
             elif kind in ("channel.disconnected", "channel.connected"):
                 self.event(None, f"Орбита: {kind}", str(data.get("provider") or data.get("id") or ""))
+
+
+    async def _send_outcome(self, ok: bool, data: dict) -> None:
+        """Исход отправки, на которую Орбита ответила 202: первое сообщение, напоминание или ответ по шаблону."""
+        rk = data["request_key"]
+        reason = str(data.get("reason_code") or "причина не указана")
+        row = self.db.deal_by("request_key", rk)
+        if row and row["status"] == "pending_first":
+            deal_id = row["deal_id"]
+            if ok:
+                dialog = data.get("dialog_id")
+                self._mark_sent_first(deal_id, None, str(dialog) if dialog is not None else None, row["channel"])
+                await self.note(deal_id, f"Написал клиенту первым ({row['channel']}, {row['phone']}).")
+            else:
+                self.db.update(deal_id, status="needs_check", last_error=f"не доставлено: {reason}")
+                self.event(deal_id, "первое сообщение не доставлено", reason)
+                await self.note(deal_id, f"Первое сообщение не доставлено ({reason}). Нужен звонок менеджера.")
+            return
+        for step, column, title in (("followup", "followup_request_key", "напоминание"),
+                                    ("reply", "reply_request_key", "ответ по шаблону")):
+            row = self.db.deal_by(column, rk)
+            if row is None:
+                continue
+            deal_id = row["deal_id"]
+            if ok:
+                self.db.update(deal_id, **{column: None})
+                self.event(deal_id, f"{title}: мессенджер подтвердил доставку")
+                return
+            fields: dict = {column: None}
+            # Сообщение не ушло: шаг не сделан. Человек решает, повторять ли («Повторить» — с новым ключом)
+            expected = "sent_followup" if step == "followup" else "replied"
+            if row["status"] == expected:
+                fields.update(status="needs_check", last_error=f"{title} не доставлен(о): {reason}")
+                if step == "followup":
+                    fields["followup_sent_at"] = None
+                else:
+                    fields.update(reply_sent_at=None, reply_due_at=now())   # ответ всё ещё нужен
+            self.db.update(deal_id, **fields)
+            self.event(deal_id, f"{title} не доставлен(о)", reason)
+            if row["status"] == expected:
+                await self.note(deal_id, f"Не удалось доставить {title} ({reason}). Проверьте переписку; "
+                                         "«Повторить» в панели робота отправит заново.")
+            return
 
 
 def render(tpl: str, name: str, deal_title: str = "") -> str:
