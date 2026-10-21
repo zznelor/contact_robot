@@ -5,11 +5,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from conftest import PHONE, UTC, Gate, WatchedLock, ago, async_panel, first_of, run, start_deal
+from conftest import (PHONE, UTC, Gate, WatchedLock, ago, async_panel, first_of, run, start_deal,
+                      status_write_fails)
 from first_contact import config
 from first_contact import worker as worker_mod
 from first_contact.orbita import Message
-from first_contact.worker import render
+from first_contact.worker import Worker, render
 
 
 def out(at):
@@ -169,6 +170,24 @@ def test_retry_after_no_messenger_sends_with_new_idempotency_key(running, bitrix
     assert [k for k in orbita.keys if k.endswith("-whatsapp")] == [f"deal-120-first-{PHONE}-whatsapp",
                                                                 f"deal-120-first-{PHONE}-r1-whatsapp"]
     assert row["created_at"] == created_at and row["retried_at"]
+
+
+@pytest.mark.parametrize("answer, expected", [("sent", "sent_first"), ("pending", "pending_first")])
+def test_lost_result_write_keeps_intent_retry_goes_to_same_channel(running, bitrix, orbita, clock, answer, expected):
+    """Орбита приняла первое сообщение в WhatsApp, а запись исхода в базу не удалась (процесс упал посреди
+    перехода). К повтору порядок каналов сменили — повтор идёт тем же запросом, второе первое в Max не уходит."""
+    orbita.answers["whatsapp"] = answer
+    bitrix.new_ids.append(195)
+    with status_write_fails(running.db, "NEW.status IN ('sent_first', 'pending_first')"):
+        run(running.tick())
+    assert running.db.deal(195)["status"] == "new"
+
+    running.s.orbita_channels = ["max", "whatsapp"]
+    restarted = Worker(config.env(), running.s, running.db, bitrix, orbita)
+    clock.advance(minutes=3)
+    run(restarted.tick())
+    assert orbita.keys == [f"deal-195-first-{PHONE}-whatsapp"] * 2
+    assert restarted.db.deal(195)["status"] == expected
 
 
 def no_messenger_then_retry(w, bitrix, orbita, deal_id, pending=False):

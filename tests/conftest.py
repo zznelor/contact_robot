@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -251,6 +252,18 @@ def clock(monkeypatch) -> Clock:
             return datetime.now(tz) + c.shift
     monkeypatch.setattr(worker_mod, "datetime", Shifted)
     return c
+
+
+@contextmanager
+def status_write_fails(db: DB, when: str):
+    """База отказывает в записи статуса сделки по условию when (SQL над NEW.*) — как обрыв процесса или сбой
+    диска посреди перехода. Временный триггер SQLite, в файл базы не попадает."""
+    db.conn.execute(f"CREATE TEMP TRIGGER status_write_fails BEFORE UPDATE OF status ON deals WHEN {when} "
+                    "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END")
+    try:
+        yield
+    finally:
+        db.conn.execute("DROP TRIGGER status_write_fails")
 
 
 def start_deal(w: Worker, bitrix: FakeBitrix, deal_id: int):

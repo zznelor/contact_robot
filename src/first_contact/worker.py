@@ -450,8 +450,10 @@ class Worker:
     async def _start(self, deal_id: int, phone: str, channel: str, text: str, key: str,
                      name: str) -> FirstSendResult:
         """Один запрос «написать первым». Намерение (номер, канал, ключ) пишется в базу ДО запроса и
-        стирается, только когда исход определён: ответ Орбиты или её отказ, по которому точно ничего
-        не ушло. Сбой связи, 5xx, idempotency_in_progress оставляют намерение — повтор пойдёт туда же."""
+        стирается, только когда исход определён: отказ Орбиты, по которому точно ничего не ушло, или ответ
+        «не найден» / «не проверен» / «номер не принят» — здесь; ушло или могло уйти (201/202) — в _first_done
+        той же записью, что и результат (иначе обрыв между двумя записями оставит сделку без намерения и без
+        результата). Сбой связи, 5xx, idempotency_in_progress оставляют намерение — повтор пойдёт туда же."""
         self.db.update(deal_id, intent_phone=phone, intent_channel=channel, intent_key=key)
         try:
             res = await self.orbita.start_dialog(channel, phone, text, key, name or None)
@@ -463,7 +465,8 @@ class Worker:
             raise                                       # сбой связи: повтор с тем же ключом безопасен
         except Exception as e:                          # непредвиденный сбой посреди отправки
             raise UnknownOutcome(f"{phone}: {type(e).__name__}: {e}") from e
-        self.db.update(deal_id, intent_phone=None, intent_channel=None, intent_key=None)
+        if res.status not in ("sent", "pending"):
+            self.db.update(deal_id, intent_phone=None, intent_channel=None, intent_key=None)
         return res
 
     async def _first_done(self, deal_id: int, phone: str, res: FirstSendResult) -> bool:
@@ -475,7 +478,8 @@ class Worker:
             return True
         if res.status == "pending":
             self.db.update(deal_id, status="pending_first", phone=phone, channel=res.channel,
-                           request_key=res.request_key, last_error=None, pending_at=now())
+                           request_key=res.request_key, last_error=None, pending_at=now(),
+                           intent_phone=None, intent_channel=None, intent_key=None)
             self.event(deal_id, "первое сообщение передано, ждём подтверждения",
                        f"{phone} {res.channel} {res.request_key}")
             return True
@@ -495,7 +499,8 @@ class Worker:
         due = sent_at + timedelta(hours=self.s.followup_hours)
         fields = dict(status="sent_first", dialog_id=dialog_id, channel=channel,
                       first_sent_at=sent_at.isoformat(timespec="seconds"),
-                      followup_due_at=due.isoformat(timespec="seconds"), last_error=None)
+                      followup_due_at=due.isoformat(timespec="seconds"), last_error=None,
+                      intent_phone=None, intent_channel=None, intent_key=None)   # исход записан — намерение снято
         if phone:
             fields["phone"] = phone
         self.db.update(deal_id, **fields)
