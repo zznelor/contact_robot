@@ -226,4 +226,6 @@ def verify_signature(secret: str, timestamp: str, body: bytes, signature: str,
     except ValueError:
         return False
     expected = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
-    return any(hmac.compare_digest(f"v1={expected}", s.strip()) for s in signature.split(","))
+    # Сравниваем байты: compare_digest на str с не-ASCII бросает TypeError (заголовок приходит как latin-1)
+    want = f"v1={expected}".encode()
+    return any(hmac.compare_digest(want, s.strip().encode("utf-8")) for s in signature.split(","))

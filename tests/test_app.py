@@ -1,5 +1,7 @@
 """HTTP-входы app.py: вебхуки Орбиты и Битрикса, /healthz и /ready. Логика событий — test_worker.py."""
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -136,3 +138,10 @@ def test_client_reply_before_send_confirmation_counts(webhook_app, running, bitr
         wait_for(lambda: running.db.deal(180)["status"] != "pending_first")
     row = running.db.deal(180)
     assert row["status"] == "replied" and row["client_replied_at"]
+
+
+def test_orbita_webhook_not_ascii_signature_401(webhook_app):
+    ts = str(int(time.time()))
+    r = TestClient(webhook_app).post("/orbita/webhook", content=b"{}", headers={
+        "X-Orbita-Timestamp": ts, "X-Orbita-Signature": "v1=\xff\xfe".encode("latin-1")})
+    assert r.status_code == 401

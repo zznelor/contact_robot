@@ -255,3 +255,9 @@ def test_disconnected_selected_channel_makes_send_first_unchecked(http):
     http(orbita({"max": not_found("max_not_found")}, channels=[("whatsapp", False), ("max", True)]))
     with pytest.raises(OrbitaError):
         run(OrbitaAPI(URL, "k", ["whatsapp", "max"]).send_first("+7", "t", "k9"))
+
+
+@pytest.mark.parametrize("signature", ["v1=ÿÿ", "v1=подпись", "v1=ab"])
+def test_signature_not_ascii_or_other_length_rejected(signature):
+    ts = str(int(time.time()))
+    assert verify_signature("whsec", ts, b'{"id":1}', signature) is False
