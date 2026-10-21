@@ -15,8 +15,8 @@ from . import config
 from .bitrix import Bitrix
 from .config import Env, Settings
 from .db import DB, now
-from .orbita import (CLOCK_SKEW, FirstSendResult, OrbitaError, _parse_time, answered_after, client_replied,
-                     first_incoming)
+from .orbita import (CLOCK_SKEW, FirstSendResult, OrbitaError, ReplyResult, _parse_time, answered_after,
+                     client_replied, first_incoming)
 from .orbita_api import OrbitaAPI, OrbitaAPIError
 
 log = logging.getLogger("first_contact")
@@ -290,12 +290,15 @@ class Worker:
         else:
             status = "new"
         fields: dict = {"status": status, "attempts": 0, "last_error": None, "next_attempt_at": None}
-        # Повтор шага после ошибки — новый ключ идемпотентности этого шага (-r<n>): с прежним Орбита вернула
-        # бы исход прошлой попытки и сообщение не ушло бы
-        if status == "sent_first":
+        # Повтор шага после определённого отказа — новый ключ идемпотентности этого шага (-r<n>): с прежним
+        # Орбита вернула бы исход прошлой попытки и сообщение не ушло бы. Исход прошлой попытки неизвестен
+        # (сохранён followup_key / reply_key) — тот же ключ: если сообщение дошло, Орбита второе не отправит
+        if status == "sent_first" and not row["followup_key"]:
             fields["followup_retry_n"] = (row["followup_retry_n"] or 0) + 1
         if status == "replied" and not row["reply_sent_at"] and row["reply_due_at"] and self.s.reply_on:
-            fields.update(reply_retry_n=(row["reply_retry_n"] or 0) + 1, reply_due_at=now())
+            fields["reply_due_at"] = now()
+            if not row["reply_key"]:
+                fields["reply_retry_n"] = (row["reply_retry_n"] or 0) + 1
         if status == "new":
             # Прежняя отправка с 202 больше не ждёт исхода: решение человека — новая попытка
             fields.update(retry_n=(row["retry_n"] or 0) + 1, retried_at=now(), request_key=None, pending_at=None)
@@ -608,13 +611,9 @@ class Worker:
             return
 
         text = self.render("followup", row["name"] or "", deal.title)
-        key = f"deal-{deal_id}-followup" + (f"-r{row['followup_retry_n']}" if row["followup_retry_n"] else "")
-        try:
-            res = await self.orbita.send_reply(row["dialog_id"], text, key)
-        except OrbitaError:
-            raise
-        except Exception as e:
-            raise UnknownOutcome(f"напоминание: {type(e).__name__}: {e}") from e
+        key = row["followup_key"] or \
+            f"deal-{deal_id}-followup" + (f"-r{row['followup_retry_n']}" if row["followup_retry_n"] else "")
+        res = await self._send_step(deal_id, "followup_key", key, row["dialog_id"], text, "напоминание")
         pending = res.status == "pending"
         self.db.update(deal_id, status="sent_followup", followup_request_key=res.request_key if pending else None,
                        followup_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -625,6 +624,23 @@ class Worker:
         else:
             self.event(deal_id, "напоминание отправлено")
             await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч — отправил напоминание.")
+
+    async def _send_step(self, deal_id: int, column: str, key: str, dialog_id: str, text: str,
+                         title: str) -> ReplyResult:
+        """Напоминание или ответ по шаблону. Ключ (намерение) пишется в column до запроса и стирается только
+        при определённом отказе Орбиты: тогда «Повторить» выпустит новый -r<n>. Сбой связи, 5xx и непредвиденный
+        сбой ключ оставляют — повтор (автоматический и ручной) идёт тем же ключом."""
+        self.db.update(deal_id, **{column: key})
+        try:
+            return await self.orbita.send_reply(dialog_id, text, key)
+        except OrbitaAPIError as e:
+            if e.definite:
+                self.db.update(deal_id, **{column: None})
+            raise
+        except OrbitaError:
+            raise
+        except Exception as e:
+            raise UnknownOutcome(f"{title}: {type(e).__name__}: {e}") from e
 
     async def after_followup(self, deal_id: int) -> None:
         """Через followup_hours после напоминания — итог: ответил или нет. Иначе статус висит вечно."""
@@ -714,13 +730,8 @@ class Worker:
             self.event(deal_id, "ответ по шаблону не отправлен", "опоздал с ответом больше чем на 30 мин")
             return
         text = self.render("reply", row["name"] or "")
-        key = f"deal-{deal_id}-reply" + (f"-r{row['reply_retry_n']}" if row["reply_retry_n"] else "")
-        try:
-            res = await self.orbita.send_reply(row["dialog_id"], text, key)
-        except OrbitaError:
-            raise
-        except Exception as e:
-            raise UnknownOutcome(f"ответ по шаблону: {type(e).__name__}: {e}") from e
+        key = row["reply_key"] or f"deal-{deal_id}-reply" + (f"-r{row['reply_retry_n']}" if row["reply_retry_n"] else "")
+        res = await self._send_step(deal_id, "reply_key", key, row["dialog_id"], text, "ответ по шаблону")
         pending = res.status == "pending"
         self.db.update(deal_id, reply_sent_at=now(), reply_due_at=None, attempts=0,
                        reply_request_key=res.request_key if pending else None)
@@ -828,8 +839,9 @@ class Worker:
                 self.db.update(deal_id, **{column: None})
                 self.event(deal_id, f"{title}: мессенджер подтвердил доставку")
                 return
-            fields: dict = {column: None}
-            # Сообщение не ушло: шаг не сделан. Человек решает, повторять ли («Повторить» — с новым ключом)
+            # Сообщение не ушло: шаг не сделан, намерение снято. Человек решает, повторять ли («Повторить» —
+            # с новым ключом)
+            fields: dict = {column: None, f"{step}_key": None}
             expected = "sent_followup" if step == "followup" else "replied"
             if row["status"] == expected:
                 fields.update(status="needs_check", last_error=f"{title} не доставлен(о): {reason}")

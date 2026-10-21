@@ -612,6 +612,30 @@ def test_retry_after_failed_followup_resends_with_new_key(running, orbita):
     assert [k for _, _, k in orbita.replies] == ["deal-162-followup", "deal-162-followup-r1"]
 
 
+def test_retry_after_lost_followup_answer_repeats_same_key(running, orbita):
+    """Ответ Орбиты на напоминание потерян (могло уйти), человек остановил и нажал «Повторить» — повтор
+    тем же ключом: Орбита вернёт исход прошлого запроса, второе напоминание не уйдёт."""
+    orbita.reply_mode = "lost"
+    due_followup(running, orbita, 164)
+    run(running.tick())
+    run(running.stop(164, "a@x.ru"))
+    orbita.reply_mode = "sent"
+    assert run(running.retry(164, "a@x.ru")) == "sent_first"
+    run(running.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-164-followup"] * 2
+
+
+def test_retry_after_lost_template_reply_answer_repeats_same_key(replying, bitrix, orbita):
+    orbita.reply_mode = "lost"
+    client_writes(replying, bitrix, orbita, 165, lambda first: [out(first), inc(datetime.now(UTC))])
+    run(replying.tick())
+    replying.db.update(165, status="error")             # как после пяти сбоев подряд
+    orbita.reply_mode = "sent"
+    assert run(replying.retry(165, "a@x.ru")) == "replied"
+    run(replying.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-165-reply"] * 2
+
+
 def test_template_reply_202_then_failed_needs_check_and_retry_resends(replying, bitrix, orbita):
     orbita.reply_mode = "pending"
     client_writes(replying, bitrix, orbita, 163, lambda first: [out(first), inc(datetime.now(UTC))])

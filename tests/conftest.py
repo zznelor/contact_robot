@@ -150,8 +150,11 @@ class FakeOrbita:
         return FirstSendResult("sent", "D1", channel)
 
     async def send_reply(self, dialog_id, text, key):
-        """reply_mode: sent — 201 (Telegram подтвердил); pending — 202, исход придёт вебхуком с request_key."""
+        """reply_mode: sent — 201 (Telegram подтвердил); pending — 202, исход придёт вебхуком с request_key;
+        lost — Орбита приняла запрос, а ответ до робота не дошёл (обрыв связи)."""
         self.replies.append((dialog_id, text, key))
+        if self.reply_mode == "lost":
+            raise OrbitaError("POST /messages: ReadTimeout: ответ не дошёл")
         if self.reply_mode == "pending":
             return ReplyResult("pending", f"rk-{key}")
         return ReplyResult("sent")
