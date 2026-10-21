@@ -18,6 +18,7 @@ from datetime import datetime
 
 import httpx
 
+from .config import CHANNELS
 from .orbita import FirstSendResult, Message, OrbitaError, _parse_time
 
 # Номера нет в этом мессенджере (или человек запретил писать ему) — пробуем следующий канал
@@ -70,6 +71,14 @@ class OrbitaAPI:
         items = (await self._request("GET", "/channels"))[1].get("items", [])
         return [{"канал": c.get("provider"), "подключён": bool(c.get("is_connected")),
                  "сотрудник": c.get("employee_id")} for c in items]
+
+    async def channel_status(self) -> dict[str, bool | None]:
+        """Все мессенджеры робота, даже не заведённые в Орбите: True — подключён хоть у одного
+        сотрудника, False — подключение есть, но отвалилось, None — не подключали вовсе."""
+        status: dict[str, bool | None] = dict.fromkeys(CHANNELS)
+        for c in await self.channels():
+            status[c["канал"]] = bool(status.get(c["канал"])) or c["подключён"]
+        return status
 
     # ---------- отправка ----------
 

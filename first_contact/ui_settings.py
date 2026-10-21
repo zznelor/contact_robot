@@ -126,11 +126,11 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         if worker.orbita:
             try:
                 acc = await worker.orbita.account()
-                chs = {c["канал"]: c["подключён"] for c in await worker.orbita.channels()}
+                chs = await worker.orbita.channel_status()
                 live = (f'<p>Аккаунт «{e(acc.get("name"))}», подписка '
                         f'{"<span class=ok>активна</span>" if acc.get("subscription_active") else "<span class=bad>неактивна</span>"}. '
                         "Каналы: " + ", ".join(
-                            f'{e(CHANNEL_RU.get(c, c))} — {"<span class=ok>подключён</span>" if ok else "<span class=muted>нет</span>"}'
+                            f'{e(CHANNEL_RU.get(c, c))} — {"<span class=ok>подключён</span>" if ok else "<span class=muted>не подключён</span>" if ok is None else "<span class=bad>отключился</span>"}'
                             for c, ok in chs.items()) + "</p>")
             except Exception as ex:  # noqa: BLE001
                 live = f'<p class="bad">Орбита не отвечает: {e(type(ex).__name__)}: {e(ex)}</p>'

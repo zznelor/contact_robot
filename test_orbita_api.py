@@ -88,6 +88,10 @@ mock(make({}, channels=[("whatsapp", False)]))
 try: run(api.send_first("+7", "t", "k5")); check(False, "x")
 except OrbitaError as e: check("нет подключённых" in str(e), "нет каналов → ошибка, а не «не найден»")
 
+mock(make({}, channels=[("whatsapp", False), ("whatsapp", True), ("max", False)]))
+check(run(api.channel_status()) == {"whatsapp": True, "max": False, "telegram": None},
+      "статус каналов: все три, даже не заведённый Telegram; два подключения WhatsApp — живо хоть одно")
+
 mock(make({"whatsapp": (202, {"request_key": "rk-1"})}))
 r = run(api.send_first("+7", "t", "k6"))
 check(r.status == "pending" and r.request_key == "rk-1", "202 → pending с request_key")

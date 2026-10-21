@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 from .auth import (MIN_PASSWORD, SESSION_COOKIE, SESSION_DAYS, RateLimit, email_problem, password_problem,
                    same_origin)
 from .ui_base import (ORDER, STATUS_RU, TONE, Ctx, badge, e, flash_html, go, shell, when)
+from .config import CHANNEL_RU
 from .db import now
 from .worker import RETRYABLE
 
@@ -371,9 +372,10 @@ def build_router(ctx: Ctx) -> APIRouter:
                     f"{'активна' if acc.get('subscription_active') else 'НЕАКТИВНА'}")
 
         async def channels_info():
-            chs = await worker.orbita.channels()
-            return ", ".join(f"{c.get('канал')} — {'подключён' if c.get('подключён') else 'нет'}" for c in chs) \
-                or "ни одного канала"
+            chs = await worker.orbita.channel_status()
+            return ", ".join(f"{CHANNEL_RU.get(c, c)} — "
+                             f"{'подключён' if ok else 'не подключён' if ok is None else 'отключился'}"
+                             for c, ok in chs.items())
 
         if worker.bitrix:
             await probe("Битрикс", bitrix_info())
