@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -54,6 +55,7 @@ class Worker:
         # _pass — проходы целиком (фоновый цикл и кнопки панели) не идут одновременно.
         self.lock = asyncio.Lock()
         self._pass = asyncio.Lock()
+        self._inbox = asyncio.Lock()     # события Орбиты из базы разбираются по одному разу
         if bitrix is None and orbita is None:
             self.reconnect()
 
@@ -119,6 +121,7 @@ class Worker:
 
     # Шаги прохода — по порядку; в панели их можно запустить по одному
     STEPS = {
+        "events": "Обработать принятые события Орбиты",
         "poll": "Забрать новые сделки из Битрикса",
         "first": "Написать первым по новым сделкам",
         "followup": "Напоминания и итог по тем, кто молчит",
@@ -128,11 +131,14 @@ class Worker:
     }
 
     async def tick(self) -> None:
-        if not self.active:
-            return
         async with self._pass:
+            # Принятые события Орбиты разбираются и при выключенном роботе: они только записывают исходы
+            await self._step("events", manual=False)
+            if not self.active:
+                return
             for step in self.STEPS:
-                await self._step(step, manual=False)
+                if step != "events":
+                    await self._step(step, manual=False)
 
     async def run_step(self, step: str) -> None:
         """Один шаг прохода по кнопке из панели."""
@@ -146,7 +152,9 @@ class Worker:
     async def _step(self, step: str, manual: bool) -> None:
         # Замок берётся на каждую сделку (в _guarded и ниже), а не на весь проход: между сделками
         # проходят ручные действия и события Орбиты, а выключение останавливает оставшуюся очередь.
-        if step == "poll":
+        if step == "events":
+            await self.process_inbox()
+        elif step == "poll":
             async with self.lock:
                 if self.active:
                     await self.poll_new_deals()
@@ -517,6 +525,33 @@ class Worker:
         await self.note(deal_id, "Ответил клиенту по шаблону. Дальше — менеджер.")
 
     # ---------- вебхуки Орбиты ----------
+
+    async def process_inbox(self) -> None:
+        """Разобрать сохранённые события Орбиты (таблица orbita_events, state='new').
+
+        Событие помечается обработанным только после успешного on_orbita_event; сбой оставляет его в
+        очереди до следующего прохода, после MAX_ATTEMPTS сбоев — failed. Отмена (остановка сервиса)
+        оставляет событие в очереди: после перезапуска его подхватит первый проход. Обработка
+        идемпотентна — каждое действие проверяет статус сделки."""
+        async with self._inbox:
+            for row in self.db.pending_events():
+                try:
+                    ev = json.loads(row["body"] or "")
+                except ValueError as e:
+                    self.db.event_failed(row["id"], f"тело не JSON: {e}", give_up=True)
+                    log.error("событие Орбиты %s: тело не JSON", row["id"])
+                    continue
+                try:
+                    await self.on_orbita_event(ev)
+                except Exception as e:  # noqa: BLE001
+                    attempts = row["attempts"] + 1
+                    self.db.event_failed(row["id"], f"{type(e).__name__}: {e}", give_up=attempts >= MAX_ATTEMPTS)
+                    log.exception("событие Орбиты %s (%s): ошибка обработки, попытка %s", row["id"], row["type"],
+                                  attempts)
+                    self.event(None, "Орбита: ошибка обработки события",
+                               f"{row['type']} #{row['id']}, попытка {attempts}: {e}")
+                else:
+                    self.db.event_done(row["id"])
 
     async def on_orbita_event(self, ev: dict) -> None:
         """Событие вебхука Орбиты (подпись уже проверена, дубли отсечены).

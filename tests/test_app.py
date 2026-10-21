@@ -3,8 +3,10 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from conftest import post_orbita, wait_for
+from conftest import post_orbita, run, wait_for
+from first_contact import config
 from first_contact.app import create_app
+from first_contact.worker import Worker
 
 RECEIVED = {"type": "message.received", "data": {"dialog_id": 501, "direction": "incoming"}}
 
@@ -60,20 +62,29 @@ def test_orbita_events_without_id_are_not_duplicates(client, waiting_deal):
     wait_for(lambda: waiting_deal.db.deal(10)["status"] == "replied")
 
 
-def test_orbita_processing_failure_logged_and_redelivery_processed(client, waiting_deal, monkeypatch):
-    original = waiting_deal.on_orbita_event
+def test_orbita_event_failed_after_ack_processed_after_restart(webhook_app, waiting_deal, settings, bitrix, orbita,
+                                                              monkeypatch):
+    """2xx = доставлено, повтора не будет: принятое событие не теряется ни при сбое обработки, ни при перезапуске."""
+    original, calls = waiting_deal.on_orbita_event, []
 
     async def broken(ev):
+        calls.append(ev)
         raise RuntimeError("сбой")
     monkeypatch.setattr(waiting_deal, "on_orbita_event", broken)
-    post_orbita(client, {"id": 50, **RECEIVED}, event_id="50")
-    # Название записи журнала задано в docs/РАЗРАБОТЧИКУ.md, «Защита от дублей»
-    wait_for(lambda: any(ev["event"] == "Орбита: ошибка обработки события" for ev in waiting_deal.db.events()))
-
+    with TestClient(webhook_app) as c:
+        assert post_orbita(c, {"id": 50, **RECEIVED}, event_id="50").status_code == 200
+        wait_for(lambda: calls)
     monkeypatch.setattr(waiting_deal, "on_orbita_event", original)
-    r = post_orbita(client, {"id": 50, **RECEIVED}, event_id="50")
-    assert not r.json().get("duplicate"), "номер события забыт — повторная доставка проходит"
+
+    restarted = Worker(config.env(), settings, waiting_deal.db, bitrix, orbita)
+    run(restarted.tick())
+    assert restarted.db.deal(10)["status"] == "replied"
+
+
+def test_orbita_redelivery_of_accepted_event_is_duplicate(client, waiting_deal):
+    post_orbita(client, {"id": 51, **RECEIVED}, event_id="51")
     wait_for(lambda: waiting_deal.db.deal(10)["status"] == "replied")
+    assert post_orbita(client, {"id": 51, **RECEIVED}, event_id="51").json().get("duplicate")
 
 
 # ---------- событие Битрикса ----------

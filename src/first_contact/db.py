@@ -40,7 +40,20 @@ CREATE TABLE IF NOT EXISTS deals (
     updated_at       TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS orbita_events (id TEXT PRIMARY KEY, type TEXT, at TEXT NOT NULL);
+-- Входящие вебхуки Орбиты (durable inbox): событие целиком сохраняется до ответа 2xx, обрабатывается
+-- отсюда. id — номер события Орбиты (ключ дедупликации). state: new — ждёт обработки (в том числе
+-- после сбоя или перезапуска), done — обработано, failed — обработка не удалась MAX_ATTEMPTS раз.
+CREATE TABLE IF NOT EXISTS orbita_events (
+    id         TEXT PRIMARY KEY,
+    type       TEXT,
+    at         TEXT NOT NULL,
+    body       TEXT,
+    state      TEXT NOT NULL DEFAULT 'done',
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    dialog_id  TEXT,
+    done_at    TEXT
+);
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     at      TEXT NOT NULL,
@@ -80,6 +93,13 @@ MIGRATIONS = [
     ("deals", "checked_at", "TEXT"),         # когда последний раз смотрели, не ответил ли клиент
     ("deals", "retry_n", "INTEGER NOT NULL DEFAULT 0"),  # ручные повторы: входят в ключ идемпотентности
     ("deals", "retried_at", "TEXT"),         # последний ручной повтор: от него считаются 48 ч
+    # Вебхуки Орбиты — durable inbox, 21.10.2026. Строки старых версий (тела нет) — уже обработанные: done
+    ("orbita_events", "body", "TEXT"),
+    ("orbita_events", "state", "TEXT NOT NULL DEFAULT 'done'"),
+    ("orbita_events", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("orbita_events", "last_error", "TEXT"),
+    ("orbita_events", "dialog_id", "TEXT"),
+    ("orbita_events", "done_at", "TEXT"),
 ]
 
 
@@ -147,11 +167,28 @@ class DB:
             f"SELECT * FROM deals WHERE {column}=? ORDER BY deal_id DESC LIMIT 1", (str(value),)
         ).fetchone()
 
-    def first_seen_event(self, event_id: str, type_: str) -> bool:
-        """True, если событие Орбиты пришло впервые (повтор доставки несёт тот же номер)."""
-        cur = self.conn.execute("INSERT OR IGNORE INTO orbita_events VALUES (?, ?, ?)",
-                                (str(event_id), type_, now()))
+    # ---------- входящие события Орбиты ----------
+
+    def accept_event(self, event_id: str, type_: str, body: str, dialog_id: str | None) -> bool:
+        """Сохранить событие до ответа Орбите. False — такое уже принято (повтор доставки несёт тот же номер)."""
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO orbita_events (id, type, at, body, state, dialog_id) VALUES (?, ?, ?, ?, 'new', ?)",
+            (str(event_id), type_, now(), body, dialog_id))
         return cur.rowcount == 1
+
+    def pending_events(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM orbita_events WHERE state='new' ORDER BY at, rowid").fetchall()
+
+    def inbox_event(self, event_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM orbita_events WHERE id=?", (str(event_id),)).fetchone()
+
+    def event_done(self, event_id: str) -> None:
+        self.conn.execute("UPDATE orbita_events SET state='done', done_at=?, last_error=NULL WHERE id=?",
+                          (now(), str(event_id)))
+
+    def event_failed(self, event_id: str, error: str, give_up: bool) -> None:
+        self.conn.execute("UPDATE orbita_events SET attempts=attempts+1, last_error=?, state=? WHERE id=?",
+                          (error, "failed" if give_up else "new", str(event_id)))
 
     def by_status(self, *statuses: str) -> list[sqlite3.Row]:
         marks = ",".join("?" * len(statuses))
@@ -195,10 +232,6 @@ class DB:
         total = self.conn.execute(f"SELECT COUNT(*) FROM deals{cond}", args).fetchone()[0]
         rows = self.conn.execute(f"SELECT * FROM deals{cond} ORDER BY deal_id DESC LIMIT ?", (*args, limit)).fetchall()
         return rows, total
-
-    def forget_event(self, event_id: str) -> None:
-        """Событие Орбиты не обработано — пусть повторная доставка пройдёт."""
-        self.conn.execute("DELETE FROM orbita_events WHERE id=?", (str(event_id),))
 
     def recent(self, limit: int = 200) -> list[sqlite3.Row]:
         return self.conn.execute(

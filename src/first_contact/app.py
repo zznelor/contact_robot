@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -27,15 +28,6 @@ def create_app(worker: Worker) -> FastAPI:
         task = asyncio.create_task(coro)
         background.add(task)
         task.add_done_callback(background.discard)
-
-    async def handle_orbita(ev: dict, event_id: str) -> None:
-        try:
-            await worker.on_orbita_event(ev)
-        except Exception as ex:  # noqa: BLE001
-            log.exception("вебхук Орбиты: ошибка обработки")
-            worker.event(None, "Орбита: ошибка обработки события", f"{ev.get('type')} #{event_id}: {ex}")
-            if event_id:
-                worker.db.forget_event(event_id)   # повторная доставка обработается заново
 
     async def loop():
         while True:
@@ -112,12 +104,17 @@ def create_app(worker: Worker) -> FastAPI:
             return Response(status_code=400)
         if not isinstance(ev, dict):
             return Response(status_code=400)
-        event_id = h.get("x-orbita-event-id") or str(ev.get("id") or "")
-        # Без номера дубль не распознать — обрабатываем (иначе все такие события после первого пропали бы)
-        if event_id and not worker.db.first_seen_event(event_id, ev.get("type", "")):
+        # Без номера дубль не распознать — сохраняем под своим номером (иначе все такие события после
+        # первого пропали бы)
+        event_id = h.get("x-orbita-event-id") or str(ev.get("id") or "") or f"local-{uuid.uuid4().hex}"
+        data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+        dialog = data.get("dialog_id")
+        # 2xx для Орбиты — «доставлено», повтора не будет. Поэтому до ответа событие целиком сохраняется
+        # в базе; обработка — из базы (сразу в фоне, а после сбоя или перезапуска — на проходе робота)
+        if not worker.db.accept_event(event_id, str(ev.get("type") or ""), body.decode("utf-8", "replace"),
+                                      str(dialog) if dialog is not None else None):
             return {"ok": True, "duplicate": True}
-        # Отвечаем сразу, обработка — в фоне: Орбита ждёт 2xx, а у воркера может быть занят замок
-        spawn(handle_orbita(ev, event_id))
+        spawn(worker.process_inbox())
         return {"ok": True}
 
     @app.get("/health")
