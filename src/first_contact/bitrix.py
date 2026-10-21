@@ -52,7 +52,7 @@ class Bitrix:
         self.webhook = webhook.rstrip("/") + "/"
         self.timeout = timeout
 
-    async def call(self, method: str, params: dict | None = None):
+    async def _raw(self, method: str, params: dict | None = None) -> dict:
         # Соединение на вызов: нагрузка — единицы запросов в минуту, а адрес может смениться в панели
         async with httpx.AsyncClient(base_url=self.webhook, timeout=self.timeout) as http:
             r = await http.post(f"{method}.json", json=params or {})
@@ -60,9 +60,26 @@ class Bitrix:
             data = r.json()
         except ValueError:
             raise BitrixError(f"{method}: HTTP {r.status_code}, ответ не JSON — проверьте адрес вебхука") from None
+        if not isinstance(data, dict) or "result" not in data and "error" not in data:
+            raise BitrixError(f"{method}: HTTP {r.status_code}, неожиданный ответ")
         if "error" in data:
             raise BitrixError(f"{method}: {data['error']} {data.get('error_description', '')}")
-        return data["result"]
+        return data
+
+    async def call(self, method: str, params: dict | None = None):
+        return (await self._raw(method, params))["result"]
+
+    async def call_all(self, method: str, params: dict) -> list:
+        """Списочный метод целиком: Битрикс отдаёт по 50 строк и номер следующей страницы в next."""
+        rows: list = []
+        start = 0
+        while True:
+            data = await self._raw(method, {**params, "start": start})
+            rows += data["result"] or []
+            nxt = data.get("next")
+            if not nxt or int(nxt) <= start:
+                return rows
+            start = int(nxt)
 
     # ---------- для настройки ----------
 
@@ -80,7 +97,7 @@ class Bitrix:
     async def stages(self, category_id: str | None) -> list[tuple[str, str]]:
         """Этапы воронки: [(STATUS_ID, название)]."""
         entity = "DEAL_STAGE" if category_id in (None, "", "0") else f"DEAL_STAGE_{category_id}"
-        rows = await self.call("crm.status.list", {"filter": {"ENTITY_ID": entity}, "order": {"SORT": "ASC"}})
+        rows = await self.call_all("crm.status.list", {"filter": {"ENTITY_ID": entity}, "order": {"SORT": "ASC"}})
         return [(r["STATUS_ID"], r.get("NAME") or r["STATUS_ID"]) for r in rows]
 
     async def get_deal(self, deal_id: int) -> Deal:
@@ -109,9 +126,7 @@ class Bitrix:
         flt: dict = {">ID": last_id}
         if category_id is not None:
             flt["CATEGORY_ID"] = category_id
-        rows = await self.call("crm.deal.list", {
-            "filter": flt, "select": ["ID"], "order": {"ID": "ASC"},
-        })
+        rows = await self.call_all("crm.deal.list", {"filter": flt, "select": ["ID"], "order": {"ID": "ASC"}})
         return [int(r["ID"]) for r in rows]
 
     async def max_deal_id(self) -> int:
