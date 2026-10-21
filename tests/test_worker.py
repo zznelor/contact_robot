@@ -258,6 +258,15 @@ def test_outcome_after_followup(running, orbita, followup_sent_hours_ago, histor
     assert running.db.deal(122)["status"] == expected
 
 
+def test_followup_with_incoming_without_time_needs_check(running, orbita):
+    """Входящее без времени: не «клиент ответил» (ответ по шаблону его бы не нашёл) и не «молчит»."""
+    due_followup(running, orbita, 125)
+    orbita.history_items["D1"] = [out(ago(hours=25)), inc(None)]
+    run(running.tick())
+    assert running.db.deal(125)["status"] == "needs_check"
+    assert orbita.replies == []
+
+
 # ---------- клиент ответил: ответ по шаблону ----------
 
 @pytest.fixture

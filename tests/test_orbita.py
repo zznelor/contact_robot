@@ -40,8 +40,19 @@ def test_client_replied_without_since_takes_whole_history():
     assert client_replied([msg(False, minutes=-600)]) is True
 
 
-def test_client_replied_message_without_time_kept():
-    assert client_replied([msg(False, at=None)], T0) is True
+@pytest.mark.parametrize("messages, expected", [
+    ([msg(True), msg(False, at=None)], None),               # без времени не расположить относительно нашего
+    ([msg(True), msg(False, at=None), msg(False, minutes=5)], True),   # есть входящее со временем после нашего
+    ([msg(True), msg(True, at=None)], False),                # наше без времени ответом клиента не бывает
+])
+def test_client_replied_message_without_time(messages, expected):
+    """Сообщение без времени нельзя расположить относительно нашего первого: ответом его не считаем,
+    молчанием тоже — если ничего другого нет, «не понять» (а робот зовёт человека)."""
+    assert client_replied(messages, T0) is expected
+
+
+def test_client_replied_without_since_counts_message_without_time():
+    assert client_replied([msg(False, at=None)]) is True
 
 
 # ---------- first_incoming ----------

@@ -524,7 +524,7 @@ class Worker:
             self.event(deal_id, "напоминание не нужно", f"сделка закрыта ({deal.stage_id})")
             return
 
-        replied = client_replied(await self.orbita.history(row["dialog_id"]), _ts(row["first_sent_at"]))
+        replied = client_replied(await self.orbita.history(row["dialog_id"], _ts(row["first_sent_at"])), _ts(row["first_sent_at"]))
         if replied is None:
             self.db.update(deal_id, status="needs_check", last_error="не смог прочитать историю диалога")
             self.event(deal_id, "не понял, ответил ли клиент")
@@ -566,7 +566,7 @@ class Worker:
             return
         if datetime.now(timezone.utc) < _ts(row["followup_sent_at"]) + timedelta(hours=self.s.followup_hours):
             return
-        replied = client_replied(await self.orbita.history(row["dialog_id"]), _ts(row["first_sent_at"])) \
+        replied = client_replied(await self.orbita.history(row["dialog_id"], _ts(row["first_sent_at"])), _ts(row["first_sent_at"])) \
             if row["dialog_id"] else None
         if replied:
             await self._client_replied(deal_id, "по истории")
@@ -610,7 +610,7 @@ class Worker:
             return
         self.db.update(deal_id, checked_at=now())
         try:
-            replied = client_replied(await self.orbita.history(row["dialog_id"]), sent)
+            replied = client_replied(await self.orbita.history(row["dialog_id"], sent), sent)
         except Exception as e:  # noqa: BLE001
             log.warning("сделка %s: история недоступна: %s", deal_id, e)
             return
@@ -625,7 +625,7 @@ class Worker:
         if not self.s.reply_on:
             self.db.update(deal_id, reply_due_at=None)
             return
-        history = await self.orbita.history(row["dialog_id"])
+        history = await self.orbita.history(row["dialog_id"], _ts(row["first_sent_at"]))
         client_msg = first_incoming(history, _ts(row["first_sent_at"]))
         if client_msg is None:
             self.db.update(deal_id, reply_due_at=None)

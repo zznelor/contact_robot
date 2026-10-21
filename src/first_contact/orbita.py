@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # Запас на расхождение часов сервиса и Орбиты
@@ -46,28 +46,41 @@ class Message:
 
 
 def _parse_time(value) -> datetime | None:
+    """Время из API Орбиты — всегда с зоной: без смещения считаем UTC (иначе сравнение с нашим временем падает)."""
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
 def _after(messages: list[Message], since: datetime | None) -> list[Message]:
-    """Сообщения не раньше since (старая переписка с этим человеком не считается)."""
+    """Сообщения не раньше since (старая переписка с этим человеком не считается). Сообщения без времени
+    остаются: отбросить их нельзя, но и расположить относительно since тоже (см. client_replied)."""
     if since is None:
         return messages
     edge = since - CLOCK_SKEW
-    return [m for m in messages if m.at is None or m.at.tzinfo is None or m.at >= edge]
+    return [m for m in messages if m.at is None or m.at >= edge]
 
 
 def client_replied(messages: list[Message], since: datetime | None = None) -> bool | None:
-    """Ответил ли клиент после нашего первого сообщения. None — не понять (нет направлений)."""
+    """Ответил ли клиент после нашего первого сообщения. None — не понять.
+
+    Правило для сообщений без времени (sent_at в API может быть пустым): их нельзя расположить
+    относительно нашего первого сообщения, поэтому они не доказывают ни ответ, ни молчание. Входящее
+    без времени, когда нет входящего со временем после since, — «не понять». Без since сравнивать не с чем —
+    любое входящее считается. Сообщение без направления — тоже «не понять»."""
     messages = _after(messages, since)
     if not messages or any(m.outgoing is None for m in messages):
         return None
-    return any(not m.outgoing for m in messages)
+    incoming = [m for m in messages if not m.outgoing]
+    if since is None:
+        return bool(incoming)
+    if any(m.at is not None for m in incoming):
+        return True
+    return None if incoming else False
 
 
 def first_incoming(messages: list[Message], since: datetime | None = None) -> Message | None:

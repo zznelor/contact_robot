@@ -155,6 +155,44 @@ def test_history_directions_and_client_reply(http):
     assert client_replied(msgs, datetime(2026, 10, 20, 10, 30, tzinfo=UTC)) is None, "старая реплика — не ответ"
 
 
+def paged_history(pages):
+    """История по страницам (новые первыми): pages — списки сообщений; курсор следующей — её номер."""
+    def handler(req):
+        n = int(req.url.params.get("cursor") or 0)
+        nxt = str(n + 1) if n + 1 < len(pages) else None
+        return httpx.Response(200, json={"items": pages[n], "next_cursor": nxt})
+    return handler
+
+
+def m(direction, sent_at):
+    return {"id": 1, "dialog_id": 501, "channel": "whatsapp", "direction": direction, "sent_at": sent_at}
+
+
+def test_history_follows_next_cursor(http):
+    """Входящий ответ клиента — на второй странице, первая забита исходящими."""
+    calls = http(paged_history([[m("outgoing", "2026-10-20T12:00:00+00:00")] * 3,
+                                [m("incoming", "2026-10-20T10:10:00+00:00"),
+                                 m("outgoing", "2026-10-20T10:00:00+00:00")]]))
+    msgs = run(OrbitaAPI(URL, "k", ALL).history("501"))
+    assert client_replied(msgs, datetime(2026, 10, 20, 10, 0, tzinfo=UTC)) is True
+    assert len([c for c in calls if c[1].endswith("/messages")]) == 2
+
+
+def test_history_stops_at_since(http):
+    """Страницы старше нашего первого сообщения (с запасом на часы) не читаются."""
+    calls = http(paged_history([[m("incoming", "2026-10-20T10:10:00+00:00"),
+                                 m("outgoing", "2026-10-20T09:00:00+00:00")],
+                                [m("incoming", "2026-10-19T10:00:00+00:00")]]))
+    run(OrbitaAPI(URL, "k", ALL).history("501", datetime(2026, 10, 20, 10, 0, tzinfo=UTC)))
+    assert len([c for c in calls if c[1].endswith("/messages")]) == 1
+
+
+def test_history_time_without_offset_is_utc(http):
+    http(paged_history([[m("incoming", "2026-10-20T10:10:00")]]))
+    (msg,) = run(OrbitaAPI(URL, "k", ALL).history("501"))
+    assert msg.at == datetime(2026, 10, 20, 10, 10, tzinfo=UTC)
+
+
 def test_send_reply_202_pending_with_request_key(http):
     calls = http(orbita())
     r = run(OrbitaAPI(URL, "k", ALL).send_reply("501", "второе", "k8"))

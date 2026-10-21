@@ -19,7 +19,7 @@ from datetime import datetime, time, timedelta, timezone
 import httpx
 
 from .config import CHANNELS
-from .orbita import FirstSendResult, Message, OrbitaError, ReplyResult, _parse_time
+from .orbita import CLOCK_SKEW, FirstSendResult, Message, OrbitaError, ReplyResult, _parse_time
 
 # Номера нет в этом мессенджере (или человек запретил писать ему) — пробуем следующий канал
 NOT_FOUND_CODES = {"not_on_whatsapp", "max_not_found", "telegram_recipient_not_found",
@@ -188,16 +188,31 @@ class OrbitaAPI:
 
     # ---------- история ----------
 
-    async def history(self, dialog_id: str) -> list[Message]:
+    async def history(self, dialog_id: str, since: datetime | None = None) -> list[Message]:
         """Метаданные сообщений (без текста): направление и время — этого хватает,
-        чтобы понять, ответил ли клиент. Право dialogs:read, без лимита 10/мин у history."""
-        data = (await self._request("GET", f"/dialogs/{dialog_id}/messages", params={"limit": 200}))[1]
-        return [
-            Message(author=str(m.get("direction") or ""), text="",
-                    at=_parse_time(m.get("sent_at")),
-                    outgoing={"outgoing": True, "incoming": False}.get(m.get("direction")))
-            for m in data.get("items", [])
-        ]
+        чтобы понять, ответил ли клиент. Право dialogs:read, без лимита 10/мин у history.
+
+        Лента — новые первыми, страницами по next_cursor. Читаем страницы, пока не дошли до since
+        (с запасом CLOCK_SKEW) — иначе ответ клиента, сдвинутый на следующую страницу множеством
+        исходящих, был бы принят за молчание. since не задан — до конца ленты."""
+        edge = since - CLOCK_SKEW if since else None
+        messages: list[Message] = []
+        cursor, seen = None, set()
+        while True:
+            params: dict = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            data = (await self._request("GET", f"/dialogs/{dialog_id}/messages", params=params))[1]
+            page = [Message(author=str(m.get("direction") or ""), text="", at=_parse_time(m.get("sent_at")),
+                            outgoing={"outgoing": True, "incoming": False}.get(m.get("direction")))
+                    for m in data.get("items", [])]
+            messages += page
+            cursor = data.get("next_cursor")
+            if not cursor or not page or cursor in seen:
+                return messages
+            seen.add(cursor)
+            if edge is not None and any(m.at is not None and m.at < edge for m in page):
+                return messages                     # дальше — только сообщения старше нашего первого
 
 
 def verify_signature(secret: str, timestamp: str, body: bytes, signature: str,

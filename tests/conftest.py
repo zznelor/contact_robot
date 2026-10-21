@@ -155,7 +155,7 @@ class FakeOrbita:
             return ReplyResult("pending", f"rk-{key}")
         return ReplyResult("sent")
 
-    async def history(self, dialog_id):
+    async def history(self, dialog_id, since=None):
         self.history_calls.append(dialog_id)
         return self.history_items.get(dialog_id, [])
 
