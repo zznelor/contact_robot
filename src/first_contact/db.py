@@ -115,6 +115,8 @@ MIGRATIONS = [
     # повторяет этот ключ, а не выпускает новый -r<n> (иначе клиент может получить второе), 22.10.2026
     ("deals", "followup_key", "TEXT"),
     ("deals", "reply_key", "TEXT"),
+    # Ручной «Повторить» ответа по шаблону: срок отправки (REPLY_MAX_LATE) отсчитывается и от этого момента
+    ("deals", "reply_retried_at", "TEXT"),
     ("deals", "stage_attempts", "INTEGER NOT NULL DEFAULT 0"),
     ("deals", "stage_retry_at", "TEXT"),
     # Когда первое сообщение ушло в Орбиту с ответом 202 (ждём message.sent), 21.10.2026

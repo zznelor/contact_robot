@@ -612,6 +612,19 @@ def test_retry_after_failed_followup_resends_with_new_key(running, orbita):
     assert [k for _, _, k in orbita.replies] == ["deal-162-followup", "deal-162-followup-r1"]
 
 
+def test_retry_sends_old_undelivered_template_reply(replying, orbita):
+    """Ответ по шаблону не доставлен (message.failed), человек нажал «Повторить» через час после сообщения
+    клиента — ручной повтор продлевает срок, ответ уходит с новым ключом."""
+    replying.db.add_deal(166)
+    replying.db.update(166, status="needs_check", dialog_id="D1", first_sent_at=ago(hours=2).isoformat(),
+                       client_replied_at=ago(hours=1).isoformat(), reply_due_at=ago(minutes=50).isoformat(),
+                       last_error="ответ по шаблону не доставлен(о): send_failed")
+    orbita.history_items["D1"] = [out(ago(hours=2)), inc(ago(hours=1))]
+    assert run(replying.retry(166, "a@x.ru")) == "replied"
+    run(replying.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-166-reply-r1"]
+
+
 def test_retry_after_lost_followup_answer_repeats_same_key(running, orbita):
     """Ответ Орбиты на напоминание потерян (могло уйти), человек остановил и нажал «Повторить» — повтор
     тем же ключом: Орбита вернёт исход прошлого запроса, второе напоминание не уйдёт."""

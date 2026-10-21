@@ -296,7 +296,8 @@ class Worker:
         if status == "sent_first" and not row["followup_key"]:
             fields["followup_retry_n"] = (row["followup_retry_n"] or 0) + 1
         if status == "replied" and not row["reply_sent_at"] and row["reply_due_at"] and self.s.reply_on:
-            fields["reply_due_at"] = now()
+            # Ручной повтор продлевает срок: ответ уходит, даже если с сообщения клиента прошло больше 30 мин
+            fields.update(reply_due_at=now(), reply_retried_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
             if not row["reply_key"]:
                 fields["reply_retry_n"] = (row["reply_retry_n"] or 0) + 1
         if status == "new":
@@ -723,8 +724,10 @@ class Worker:
             self.event(deal_id, "ответ по шаблону не нужен", "менеджер уже ответил")
             return
         # Отсечка — от момента, когда робот должен был ответить (сообщение клиента + пауза из настроек), а не
-        # от самого сообщения: иначе при паузе от 30 мин ответ почти никогда не уходил бы
-        should_answer_at = client_msg.at + timedelta(minutes=self.s.reply_delay_minutes)
+        # от самого сообщения: иначе при паузе от 30 мин ответ почти никогда не уходил бы. После ручного
+        # «Повторить» — от него, если он позже
+        should_answer_at = max(filter(None, (client_msg.at + timedelta(minutes=self.s.reply_delay_minutes),
+                                             _ts(row["reply_retried_at"]))))
         if datetime.now(timezone.utc) - should_answer_at > REPLY_MAX_LATE:
             self.db.update(deal_id, reply_due_at=None)
             self.event(deal_id, "ответ по шаблону не отправлен", "опоздал с ответом больше чем на 30 мин")
