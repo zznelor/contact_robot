@@ -133,6 +133,23 @@ MIGRATIONS = [
 ]
 
 
+def service_lock(db_path: Path):
+    """Межпроцессный замок робота на базу: файл «<база>.lock» рядом с ней, fcntl.flock. Сервис `run` держит его,
+    пока работает, разовые `once` / `process` — на время своей работы: два процесса робота на одной базе не
+    отправляют и не пишут статусы одновременно (у каждого процесса свой Worker.lock). Возвращает открытый
+    файл (замок держится, пока он открыт; закрытие или конец процесса отпускают) или None — замок занят."""
+    import fcntl                                    # только POSIX: робот работает в Docker (Linux) или на macOS
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path.with_name(path.name + ".lock"), "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 

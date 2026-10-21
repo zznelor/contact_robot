@@ -2,8 +2,8 @@
 
   python -m first_contact run [порт]           — сервер с панелью и фоновым циклом (по умолчанию 8080)
   python -m first_contact check                — проверить связь с Битриксом и Орбитой
-  python -m first_contact once                 — один проход очереди
-  python -m first_contact process ID           — обработать конкретную сделку сейчас
+  python -m first_contact once                 — один проход очереди (только при остановленном сервисе)
+  python -m first_contact process ID           — обработать конкретную сделку сейчас (так же)
   python -m first_contact setup-code           — код для создания первого администратора
   python -m first_contact create-admin ПОЧТА   — создать администратора (пароль спросит)
   python -m first_contact reset-password ПОЧТА — задать новый пароль пользователю
@@ -21,7 +21,7 @@ from pathlib import Path
 
 from . import config
 from .auth import Users, email_problem, password_problem
-from .db import DB
+from .db import DB, service_lock
 from .worker import Worker
 
 
@@ -71,6 +71,20 @@ def _ask_password() -> str:
         return p
 
 
+BUSY = ("Робот уже работает с этой базой (запущен сервис). Остановите сервис или нажмите "
+        "«Выполнить сейчас» в панели.")
+
+
+def _hold_robot(w: Worker):
+    """Замок робота на базу (db.service_lock) или выход с кодом 1: второй процесс робота на той же базе
+    отправлял бы и писал статусы мимо замка сервиса."""
+    held = service_lock(w.env.db_path)
+    if held is None:
+        print(BUSY, file=sys.stderr)
+        sys.exit(1)
+    return held
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%d.%m %H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе в лог попадает адрес вебхука с секретом
@@ -81,9 +95,11 @@ def main() -> None:
     if cmd == "check":
         asyncio.run(check(w))
     elif cmd == "once":
+        _hold_robot(w)
         asyncio.run(w.tick())
     elif cmd == "process":
         deal_id = int(args[1])
+        _hold_robot(w)
         w.db.add_deal(deal_id)
         asyncio.run(w._guarded(deal_id, w.first_contact))
         print(dict(w.db.deal(deal_id)))
@@ -123,6 +139,7 @@ def main() -> None:
     elif cmd == "run":
         import uvicorn
         from .app import create_app
+        held = _hold_robot(w)     # noqa: F841 — держим замок, пока сервис работает
         port = int(args[1]) if len(args) > 1 else w.env.port
         # proxy_headers: за Caddy адрес клиента и https берём из X-Forwarded-* — но только от доверенных адресов.
         # По умолчанию слушаем только сам компьютер; в Docker HOST=0.0.0.0 (см. Dockerfile)
