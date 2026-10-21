@@ -268,9 +268,18 @@ class DB:
         return cur.rowcount == 1
 
     def update(self, deal_id: int, **fields) -> None:
+        """Записать поля сделки одним UPDATE. Смена статуса — новый шаг: счётчик сбоев (attempts) и пауза
+        (next_attempt_at) прежнего шага сбрасываются этой же записью, откуда бы переход ни пришёл (шаг, вебхук,
+        опрос, кнопка), — если запись не задаёт их сама (сбой шага, пятый сбой → error)."""
         fields["updated_at"] = now()
-        cols = ", ".join(f"{k}=?" for k in fields)
-        self.conn.execute(f"UPDATE deals SET {cols} WHERE deal_id=?", (*fields.values(), deal_id))
+        sets, args = [f"{k}=?" for k in fields], list(fields.values())
+        if "status" in fields:
+            for col, reset in (("attempts", "0"), ("next_attempt_at", "NULL")):
+                if col not in fields:
+                    # В SET справа — значения строки до записи: status здесь ещё прежний
+                    sets.append(f"{col}=CASE WHEN status=? THEN {col} ELSE {reset} END")
+                    args.append(fields["status"])
+        self.conn.execute(f"UPDATE deals SET {', '.join(sets)} WHERE deal_id=?", (*args, deal_id))
 
     def deal_by(self, column: str, value) -> sqlite3.Row | None:
         if column != "dialog_id":

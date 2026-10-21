@@ -283,12 +283,8 @@ class Worker:
             if status == "error":
                 log.error("сделка %s: ошибка после %s попыток: %s: %s", deal_id, attempts, type(e).__name__, e)
                 await self.note(deal_id, f"Не смог обработать заявку после {attempts} попыток: {e}")
-        else:
-            # Сделка продвинулась — прошлые сбои не должны копиться до «ошибки» на следующем шаге
-            after = self.db.deal(deal_id)
-            if before and after and (after["attempts"] or after["next_attempt_at"]) \
-                    and after["status"] != before["status"]:
-                self.db.update(deal_id, attempts=0, next_attempt_at=None)
+        # Сделка продвинулась — прошлые сбои не копятся до «ошибки» на следующем шаге: сброс делает сама запись
+        # нового статуса (DB.update), в том числе вне _attempt (вебхуки, опрос ответов)
 
     async def retry(self, deal_id: int, who: str) -> str:
         """«Повторить» из панели: вернуть сделку туда, где робот остановился. Возвращает новый статус.

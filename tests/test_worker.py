@@ -149,6 +149,39 @@ def test_failures_count_and_reset_when_deal_moves(running, bitrix, orbita, clock
     assert (row["status"], row["attempts"]) == ("sent_first", 0)
 
 
+def test_client_reply_by_webhook_does_not_inherit_failures_of_reminder(running, bitrix, orbita):
+    """Перед напоминанием четыре сбоя подряд (пауза 16 минут), тут клиент ответил вебхуком: новый шаг — ответ по
+    шаблону — не ждёт чужую паузу и не наследует счётчик сбоев."""
+    running.s.reply_on, running.s.reply_delay_minutes = True, 0
+    due_followup(running, orbita, 128)
+    running.db.update(128, attempts=4, next_attempt_at=ago(minutes=-16).isoformat(timespec="seconds"),
+                      last_error="BitrixError: HTTP 503")           # как после четырёх сбоев подряд
+    orbita.history_items["D1"] = [out(ago(hours=25)), inc(datetime.now(UTC))]
+    run(running.on_orbita_event(event("message.received", dialog_id="D1", direction="incoming")))
+    row = running.db.deal(128)
+    assert (row["status"], row["attempts"], row["next_attempt_at"]) == ("replied", 0, None)
+    run(running.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-128-reply"]
+
+
+def test_failures_reset_by_status_write_itself(running, bitrix, orbita):
+    """Первое сообщение ушло после четырёх сбоев, а процесс остановили, пока шёл комментарий в Битрикс: сброс
+    счётчика сбоев — та же запись, что новый статус, а не отдельная после шага."""
+    orbita.mode = "boom"
+    start_deal(running, bitrix, 129)
+    running.db.update(129, attempts=4, next_attempt_at=None)          # как после четырёх сбоев подряд
+    orbita.mode = "sent"
+
+    async def stopped(*a):
+        raise asyncio.CancelledError
+    bitrix.comment = stopped
+    with pytest.raises(asyncio.CancelledError):
+        run(running.tick())
+    del bitrix.comment
+    row = Worker(config.env(), running.s, running.db, bitrix, orbita).db.deal(129)
+    assert (row["status"], row["attempts"], row["next_attempt_at"]) == ("sent_first", 0, None)
+
+
 def test_five_failures_in_a_row_is_error(running, bitrix, orbita, clock):
     orbita.mode = "boom"
     bitrix.new_ids = [123]
