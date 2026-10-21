@@ -108,6 +108,10 @@ MIGRATIONS = [
     # Этап сделки в Битриксе до переноса роботом на «Не нашёл мессенджер»: после успешного «Повторить»
     # сделка возвращается на него, 22.10.2026. Пусто — робот не переносил или перенёс до обновления
     ("deals", "stage_before", "TEXT"),
+    # Возврат этапа — сохранённая работа: не удался (Битрикс недоступен) — повтор на следующих проходах с
+    # нарастающей паузой, 22.10.2026
+    ("deals", "stage_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("deals", "stage_retry_at", "TEXT"),
     # Когда первое сообщение ушло в Орбиту с ответом 202 (ждём message.sent), 21.10.2026
     ("deals", "pending_at", "TEXT"),
     # Время следующей попытки шага после сбоя (нарастающая пауза) или срок, названный Орбитой, 21.10.2026
@@ -245,6 +249,12 @@ class DB:
         marks = ",".join("?" * len(statuses))
         return self.conn.execute(
             f"SELECT * FROM deals WHERE status IN ({marks}) ORDER BY deal_id", statuses
+        ).fetchall()
+
+    def stages_to_restore(self) -> list[sqlite3.Row]:
+        """Первое сообщение ушло, а этап, с которого робот увёл сделку на «Не нашёл мессенджер», не возвращён."""
+        return self.conn.execute(
+            "SELECT * FROM deals WHERE stage_before IS NOT NULL AND first_sent_at IS NOT NULL ORDER BY deal_id"
         ).fetchall()
 
     def replies_due(self, at: str) -> list[sqlite3.Row]:

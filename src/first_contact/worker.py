@@ -133,6 +133,7 @@ class Worker:
         "first": "Написать первым по новым сделкам",
         "followup": "Напоминания и итог по тем, кто молчит",
         "pending": "Проверить неподтверждённые отправки",
+        "stages": "Вернуть этап сделкам, которым написали после «Повторить»",
         "replies": "Проверить ответы клиентов в истории",
         "auto_reply": "Отправить ответы по шаблону",
     }
@@ -184,6 +185,9 @@ class Worker:
         elif step == "pending":
             for row in self.db.by_status("pending_first"):
                 await self._guarded(row["deal_id"], self.pending_timeout)
+        elif step == "stages":
+            for row in self.db.stages_to_restore():
+                await self._guarded(row["deal_id"], self._restore_stage)
         elif step == "replies":
             # Сам — только без вебхуков и при ответе по шаблону; по кнопке — всегда и без паузы REPLY_POLL
             if manual or (self.s.reply_on and not self.s.orbita_webhook_secret):
@@ -370,7 +374,9 @@ class Worker:
             self.db.update(deal_id, status="skipped", last_error=f"другая воронка ({deal.category_id})")
             self.event(deal_id, "пропущена", f"другая воронка ({deal.category_id})")
             return
-        manual = bool(row["retry_n"])      # человек нажал «Повторить» — этап робота не помеха
+        # Человек нажал «Повторить» или этап «Не нашёл мессенджер» поставил сам робот (запомнен прежний этап,
+        # а статус записать не успел) — этот этап не помеха
+        manual = bool(row["retry_n"]) or bool(row["stage_before"])
         if deal.stage_semantic != "P" or (deal.stage_id == self.s.no_messenger_stage and not manual):
             self.db.update(deal_id, status="skipped", last_error=f"этап {deal.stage_id}")
             self.event(deal_id, "пропущена", f"этап {deal.stage_id}")
@@ -509,36 +515,50 @@ class Worker:
     async def _restore_stage(self, deal_id: int) -> None:
         """Первое сообщение ушло после ручного «Повторить», а сделку раньше робот перенёс на «Не нашёл
         мессенджер», — вернуть её на прежний этап. Менеджер уже сам передвинул сделку — не трогаем.
-        Сбой Битрикса здесь не повод повторять отправку: сообщение уже ушло, — только лог и журнал."""
+
+        Это сохранённая работа (stage_before при first_sent_at): кроме вызова сразу после отправки её доделывает
+        шаг прохода stages — после сбоя Битрикса (пауза 2, 4, 8, 16 мин) и после перезапуска. Отправку
+        сбой не повторяет: сообщение уже ушло. MAX_ATTEMPTS сбоев подряд — комментарий «верните вручную»."""
         row = self.db.deal(deal_id)
-        if row is None or not row["stage_before"] or self.dry_run:
+        if row is None or not row["stage_before"] or not row["first_sent_at"] or self.dry_run:
+            return
+        if row["stage_retry_at"] and datetime.now(timezone.utc) < _ts(row["stage_retry_at"]):
             return
         before = row["stage_before"]
+        done = dict(stage_before=None, stage_attempts=0, stage_retry_at=None)
         try:
             deal = await self.bitrix.get_deal(deal_id)
             if deal.stage_id != self.s.no_messenger_stage:
-                self.db.update(deal_id, stage_before=None)
-                self.event(deal_id, "этап не возвращён", f"менеджер уже перенёс сделку на {deal.stage_id}")
+                self.db.update(deal_id, **done)
+                self.event(deal_id, "этап не возвращён", f"сделка уже на этапе {deal.stage_id}")
                 return
             await self.bitrix.set_stage(deal_id, before)
         except Exception as e:  # noqa: BLE001
-            log.error("сделка %s: не удалось вернуть этап %s: %s: %s", deal_id, before, type(e).__name__, e,
-                      exc_info=e)
-            self.event(deal_id, "не удалось вернуть этап", f"{before}: {type(e).__name__}: {e}")
+            attempts = (row["stage_attempts"] or 0) + 1
+            log.error("сделка %s: не удалось вернуть этап %s (попытка %s): %s: %s", deal_id, before, attempts,
+                      type(e).__name__, e, exc_info=e)
+            self.event(deal_id, "не удалось вернуть этап", f"{before}, попытка {attempts}: {type(e).__name__}: {e}")
+            if attempts >= MAX_ATTEMPTS:
+                self.db.update(deal_id, **done)
+                await self.note(deal_id, f"Первое сообщение ушло, но вернуть сделку с этапа «Не нашёл мессенджер» "
+                                         f"на прежний ({before}) не удалось — верните вручную.")
+                return
+            pause = datetime.now(timezone.utc) + RETRY_PAUSE * 2 ** (attempts - 1)
+            self.db.update(deal_id, stage_attempts=attempts, stage_retry_at=pause.isoformat(timespec="seconds"))
             return
-        self.db.update(deal_id, stage_before=None)
+        self.db.update(deal_id, **done)
         self.event(deal_id, f"этап возвращён → {before}", "первое сообщение ушло после «Повторить»")
         await self.note(deal_id, "Первое сообщение ушло — вернул сделку с этапа «Не нашёл мессенджер» на прежний.")
 
     async def _no_messenger(self, deal_id: int, status: str, reason: str, stage_now: str) -> None:
-        fields: dict = {"status": status, "last_error": reason}
         if not self.dry_run:
-            await self.bitrix.set_stage(deal_id, self.s.no_messenger_stage)
             if stage_now != self.s.no_messenger_stage:
-                # Запоминаем, откуда увели: после успешного «Повторить» вернём (повтор, когда сделка уже на
-                # «Не нашёл мессенджер», прежний этап не затирает)
-                fields["stage_before"] = stage_now
-        self.db.update(deal_id, **fields)
+                # Запоминаем, откуда увели, ДО переноса: после успешного «Повторить» вернём. Обрыв между переносом
+                # и записью статуса не теряет прежний этап (повтор, когда сделка уже на «Не нашёл мессенджер»,
+                # прежний этап не затирает)
+                self.db.update(deal_id, stage_before=stage_now)
+            await self.bitrix.set_stage(deal_id, self.s.no_messenger_stage)
+        self.db.update(deal_id, status=status, last_error=reason)
         self.event(deal_id, "этап → «Не нашёл мессенджер»", reason)
         await self.note(deal_id, f"Не смог написать клиенту: {reason}. Нужен звонок менеджера.")
 

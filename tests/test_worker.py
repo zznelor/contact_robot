@@ -1,6 +1,7 @@
 """Логика робота (worker.py) на подделках Битрикса и Орбиты. Эталон — docs/РАЗРАБОТЧИКУ.md."""
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -9,6 +10,7 @@ from conftest import (PHONE, UTC, Gate, WatchedLock, ago, async_panel, first_of,
                       status_write_fails)
 from first_contact import config
 from first_contact import worker as worker_mod
+from first_contact.bitrix import BitrixError
 from first_contact.orbita import Message
 from first_contact.worker import Worker, render
 
@@ -217,6 +219,62 @@ def test_retry_confirmed_by_webhook_returns_previous_stage(running, bitrix, orbi
     assert row["status"] == "pending_first" and bitrix.stages_set == [(191, "NO_MESSENGER")]
     run(running.on_orbita_event(event("message.sent", request_key=row["request_key"], dialog_id=5)))
     assert bitrix.stages_set == [(191, "NO_MESSENGER"), (191, "IN_WORK")]
+
+
+def test_stage_return_retried_after_bitrix_error(running, bitrix, orbita, clock):
+    """Первое сообщение после «Повторить» ушло, а Битрикс не дал вернуть этап — возврат повторяется сам."""
+    bitrix.stage = "IN_WORK"
+    real, failed = bitrix.set_stage, []
+
+    async def flaky(deal_id, stage_id):
+        if stage_id == "IN_WORK" and not failed:
+            failed.append(stage_id)
+            raise BitrixError("crm.deal.update: HTTP 503")
+        await real(deal_id, stage_id)
+    bitrix.set_stage = flaky
+    no_messenger_then_retry(running, bitrix, orbita, 196)
+    assert running.db.deal(196)["status"] == "sent_first" and bitrix.stage == "NO_MESSENGER"
+
+    clock.advance(minutes=3)
+    run(running.tick())
+    assert bitrix.stages_set == [(196, "NO_MESSENGER"), (196, "IN_WORK")]
+    assert len(orbita.first) == 1, "первое сообщение заново не отправляется"
+
+
+def test_stage_returned_after_restart_while_confirming(running, bitrix, orbita):
+    """message.sent по «Повторить» записан, а процесс остановили, пока шёл комментарий в Битрикс."""
+    bitrix.stage = "IN_WORK"
+    no_messenger_then_retry(running, bitrix, orbita, 197, pending=True)
+    rk = running.db.deal(197)["request_key"]
+    running.db.accept_event("e197", "message.sent", json.dumps(event("message.sent", request_key=rk, dialog_id=5)),
+                            "5")
+
+    async def stopped(*a):
+        raise asyncio.CancelledError
+    bitrix.comment = stopped
+    with pytest.raises(asyncio.CancelledError):
+        run(running.process_inbox())
+    del bitrix.comment
+
+    run(Worker(config.env(), running.s, running.db, bitrix, orbita).tick())
+    assert bitrix.stages_set[-1] == (197, "IN_WORK")
+
+
+def test_previous_stage_remembered_when_status_write_lost(running, bitrix, orbita, clock):
+    """Сделка уже перенесена на «Не нашёл мессенджер», а запись статуса не удалась (обрыв посреди перехода)."""
+    bitrix.stage, orbita.mode = "IN_WORK", "none"
+    bitrix.new_ids.append(198)
+    with status_write_fails(running.db, "NEW.status = 'no_messenger'"):
+        run(running.tick())
+    assert bitrix.stage == "NO_MESSENGER"
+    clock.advance(minutes=3)
+    run(running.tick())
+    assert running.db.deal(198)["status"] == "no_messenger"
+
+    orbita.mode = "sent"
+    run(running.retry(198, "a@x.ru"))
+    run(running.on_deal_added(198))
+    assert bitrix.stages_set[-1] == (198, "IN_WORK")
 
 
 def test_retry_does_not_move_deal_the_manager_already_moved(running, bitrix, orbita):
