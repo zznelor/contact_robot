@@ -61,7 +61,7 @@ def test_first_message_substitutes_name_and_title(running, bitrix, orbita):
     running.s.tpl_first = "{name} / {deal_title}"
     row = start_deal(running, bitrix, 102)
     assert row["status"] == "sent_first"
-    assert orbita.first == [(PHONE, "Анна / Заявка", f"deal-102-first-{PHONE}")]
+    assert orbita.first == [(PHONE, "Анна / Заявка", f"deal-102-first-{PHONE}-whatsapp")]
 
 
 @pytest.mark.parametrize("deal_category_id, deal_category, expected", [
@@ -138,7 +138,8 @@ def test_retry_after_no_messenger_sends_with_new_idempotency_key(running, bitrix
 
     row = running.db.deal(120)
     assert row["status"] == "sent_first", "этап «Не нашёл мессенджер» поставил сам робот — после «Повторить» не помеха"
-    assert orbita.keys == [f"deal-120-first-{PHONE}", f"deal-120-first-{PHONE}-r1"]
+    assert [k for k in orbita.keys if k.endswith("-whatsapp")] == [f"deal-120-first-{PHONE}-whatsapp",
+                                                                f"deal-120-first-{PHONE}-r1-whatsapp"]
     assert row["created_at"] == created_at and row["retried_at"]
 
 
@@ -449,4 +450,4 @@ def test_disable_during_pass_stops_remaining_deals(running, bitrix, orbita):
     run(scenario())
     assert not running.s.enabled
     assert running.db.deal(133)["status"] == "new"
-    assert [k for _, _, k in orbita.first] == [f"deal-132-first-{PHONE}"]
+    assert [k for _, _, k in orbita.first] == [f"deal-132-first-{PHONE}-whatsapp"]

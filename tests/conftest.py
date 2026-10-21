@@ -8,10 +8,12 @@ import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from first_contact import config, ui_settings
+from first_contact import orbita_api as orbita_api_mod
 from first_contact import worker as worker_mod
 from first_contact.app import create_app
 from first_contact.auth import SESSION_COOKIE, Users
@@ -114,24 +116,33 @@ class FakeBitrix:
 
 
 class FakeOrbita:
-    """Орбита: mode — sent | none (номера нигде нет) | boom (Орбита явно отказала)."""
+    """Орбита: mode — sent | none (номера нигде нет) | boom (Орбита отказала, 503).
+    connected — подключённые каналы (по умолчанию все); answers[канал] — исход в этом канале вместо mode."""
 
     def __init__(self):
         self.mode = "sent"
+        self.connected = set(config.CHANNELS)
+        self.answers: dict[str, str] = {}
         self.first: list[tuple[str, str, str]] = []     # (телефон, текст, ключ) — ушедшие первые
         self.keys: list[str] = []                        # ключи всех попыток «написать первым»
         self.replies: list[tuple[str, str, str]] = []    # (диалог, текст, ключ)
         self.history_items: dict = {}
         self.history_calls: list[str] = []
 
-    async def send_first(self, phone, text, key, name=None):
+    async def connected_channels(self):
+        return set(self.connected)
+
+    async def start_dialog(self, channel, phone, text, key, name=None):
         self.keys.append(key)
-        if self.mode == "none":
-            return FirstSendResult("no_messenger")
-        if self.mode == "boom":
+        how = self.answers.get(channel) or {"sent": "sent", "none": "not_found", "boom": "boom"}[self.mode]
+        if how == "boom":
             raise OrbitaError("HTTP 503: Орбита недоступна")
+        if how in ("not_found", "unchecked", "invalid_phone"):
+            return FirstSendResult(how, channel=channel, raw=how)
         self.first.append((phone, text, key))
-        return FirstSendResult("sent", "D1", "whatsapp")
+        if how == "pending":
+            return FirstSendResult("pending", None, channel, request_key=f"rk-{key}")
+        return FirstSendResult("sent", "D1", channel)
 
     async def send_reply(self, dialog_id, text, key):
         self.replies.append((dialog_id, text, key))
@@ -207,7 +218,6 @@ async def first_of(*aws) -> None:
 
 def async_panel(w: Worker, role: str = "admin"):
     """Клиент панели в том же цикле событий, что и робот (для одновременных действий)."""
-    import httpx
     users = Users(w.db)
     uid = users.create(f"{role}@x.ru", "password1", role)
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(w)), base_url="http://testserver",
@@ -219,6 +229,30 @@ def start_deal(w: Worker, bitrix: FakeBitrix, deal_id: int):
     bitrix.new_ids.append(deal_id)
     run(w.tick())
     return w.db.deal(deal_id)
+
+
+# ---------- настоящий клиент Орбиты на подменённом транспорте ----------
+
+@pytest.fixture
+def http(monkeypatch):
+    """Подменяет httpx.AsyncClient в orbita_api; calls — все запросы: (метод, путь, Idempotency-Key, тело, X-Api-Key)."""
+    calls = []
+    real = httpx.AsyncClient
+
+    def install(handler):
+        def recording(req):
+            body = json.loads(req.content) if req.content else None
+            calls.append((req.method, req.url.path, req.headers.get("idempotency-key"), body,
+                          req.headers.get("x-api-key")))
+            return handler(req)
+
+        class Client(real):
+            def __init__(self, **kw):
+                super().__init__(transport=httpx.MockTransport(recording), **kw)
+        monkeypatch.setattr(orbita_api_mod.httpx, "AsyncClient", Client)
+        return calls
+    return install
+
 
 
 # ---------- приложение: вебхуки ----------

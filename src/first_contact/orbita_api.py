@@ -24,12 +24,22 @@ from .orbita import FirstSendResult, Message, OrbitaError, _parse_time
 # Номера нет в этом мессенджере (или человек запретил писать ему) — пробуем следующий канал
 NOT_FOUND_CODES = {"not_on_whatsapp", "max_not_found", "telegram_recipient_not_found",
                    "telegram_recipient_refused"}
+# 422 уровня ключа или аккаунта — другой канал не поможет, повторять позже
+KEY_LEVEL_CODES = {"idempotency_in_progress", "key_lacks_right", "subscription_inactive",
+                   "daily_send_limit_exhausted", "executor_inactive", "idempotency_key_reused"}
 
 
 class OrbitaAPIError(OrbitaError):
+    """Орбита ответила ошибкой. definite — Орбита точно ничего не отправила по этому запросу (4xx);
+    5xx и idempotency_in_progress — исход неизвестен."""
+
     def __init__(self, status: int, code: str, detail):
         super().__init__(f"HTTP {status} {code}: {detail}")
         self.status, self.code, self.detail = status, code, detail
+
+    @property
+    def definite(self) -> bool:
+        return self.status < 500 and self.code != "idempotency_in_progress"
 
 
 class OrbitaAPI:
@@ -82,40 +92,60 @@ class OrbitaAPI:
 
     # ---------- отправка ----------
 
+    async def connected_channels(self) -> set[str]:
+        return {c["канал"] for c in await self.channels() if c["подключён"]}
+
+    async def start_dialog(self, channel: str, phone: str, text: str, idempotency_key: str,
+                           name: str | None = None) -> FirstSendResult:
+        """«Написать первым» в один канал. Ключ передаётся как есть (в нём уже канал).
+
+        sent (201) / pending (202) — сообщение ушло или могло уйти; not_found — номера нет в этом
+        мессенджере; unchecked — канал не смог проверить номер (raw — код отказа); invalid_phone — 400,
+        Орбита не приняла номер. Отказ уровня ключа или аккаунта, сбой связи, 5xx — исключение."""
+        body = {"channel": channel, "phone": phone, "text": text}
+        if name:
+            body["name"] = name
+        try:
+            status, data = await self._request("POST", "/dialogs", json=body, idempotency_key=idempotency_key)
+        except OrbitaAPIError as e:
+            if e.code in NOT_FOUND_CODES:
+                return FirstSendResult("not_found", channel=channel, raw=e.code)
+            if e.status == 400:
+                # Адресат у нас ровно один, текст не пустой — по спецификации 400 здесь значит невалидный номер
+                return FirstSendResult("invalid_phone", channel=channel, raw=e.code)
+            if e.status == 422 and e.code not in KEY_LEVEL_CODES:
+                return FirstSendResult("unchecked", channel=channel, raw=e.code)
+            raise
+        if status == 202:
+            return FirstSendResult("pending", None, channel, data, request_key=data.get("request_key"))
+        dialog = (data.get("dialog") or {}).get("id")
+        return FirstSendResult("sent", str(dialog) if dialog is not None else None, channel, data)
+
     async def send_first(self, phone: str, text: str, idempotency_key: str,
                          name: str | None = None) -> FirstSendResult:
-        connected = {c["канал"] for c in await self.channels() if c["подключён"]}
-        order = [ch for ch in self.channel_order if ch in connected]
-        if not order:
+        """Все выбранные каналы по порядку (тестовая отправка из панели). Робот перебирает каналы сам
+        (Worker.first_contact), чтобы сохранять намерение отправки до запроса."""
+        connected = await self.connected_channels()
+        if not connected & set(self.channel_order):
             # Не «мессенджер не найден»: иначе живой клиент уйдёт на этап NO_MESSENGER
             raise OrbitaError(f"нет подключённых каналов из {self.channel_order}")
-
-        not_found, broken = [], []
-        for ch in order:
-            body = {"channel": ch, "phone": phone, "text": text}
-            if name:
-                body["name"] = name
-            try:
-                status, data = await self._request("POST", "/dialogs", json=body,
-                                                   idempotency_key=f"{idempotency_key}-{ch}")
-            except OrbitaAPIError as e:
-                if e.code in NOT_FOUND_CODES:
-                    not_found.append(ch)
-                    continue
-                if e.status == 422 and e.code not in ("idempotency_in_progress", "key_lacks_right",
-                                                      "subscription_inactive", "daily_send_limit_exhausted",
-                                                      "executor_inactive", "idempotency_key_reused"):
-                    broken.append(f"{ch}: {e.code}")   # этот канал не смог проверить номер — пробуем другой
-                    continue
-                raise                                   # отказ уровня ключа/аккаунта — повторять позже
-            if status == 202:
-                return FirstSendResult("pending", None, ch, data, request_key=data.get("request_key"))
-            dialog = (data.get("dialog") or {}).get("id")
-            return FirstSendResult("sent", str(dialog) if dialog is not None else None, ch, data)
-
-        if broken:
-            # Хотя бы один канал не смог проверить номер — не утверждаем, что мессенджера нет
-            raise OrbitaError(f"не найден в {not_found or '—'}, не проверен: {'; '.join(broken)}")
+        not_found, unchecked = [], []
+        for ch in self.channel_order:
+            if ch not in connected:
+                unchecked.append(f"{ch}: не подключён")
+                continue
+            res = await self.start_dialog(ch, phone, text, f"{idempotency_key}-{ch}", name)
+            if res.status in ("sent", "pending"):
+                return res
+            if res.status == "invalid_phone":
+                raise OrbitaError(f"Орбита не приняла номер {phone} ({res.raw})")
+            if res.status == "not_found":
+                not_found.append(ch)
+            else:
+                unchecked.append(f"{ch}: {res.raw}")
+        if unchecked:
+            # Хотя бы один выбранный канал не проверил номер — не утверждаем, что мессенджера нет
+            raise OrbitaError(f"не найден в {not_found or '—'}, не проверен: {'; '.join(unchecked)}")
         return FirstSendResult("no_messenger", raw={"проверены каналы": not_found})
 
     async def send_reply(self, dialog_id: str, text: str, idempotency_key: str) -> dict:

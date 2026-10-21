@@ -93,6 +93,11 @@ MIGRATIONS = [
     ("deals", "checked_at", "TEXT"),         # когда последний раз смотрели, не ответил ли клиент
     ("deals", "retry_n", "INTEGER NOT NULL DEFAULT 0"),  # ручные повторы: входят в ключ идемпотентности
     ("deals", "retried_at", "TEXT"),         # последний ручной повтор: от него считаются 48 ч
+    # Намерение «написать первым»: пишется до запроса, стирается при определённом исходе. Повтор после
+    # неизвестного исхода идёт в тот же канал с тем же ключом (иначе клиент получит два первых), 21.10.2026
+    ("deals", "intent_phone", "TEXT"),
+    ("deals", "intent_channel", "TEXT"),
+    ("deals", "intent_key", "TEXT"),
     # Вебхуки Орбиты — durable inbox, 21.10.2026. Строки старых версий (тела нет) — уже обработанные: done
     ("orbita_events", "body", "TEXT"),
     ("orbita_events", "state", "TEXT NOT NULL DEFAULT 'done'"),

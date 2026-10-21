@@ -15,8 +15,8 @@ from . import config
 from .bitrix import Bitrix
 from .config import Env, Settings
 from .db import DB, now
-from .orbita import OrbitaError, answered_after, client_replied, first_incoming
-from .orbita_api import OrbitaAPI
+from .orbita import FirstSendResult, OrbitaError, answered_after, client_replied, first_incoming
+from .orbita_api import OrbitaAPI, OrbitaAPIError
 
 log = logging.getLogger("first_contact")
 
@@ -253,6 +253,10 @@ class Worker:
         fields: dict = {"status": status, "attempts": 0, "last_error": None}
         if status == "new":
             fields.update(retry_n=(row["retry_n"] or 0) + 1, retried_at=now())
+            if row["status"] == "needs_check":
+                # Человек проверил переписку (панель предупреждает о втором сообщении) — неизвестный исход
+                # прошлой отправки больше не выясняем
+                fields.update(intent_phone=None, intent_channel=None, intent_key=None)
         self.db.update(deal_id, **fields)
         self.event(deal_id, "вручную: повторить", f"{who} → {status}")
         return status
@@ -336,35 +340,93 @@ class Worker:
             await self._no_messenger(deal_id, "no_phone", "в контакте нет телефона")
             return
 
-        text = self.render("first", name, deal.title)
-        self.db.update(deal_id, name=name, phone=", ".join(phones), first_text=text)
         if self.dry_run:
+            text = self.render("first", name, deal.title)
+            self.db.update(deal_id, name=name, phone=", ".join(phones), first_text=text)
             self.db.update(deal_id, status="skipped", last_error="DRY_RUN")
             self.event(deal_id, "DRY_RUN: отправил бы первое", f"{phones} → {text!r}")
             return
 
+        connected = await self.orbita.connected_channels()
+        order = list(self.s.orbita_channels)
+        if not connected & set(order):
+            # Не «мессенджер не найден»: иначе живой клиент уйдёт на этап NO_MESSENGER
+            raise OrbitaError(f"нет подключённых каналов из {order}")
+
+        if row["intent_key"]:
+            # Прошлая попытка оборвалась с неизвестным исходом: сообщение могло уйти. Узнаём исход повтором
+            # того же запроса (тот же канал, ключ и текст) — в другой канал нельзя, клиент получит два первых
+            if row["intent_channel"] not in connected:
+                raise UnknownOutcome(f"исход отправки в {row['intent_channel']} ({row['intent_phone']}) неизвестен, "
+                                     f"а канал сейчас не подключён")
+            res = await self._start(deal_id, row["intent_phone"], row["intent_channel"], row["first_text"],
+                                    row["intent_key"], name)
+            if await self._first_done(deal_id, row["intent_phone"], res):
+                return
+
+        text = self.render("first", name, deal.title)
+        self.db.update(deal_id, name=name, phone=", ".join(phones), first_text=text)
         suffix = f"-r{row['retry_n']}" if row["retry_n"] else ""
+        not_found, unchecked, invalid = [], [], []
         for phone in phones:
-            try:
-                res = await self.orbita.send_first(phone, text, f"deal-{deal_id}-first-{phone}{suffix}", name or None)
-            except OrbitaError:
-                raise                                   # Орбита явно отказала — можно повторить
-            except Exception as e:                      # непредвиденный сбой посреди отправки
-                raise UnknownOutcome(f"{phone}: {type(e).__name__}: {e}") from e
+            for ch in order:
+                if ch not in connected:
+                    unchecked.append(f"{ch}: не подключён")
+                    continue
+                res = await self._start(deal_id, phone, ch, text, f"deal-{deal_id}-first-{phone}{suffix}-{ch}", name)
+                if await self._first_done(deal_id, phone, res):
+                    return
+                if res.status == "invalid_phone":
+                    invalid.append(phone)
+                    self.event(deal_id, "Орбита не приняла номер", phone)
+                    break                               # номер невалиден в любом канале — следующий номер
+                if res.status == "not_found":
+                    not_found.append(f"{ch}: {phone}")
+                else:
+                    unchecked.append(f"{ch}: {res.raw}")
+            else:
+                self.event(deal_id, "нет мессенджера на номере", phone)
 
-            if res.status == "sent":
-                self._mark_sent_first(deal_id, phone, res.dialog_id, res.channel)
-                await self.note(deal_id, f"Написал клиенту первым ({res.channel or 'мессенджер'}, {phone}).")
-                return
-            if res.status == "pending":
-                self.db.update(deal_id, status="pending_first", phone=phone, channel=res.channel,
-                               request_key=res.request_key, last_error=None)
-                self.event(deal_id, "первое сообщение передано, ждём подтверждения",
-                           f"{phone} {res.channel} {res.request_key}")
-                return
-            self.event(deal_id, "нет мессенджера на номере", phone)
-
+        if len(invalid) == len(phones):
+            await self._no_messenger(deal_id, "no_phone", f"Орбита не приняла номера: {', '.join(invalid)}")
+            return
+        if unchecked:
+            # Хотя бы один выбранный канал не проверил номер — не утверждаем, что мессенджера нет
+            raise OrbitaError(f"не найден: {', '.join(not_found) or '—'}; не проверен: {'; '.join(unchecked)}")
         await self._no_messenger(deal_id, "no_messenger", f"мессенджер не найден: {', '.join(phones)}")
+
+    async def _start(self, deal_id: int, phone: str, channel: str, text: str, key: str,
+                     name: str) -> FirstSendResult:
+        """Один запрос «написать первым». Намерение (номер, канал, ключ) пишется в базу ДО запроса и
+        стирается, только когда исход определён: ответ Орбиты или её отказ, по которому точно ничего
+        не ушло. Сбой связи, 5xx, idempotency_in_progress оставляют намерение — повтор пойдёт туда же."""
+        self.db.update(deal_id, intent_phone=phone, intent_channel=channel, intent_key=key)
+        try:
+            res = await self.orbita.start_dialog(channel, phone, text, key, name or None)
+        except OrbitaAPIError as e:
+            if e.definite:
+                self.db.update(deal_id, intent_phone=None, intent_channel=None, intent_key=None)
+            raise
+        except OrbitaError:
+            raise                                       # сбой связи: повтор с тем же ключом безопасен
+        except Exception as e:                          # непредвиденный сбой посреди отправки
+            raise UnknownOutcome(f"{phone}: {type(e).__name__}: {e}") from e
+        self.db.update(deal_id, intent_phone=None, intent_channel=None, intent_key=None)
+        return res
+
+    async def _first_done(self, deal_id: int, phone: str, res: FirstSendResult) -> bool:
+        """Сообщение ушло (или могло уйти, 202) — записать и закончить перебор."""
+        if res.status == "sent":
+            self._mark_sent_first(deal_id, phone, res.dialog_id, res.channel)
+            await self.note(deal_id, f"Написал клиенту первым ({res.channel or 'мессенджер'}, {phone}).")
+            return True
+        if res.status == "pending":
+            self.db.update(deal_id, status="pending_first", phone=phone, channel=res.channel,
+                           request_key=res.request_key, last_error=None)
+            self.event(deal_id, "первое сообщение передано, ждём подтверждения",
+                       f"{phone} {res.channel} {res.request_key}")
+            return True
+        return False
 
     def _mark_sent_first(self, deal_id: int, phone: str | None, dialog_id: str | None,
                          channel: str | None) -> None:

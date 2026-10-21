@@ -23,27 +23,6 @@ def not_found(code):
     return 422, {"detail": {"code": code}}
 
 
-@pytest.fixture
-def http(monkeypatch):
-    """Подменяет httpx.AsyncClient в orbita_api; calls — все запросы: (метод, путь, Idempotency-Key, тело, X-Api-Key)."""
-    calls = []
-    real = httpx.AsyncClient
-
-    def install(handler):
-        def recording(req):
-            body = json.loads(req.content) if req.content else None
-            calls.append((req.method, req.url.path, req.headers.get("idempotency-key"), body,
-                          req.headers.get("x-api-key")))
-            return handler(req)
-
-        class Client(real):
-            def __init__(self, **kw):
-                super().__init__(transport=httpx.MockTransport(recording), **kw)
-        monkeypatch.setattr(orbita_api.httpx, "AsyncClient", Client)
-        return calls
-    return install
-
-
 def orbita(dialogs=None, channels=CONNECTED):
     """Обработчик по спецификации: /channels, POST /dialogs (ответ по каналу), история, ответ в диалог."""
     dialogs = dialogs or {}
@@ -107,8 +86,9 @@ def test_number_not_in_messenger_codes(http, channel, code):
 
 
 def test_not_found_everywhere_is_no_messenger(http):
+    """«Не найден» во всех выбранных каналах (telegram не выбран — он не подключён)."""
     http(orbita({"whatsapp": not_found("not_on_whatsapp"), "max": not_found("max_not_found")}))
-    assert run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k2")).status == "no_messenger"
+    assert run(OrbitaAPI(URL, "k", ["whatsapp", "max"]).send_first("+7", "t", "k2")).status == "no_messenger"
 
 
 def test_unchecked_channel_is_error_not_no_messenger(http):
@@ -223,3 +203,10 @@ def test_signature_rejected(secret, timestamp, signature):
     body = b'{"id":1}'
     sig = sign(secret or "whsec", ts, body) if signature == "good" else signature
     assert not verify_signature(secret, ts, body, sig)
+
+
+def test_disconnected_selected_channel_makes_send_first_unchecked(http):
+    """Выбранный, но отключённый канал не проверял номер — «нет мессенджера» утверждать нельзя."""
+    http(orbita({"max": not_found("max_not_found")}, channels=[("whatsapp", False), ("max", True)]))
+    with pytest.raises(OrbitaError):
+        run(OrbitaAPI(URL, "k", ["whatsapp", "max"]).send_first("+7", "t", "k9"))

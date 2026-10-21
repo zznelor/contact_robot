@@ -18,7 +18,7 @@ class OrbitaError(RuntimeError):
 
 @dataclass
 class FirstSendResult:
-    status: str                # sent | pending | no_messenger
+    status: str                # sent | pending | no_messenger; один канал: not_found | unchecked | invalid_phone
     dialog_id: str | None = None
     channel: str | None = None
     raw: Any = None
