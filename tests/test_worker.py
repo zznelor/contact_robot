@@ -695,6 +695,23 @@ def test_manual_decision_survives_unconfirmed_template_reply(running, bitrix, or
     assert len(orbita.replies) == 1
 
 
+def test_client_reply_after_reminder_timeout_counts(running, bitrix, orbita):
+    """Напоминание передано (202) и не подтверждено за 30 минут — «проверить вручную». Клиент отвечает в
+    этот известный диалог: это ответ, ответ по шаблону уходит; позднее подтверждение напоминания его не отменяет."""
+    passed_without_confirmation(running, bitrix, orbita, "followup", 178)
+    running.s.reply_on, running.s.reply_delay_minutes = True, 0
+    running.db.update(178, followup_sent_at=ago(minutes=31).isoformat(timespec="seconds"))   # 30 минут без вебхука
+    run(running.tick())
+    assert running.db.deal(178)["status"] == "needs_check"
+    orbita.history_items["D1"] = [out(ago(hours=25)), inc(datetime.now(UTC))]
+    run(running.on_orbita_event(event("message.received", dialog_id="D1", direction="incoming")))
+    run(running.on_orbita_event(event("message.sent", request_key="rk-deal-178-followup", dialog_id="D1")))
+    row = running.db.deal(178)
+    assert row["status"] == "replied" and row["client_replied_at"] and row["reply_due_at"]
+    run(running.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-178-followup", "deal-178-reply"]
+
+
 def test_late_reminder_confirmation_does_not_undo_client_reply(running, bitrix, orbita, clock):
     """Напоминание и ответ по шаблону переданы (202), клиент между ними ответил; ответ по шаблону не подтвердили
     за 30 минут. Позднее подтверждение напоминания не возвращает сделку в «отправлено напоминание»."""

@@ -844,7 +844,11 @@ class Worker:
         async with self.lock:
             if kind == "message.received" and data.get("direction", "incoming") == "incoming":
                 row = self.db.deal_by("dialog_id", data.get("dialog_id"))
-                if row and row["status"] in ("sent_first", "sent_followup", "no_reply"):
+                # «Проверить вручную» по таймауту подтверждения напоминания (send_timeout): первое сообщение
+                # подтверждено, диалог известен, клиент ещё не отвечал — его сообщение остаётся ответом
+                reminder_unconfirmed = row and row["status"] == "needs_check" and row["followup_request_key"] \
+                    and row["followup_sent_at"] and not row["client_replied_at"]
+                if row and (row["status"] in ("sent_first", "sent_followup", "no_reply") or reminder_unconfirmed):
                     await self._client_replied(row["deal_id"], "вебхук")
             elif kind in ("message.sent", "message.failed") and data.get("request_key"):
                 await self._send_outcome(kind == "message.sent", data)
