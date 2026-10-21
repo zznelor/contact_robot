@@ -5,6 +5,7 @@
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -140,6 +141,23 @@ class DB:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         # Статус версий с MCP: сделка ждала действия «написать первым» — теперь оно есть
         self.conn.execute("UPDATE deals SET status='new' WHERE status='waiting_orbita'")
+
+    @contextmanager
+    def tx(self):
+        """Несколько записей одним атомарным переходом: все или ни одной (обрыв процесса посередине не
+        оставит половину). Соединение в autocommit, поэтому транзакция явная. Внутри — без await: пока она
+        открыта, писать в базу не может никто, а другая корутина того же соединения попала бы в неё.
+        Вложенный tx() — часть внешней транзакции."""
+        if self.conn.in_transaction:
+            yield
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        self.conn.execute("COMMIT")
 
     # ---------- служебное ----------
 

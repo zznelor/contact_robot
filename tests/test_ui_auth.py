@@ -177,3 +177,35 @@ def test_login_password_check_does_not_block_event_loop(panel, monkeypatch):
     r = run(scenario())
     assert outcome == [True]
     assert r.status_code == 303 and r.headers["location"] == "/"
+
+
+def post_at_once(panel, monkeypatch, path: str, forms: list[dict]):
+    """Формы отправлены одновременно: каждый запрос доходит до расчёта scrypt, пока другой не дошёл до него же."""
+    barrier = threading.Barrier(len(forms), timeout=5)
+    real = auth.hashlib.scrypt
+
+    def scrypt(*a, **kw):
+        barrier.wait()
+        return real(*a, **kw)
+    monkeypatch.setattr(auth.hashlib, "scrypt", scrypt)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=panel.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver", headers=ORIGIN) as c:
+            return await asyncio.gather(*(c.post(path, data=f) for f in forms))
+    return run(scenario())
+
+
+def test_invite_used_once_by_simultaneous_requests(panel, admin, monkeypatch):
+    token = invite_token(admin)
+    emails = ["op1@x.ru", "op2@x.ru"]
+    post_at_once(panel, monkeypatch, f"/invite/{token}", [{"email": m, "password": "operator1"} for m in emails])
+    assert len([m for m in emails if panel.users.by_email(m)]) == 1, "приглашение одноразовое"
+    assert panel.users.count() == 2
+
+
+def test_setup_creates_one_admin_from_simultaneous_requests(panel, monkeypatch):
+    code = panel.users.setup_code()
+    post_at_once(panel, monkeypatch, "/setup", [{"code": code, "email": m, "password": "12345678"}
+                                                for m in ("a1@x.ru", "a2@x.ru")])
+    assert panel.users.count() == 1

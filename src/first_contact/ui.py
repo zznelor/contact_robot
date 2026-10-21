@@ -101,8 +101,9 @@ def build_router(ctx: Ctx) -> APIRouter:
             return go("/setup", "!Код не подходит — возьмите его из лога сервиса")
         if problem := email_problem(email) or password_problem(password):
             return go("/setup", f"!{problem}")
-        uid = await users.create_async(email, password, "admin", name)
-        users.setup_code()                       # код больше не действует
+        uid = await users.create_first_admin_async(email, password, name)
+        if uid is None:                          # администратора уже создал другой запрос
+            return go("/login")
         worker.event(None, "создан администратор", email)
         resp = go("/settings", "Администратор создан. Теперь подключите Битрикс и Орбиту.")
         _set_session(resp, request, users.new_session(uid))
@@ -137,8 +138,9 @@ def build_router(ctx: Ctx) -> APIRouter:
             return go(f"/invite/{token}", f"!{problem}")
         if users.by_email(email):
             return go(f"/invite/{token}", "!Пользователь с такой почтой уже есть — просто войдите")
-        uid = await users.create_async(email, password, inv["role"], name)
-        users.use_invite(token)
+        uid = await users.accept_invite_async(token, email, password, name)
+        if uid is None:                          # приглашение или почту только что занял другой запрос
+            return go(f"/invite/{token}", "!Приглашение уже использовано или почта занята")
         worker.event(None, "новый пользователь по приглашению", f"{email} ({inv['role']})")
         resp = go("/")
         _set_session(resp, request, users.new_session(uid))

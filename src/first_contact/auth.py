@@ -101,8 +101,32 @@ class Users:
     # scrypt — десятки миллисекунд процессора. В обработчиках панели он идёт в потоке (asyncio.to_thread),
     # чтобы не останавливать цикл событий: вебхуки, проход робота, другие страницы. База — в цикле событий.
 
-    async def create_async(self, email: str, password: str, role: str, name: str = "") -> int:
-        return self.create(email, password, role, name, pw_hash=await asyncio.to_thread(hash_password, password))
+    # Создание учётной записи по приглашению и первого администратора: пароль считается в потоке, а проверка
+    # права (приглашение не использовано / пользователей ещё нет) и создание — одним атомарным переходом уже
+    # после расчёта. Иначе два одновременных запроса оба проходят проверку, пока считается scrypt.
+
+    async def accept_invite_async(self, token: str, email: str, password: str, name: str = "") -> int | None:
+        """Учётная запись по приглашению. None — приглашение уже использовано или истекло, или почта занята."""
+        pw_hash = await asyncio.to_thread(hash_password, password)
+        with self.db.tx():
+            inv = self.invite(token)
+            if inv is None or self.by_email(email):
+                return None
+            used = self.c.execute("UPDATE invites SET used_at=? WHERE token_hash=? AND used_at IS NULL",
+                                  (now(), _token_hash(token)))
+            if used.rowcount != 1:
+                return None
+            return self.create(email, password, inv["role"], name, pw_hash=pw_hash)
+
+    async def create_first_admin_async(self, email: str, password: str, name: str = "") -> int | None:
+        """Первый администратор (страница /setup). None — пользователь уже есть, код больше не действует."""
+        pw_hash = await asyncio.to_thread(hash_password, password)
+        with self.db.tx():
+            if self.count():
+                return None
+            uid = self.create(email, password, "admin", name, pw_hash=pw_hash)
+            self.db.put("setup_code", None)              # код больше не действует
+            return uid
 
     async def set_password_async(self, user_id: int, password: str) -> None:
         self.set_password(user_id, password, pw_hash=await asyncio.to_thread(hash_password, password))
@@ -166,9 +190,6 @@ class Users:
         return self.c.execute(
             "SELECT * FROM invites WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
             (_token_hash(token), now())).fetchone()
-
-    def use_invite(self, token: str) -> None:
-        self.c.execute("UPDATE invites SET used_at=? WHERE token_hash=?", (now(), _token_hash(token)))
 
     def open_invites(self):
         return self.c.execute("SELECT * FROM invites WHERE used_at IS NULL AND expires_at>? ORDER BY expires_at",
