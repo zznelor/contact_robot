@@ -649,6 +649,11 @@ class Worker:
 
     async def _client_replied(self, deal_id: int, how: str) -> None:
         """Клиент написал после нашего сообщения: робот больше не пишет, кроме ответа по шаблону."""
+        self._set_replied(deal_id, how)
+        await self.note(deal_id, "Клиент ответил в мессенджере.")
+
+    def _set_replied(self, deal_id: int, how: str) -> None:
+        """Запись «клиент ответил» без внешних вызовов — её можно включить в атомарный переход."""
         row = self.db.deal(deal_id)
         fields: dict = {"status": "replied", "client_replied_at": now()}
         if self.s.reply_on and not row["reply_sent_at"] and not self.dry_run:
@@ -656,7 +661,6 @@ class Worker:
             fields["reply_due_at"] = due.isoformat(timespec="seconds")
         self.db.update(deal_id, **fields)
         self.event(deal_id, f"клиент ответил ({how})")
-        await self.note(deal_id, "Клиент ответил в мессенджере.")
 
     async def poll_replies(self, force: bool = False) -> None:
         """Без вебхуков Орбиты: раз в REPLY_POLL смотрим историю свежих диалогов (force — не ждать паузу)."""
@@ -789,15 +793,22 @@ class Worker:
                 # Момент отправки — из события, иначе — когда Орбита ответила 202 (не момент подтверждения:
                 # от него считается, что ответ клиента пришёл после нашего сообщения)
                 sent_at = _parse_time(data.get("sent_at")) or _ts(row["pending_at"])
-                self._mark_sent_first(deal_id, None, dialog, row["channel"], sent_at)
+                # Исход отправки и сверка с уже принятыми ответами клиента — один атомарный переход до внешних
+                # вызовов: повтор события после обрыва (статус уже не pending_first) их не повторяет. Клиент мог
+                # ответить раньше подтверждения: тогда message.received пришёл, когда номер диалога был ещё
+                # неизвестен, и ни к какой сделке не подошёл. Клиент ответил ⇒ первое сообщение дошло
+                with self.db.tx():
+                    self._mark_sent_first(deal_id, None, dialog, row["channel"], sent_at)
+                    since = (_ts(row["pending_at"]) - CLOCK_SKEW).isoformat(timespec="seconds") \
+                        if row["pending_at"] else None
+                    replied = bool(dialog and since and self.db.incoming_since(dialog, since))
+                    if replied:
+                        self._set_replied(deal_id, "вебхук, до подтверждения отправки")
+                # Комментарии — по возможности; возврат этапа — сохранённая работа (шаг stages доделает)
                 await self.note(deal_id, f"Написал клиенту первым ({row['channel']}, {row['phone']}).")
+                if replied:
+                    await self.note(deal_id, "Клиент ответил в мессенджере.")
                 await self._restore_stage(deal_id)
-                # Клиент мог ответить раньше подтверждения: тогда message.received пришёл, когда номер диалога
-                # был ещё неизвестен, и ни к какой сделке не подошёл. Клиент ответил ⇒ первое сообщение дошло
-                if dialog and row["pending_at"]:
-                    since = (_ts(row["pending_at"]) - CLOCK_SKEW).isoformat(timespec="seconds")
-                    if self.db.incoming_since(dialog, since):
-                        await self._client_replied(deal_id, "вебхук, до подтверждения отправки")
             else:
                 self.db.update(deal_id, status="needs_check", last_error=f"не доставлено: {reason}")
                 self.event(deal_id, "первое сообщение не доставлено", reason)

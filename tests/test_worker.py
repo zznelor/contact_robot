@@ -611,6 +611,29 @@ def test_template_reply_202_then_failed_needs_check_and_retry_resends(replying, 
     assert [k for _, _, k in orbita.replies] == ["deal-163-reply", "deal-163-reply-r1"]
 
 
+def test_early_client_reply_survives_restart_while_confirming(replying, bitrix, orbita):
+    """Клиент ответил до подтверждения первого сообщения; message.sent записан, а процесс остановили, пока шёл
+    комментарий в Битрикс. После перезапуска ответ клиента не теряется."""
+    orbita.answers["whatsapp"] = "pending"
+    rk = start_deal(replying, bitrix, 186)["request_key"]
+    db = replying.db
+    db.accept_event("r186", "message.received",
+                    json.dumps(event("message.received", dialog_id=777, direction="incoming")), "777")
+    run(replying.process_inbox())
+    db.accept_event("s186", "message.sent", json.dumps(event("message.sent", request_key=rk, dialog_id=777)), "777")
+
+    async def stopped(*a):
+        raise asyncio.CancelledError
+    bitrix.comment = stopped
+    with pytest.raises(asyncio.CancelledError):
+        run(replying.process_inbox())
+    del bitrix.comment
+
+    run(Worker(config.env(), replying.s, db, bitrix, orbita).tick())
+    row = db.deal(186)
+    assert row["status"] == "replied" and row["client_replied_at"]
+
+
 def test_test_event_changes_nothing(worker):
     worker.db.add_deal(10)
     worker.db.update(10, status="sent_first", dialog_id="501")
