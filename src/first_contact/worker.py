@@ -15,7 +15,8 @@ from . import config
 from .bitrix import Bitrix
 from .config import Env, Settings
 from .db import DB, now
-from .orbita import FirstSendResult, OrbitaError, answered_after, client_replied, first_incoming
+from .orbita import (CLOCK_SKEW, FirstSendResult, OrbitaError, _parse_time, answered_after, client_replied,
+                     first_incoming)
 from .orbita_api import OrbitaAPI, OrbitaAPIError
 
 log = logging.getLogger("first_contact")
@@ -471,7 +472,7 @@ class Worker:
             return True
         if res.status == "pending":
             self.db.update(deal_id, status="pending_first", phone=phone, channel=res.channel,
-                           request_key=res.request_key, last_error=None)
+                           request_key=res.request_key, last_error=None, pending_at=now())
             self.event(deal_id, "первое сообщение передано, ждём подтверждения",
                        f"{phone} {res.channel} {res.request_key}")
             return True
@@ -486,10 +487,11 @@ class Worker:
         return True
 
     def _mark_sent_first(self, deal_id: int, phone: str | None, dialog_id: str | None,
-                         channel: str | None) -> None:
-        due = datetime.now(timezone.utc) + timedelta(hours=self.s.followup_hours)
+                         channel: str | None, sent_at: datetime | None = None) -> None:
+        sent_at = sent_at or datetime.now(timezone.utc)
+        due = sent_at + timedelta(hours=self.s.followup_hours)
         fields = dict(status="sent_first", dialog_id=dialog_id, channel=channel,
-                      first_sent_at=datetime.now(timezone.utc).isoformat(),
+                      first_sent_at=sent_at.isoformat(timespec="seconds"),
                       followup_due_at=due.isoformat(timespec="seconds"), last_error=None)
         if phone:
             fields["phone"] = phone
@@ -716,9 +718,18 @@ class Worker:
         if row and row["status"] == "pending_first":
             deal_id = row["deal_id"]
             if ok:
-                dialog = data.get("dialog_id")
-                self._mark_sent_first(deal_id, None, str(dialog) if dialog is not None else None, row["channel"])
+                dialog = str(data["dialog_id"]) if data.get("dialog_id") is not None else None
+                # Момент отправки — из события, иначе — когда Орбита ответила 202 (не момент подтверждения:
+                # от него считается, что ответ клиента пришёл после нашего сообщения)
+                sent_at = _parse_time(data.get("sent_at")) or _ts(row["pending_at"])
+                self._mark_sent_first(deal_id, None, dialog, row["channel"], sent_at)
                 await self.note(deal_id, f"Написал клиенту первым ({row['channel']}, {row['phone']}).")
+                # Клиент мог ответить раньше подтверждения: тогда message.received пришёл, когда номер диалога
+                # был ещё неизвестен, и ни к какой сделке не подошёл. Клиент ответил ⇒ первое сообщение дошло
+                if dialog and row["pending_at"]:
+                    since = (_ts(row["pending_at"]) - CLOCK_SKEW).isoformat(timespec="seconds")
+                    if self.db.incoming_since(dialog, since):
+                        await self._client_replied(deal_id, "вебхук, до подтверждения отправки")
             else:
                 self.db.update(deal_id, status="needs_check", last_error=f"не доставлено: {reason}")
                 self.event(deal_id, "первое сообщение не доставлено", reason)

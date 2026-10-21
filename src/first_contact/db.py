@@ -104,6 +104,8 @@ MIGRATIONS = [
     ("deals", "reply_request_key", "TEXT"),
     ("deals", "followup_retry_n", "INTEGER NOT NULL DEFAULT 0"),
     ("deals", "reply_retry_n", "INTEGER NOT NULL DEFAULT 0"),
+    # Когда первое сообщение ушло в Орбиту с ответом 202 (ждём message.sent), 21.10.2026
+    ("deals", "pending_at", "TEXT"),
     # Время следующей попытки шага после сбоя (нарастающая пауза) или срок, названный Орбитой, 21.10.2026
     ("deals", "next_attempt_at", "TEXT"),
     # Вебхуки Орбиты — durable inbox, 21.10.2026. Строки старых версий (тела нет) — уже обработанные: done
@@ -195,6 +197,20 @@ class DB:
 
     def inbox_event(self, event_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM orbita_events WHERE id=?", (str(event_id),)).fetchone()
+
+    def incoming_since(self, dialog_id: str, since: str) -> bool:
+        """Принимали ли вебхук message.received от клиента в этом диалоге не раньше since."""
+        rows = self.conn.execute(
+            "SELECT body FROM orbita_events WHERE type='message.received' AND dialog_id=? AND at>=?",
+            (str(dialog_id), since)).fetchall()
+        for r in rows:
+            try:
+                data = json.loads(r["body"] or "").get("data") or {}
+            except (ValueError, AttributeError):
+                continue
+            if data.get("direction", "incoming") == "incoming":
+                return True
+        return False
 
     def event_done(self, event_id: str) -> None:
         self.conn.execute("UPDATE orbita_events SET state='done', done_at=?, last_error=NULL WHERE id=?",

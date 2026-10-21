@@ -117,3 +117,22 @@ def test_ready_503_when_db_unavailable(worker):
     c = TestClient(create_app(worker))
     worker.db.conn.close()
     assert c.get("/ready").status_code == 503
+
+
+def test_client_reply_before_send_confirmation_counts(webhook_app, running, bitrix, orbita):
+    """202 на первое сообщение; клиент ответил раньше, чем пришло message.sent (номер диалога ещё не знали)."""
+    orbita.answers["whatsapp"] = "pending"
+    bitrix.new_ids.append(180)
+    run(running.tick())
+    row = running.db.deal(180)
+    assert row["status"] == "pending_first"
+
+    with TestClient(webhook_app) as c:
+        post_orbita(c, {"id": 60, "type": "message.received",
+                        "data": {"dialog_id": 777, "direction": "incoming", "channel": "whatsapp"}}, event_id="60")
+        post_orbita(c, {"id": 61, "type": "message.sent",
+                        "data": {"dialog_id": 777, "direction": "outgoing", "request_key": row["request_key"]}},
+                    event_id="61")
+        wait_for(lambda: running.db.deal(180)["status"] != "pending_first")
+    row = running.db.deal(180)
+    assert row["status"] == "replied" and row["client_replied_at"]
