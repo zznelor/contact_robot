@@ -9,6 +9,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:                        # замок базы между процессами (service_lock): POSIX — flock, Windows — msvcrt
+    import fcntl
+except ImportError:
+    fcntl = None
+    import msvcrt
+
 # Статусы сделки в сервисе:
 #   new            — увидели, ещё не обработали (или упали и повторим)
 #   pending_first  — Орбита ответила 202: сообщение могло уйти, ждём вебхук message.sent / failed
@@ -142,19 +148,28 @@ MIGRATIONS = [
 
 
 def service_lock(db_path: Path):
-    """Межпроцессный замок робота на базу: файл «<база>.lock» рядом с ней, fcntl.flock. Сервис `run` держит его,
-    пока работает, разовые `once` / `process` — на время своей работы: два процесса робота на одной базе не
-    отправляют и не пишут статусы одновременно (у каждого процесса свой Worker.lock). Возвращает открытый
-    файл (замок держится, пока он открыт; закрытие или конец процесса отпускают) или None — замок занят."""
-    import fcntl                                    # только POSIX: робот работает в Docker (Linux) или на macOS
+    """Межпроцессный замок робота на базу: файл «<база>.lock» рядом с ней. Сервис `run` держит его, пока работает,
+    разовые `once` / `process` — на время своей работы: два процесса робота на одной базе не отправляют и не пишут
+    статусы одновременно (у каждого процесса свой Worker.lock). Возвращает открытый файл (замок держится, пока он
+    открыт; закрытие или конец процесса, в том числе аварийный, отпускают) или None — замок занят.
+
+    POSIX (Docker, Linux, macOS) — fcntl.flock на весь файл; Windows (запуск без Docker) — msvcrt.locking на
+    первый байт файла. Поведение одно: неблокирующий захват, освобождение при закрытии файла."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    f = open(path.with_name(path.name + ".lock"), "a")
+    f = open(path.with_name(path.name + ".lock"), "a+")
     try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            f.seek(0)                               # msvcrt.locking считает байты от текущей позиции
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    except (BlockingIOError, PermissionError):      # занят: flock — EWOULDBLOCK, locking — EACCES
         f.close()
         return None
+    except BaseException:
+        f.close()
+        raise
     return f
 
 

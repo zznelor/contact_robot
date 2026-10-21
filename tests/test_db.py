@@ -3,7 +3,7 @@
 import sqlite3
 
 from first_contact import config
-from first_contact.db import DB
+from first_contact.db import DB, service_lock
 
 
 def test_old_orbita_events_are_done_after_upgrade():
@@ -19,3 +19,18 @@ def test_old_orbita_events_are_done_after_upgrade():
     db = DB(path)
     assert db.pending_events() == []
     assert not db.accept_event("7", "message.received", "{}", None), "повтор старого события — дубль"
+
+
+def test_service_lock_is_exclusive_until_released():
+    """Замок базы между процессами (реализация текущей ОС): второй захват не удаётся, пока первый держат;
+    закрытие отпускает."""
+    path = config.env().db_path
+    held = service_lock(path)
+    assert held is not None
+    try:
+        assert service_lock(path) is None
+    finally:
+        held.close()
+    again = service_lock(path)
+    assert again is not None
+    again.close()
