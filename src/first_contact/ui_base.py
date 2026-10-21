@@ -121,11 +121,14 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{c
 .steps .m{width:18px;text-align:center}
 .toc{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0 16px}.toc a{border:1px solid var(--line);border-radius:999px;padding:3px 12px;background:var(--card);color:var(--fg)}
 .hint{font-size:12px;color:var(--muted)}
+.visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 """
 
 # Сохранение в настройках ждёт ответа Битрикса и Орбиты (1–3 с). Повторное нажатие обрывало запрос,
 # и «Сохранено» не появлялось: после первого нажатия кнопка блокируется до ответа.
-JS = """document.addEventListener("submit",function(ev){var f=ev.target,b=ev.submitter;
+# Отправку, отменённую раньше (onsubmit="return confirm(…)" → «Отмена»), не блокируем: перехода не будет,
+# и форма осталась бы «занятой» до перезагрузки страницы.
+JS = """document.addEventListener("submit",function(ev){if(ev.defaultPrevented)return;var f=ev.target,b=ev.submitter;
 if(f.dataset.busy){ev.preventDefault();return}f.dataset.busy="1";
 if(b&&b.tagName==="BUTTON")setTimeout(function(){b.disabled=true;b.dataset.label=b.textContent;b.textContent="Подождите…"},0)});
 window.addEventListener("pageshow",function(){document.querySelectorAll("form[data-busy]").forEach(function(f){delete f.dataset.busy});

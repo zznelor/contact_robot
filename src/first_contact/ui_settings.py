@@ -77,8 +77,8 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 <p class="muted">Отправит первое сообщение по текущему шаблону на указанный номер — как будто пришла заявка.
 Сделка в Битриксе не создаётся. Берите свой номер или номер коллеги.</p>
 <form method="post" action="/settings/test" class="bar">
-<input type="tel" name="phone" placeholder="+7 900 000-00-00" required {test_disabled}>
-<input type="text" name="name" placeholder="Имя (по желанию)" {test_disabled}>
+<label><span class="visually-hidden">Телефон</span><input type="tel" name="phone" placeholder="+7 900 000-00-00" required {test_disabled}></label>
+<label><span class="visually-hidden">Имя</span><input type="text" name="name" placeholder="Имя (по желанию)" {test_disabled}></label>
 <button class="primary" {test_disabled}>Отправить</button></form>
 {f'<p class="hint">Последний тест: {e(last_test)}</p>' if last_test else ''}</div>"""
 
@@ -438,9 +438,9 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         return f"""<div class="card" id="team">
 <h2 style="margin-top:0">Команда</h2><p class="hint">Кто может входить в панель. Администратор видит и меняет
 настройки, оператор — только сделки и журнал.</p>{link}
-<div class="wrap"><table><tr><th>Почта</th><th>Имя</th><th>Роль</th><th>С</th><th></th></tr>{rows}</table></div>
+<div class="wrap"><table><thead><tr><th scope="col">Почта</th><th scope="col">Имя</th><th scope="col">Роль</th><th scope="col">С</th><th scope="col">Действия</th></tr></thead><tbody>{rows}</tbody></table></div>
 <h3>Пригласить</h3><form class="bar" method="post" action="/team/invite">
-<select name="role"><option value="operator">оператор</option><option value="admin">администратор</option></select>
+<label><span class="visually-hidden">Роль</span><select name="role"><option value="operator">оператор</option><option value="admin">администратор</option></select></label>
 <button class="primary">Создать ссылку-приглашение</button></form>{inv}</div>"""
 
     @router.get("/team")

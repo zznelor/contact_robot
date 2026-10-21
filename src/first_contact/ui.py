@@ -207,13 +207,14 @@ def build_router(ctx: Ctx) -> APIRouter:
 <p class="muted">Новые сделки Битрикса, которым робот пишет первым. Оранжевым — где нужен человек.</p>
 <div class="tiles">{''.join(tiles)}</div>
 <div class="bar"><form class="bar" style="margin:0" method="get"><input type="hidden" name="status" value="{e(status)}">
-<input type="search" name="q" value="{e(q)}" placeholder="ID, имя или телефон"><button>Найти</button></form>
+<label><span class="visually-hidden">Поиск заявки</span><input type="search" name="q" value="{e(q)}" placeholder="ID, имя или телефон"></label><button>Найти</button></form>
 <form class="bar" style="margin:0" method="post" action="/actions/tick">
-<select name="step" title="Робот и так делает всё это сам раз в минуту"><option value="all">Всё сразу (как раз в минуту)</option>
-{''.join(f'<option value="{k}">{e(v)}</option>' for k, v in worker.STEPS.items())}</select>
+<label><span class="visually-hidden">Действие робота (робот и так делает всё это сам раз в минуту)</span>
+<select name="step"><option value="all">Всё сразу (как раз в минуту)</option>
+{''.join(f'<option value="{k}">{e(v)}</option>' for k, v in worker.STEPS.items())}</select></label>
 <button>Выполнить сейчас</button></form></div>
-<div class="wrap"><table><tr><th>Сделка</th><th>Имя</th><th>Телефон</th><th>Статус</th><th>Канал</th>
-<th>Первое</th><th>Напоминание</th><th>Комментарий</th></tr>{trs}</table></div>
+<div class="wrap"><table><thead><tr><th scope="col">Сделка</th><th scope="col">Имя</th><th scope="col">Телефон</th><th scope="col">Статус</th><th scope="col">Канал</th>
+<th scope="col">Первое</th><th scope="col">Напоминание</th><th scope="col">Комментарий</th></tr></thead><tbody>{trs}</tbody></table></div>
 <p class="small muted">Показано {len(rows)} из {found}.</p>"""
         return ctx.page(user, "Заявки", "deals", body, msg)
 
@@ -267,7 +268,7 @@ def build_router(ctx: Ctx) -> APIRouter:
 <p class="muted">{link}</p>
 <div class="grid2"><div class="card"><dl>{dl}</dl></div>
 <div class="card"><b>Действия</b><div style="margin-top:10px;display:grid;gap:10px">{''.join(actions) or '<span class="muted">Робот закончил с этой сделкой.</span>'}</div>{first}</div></div>
-<h2>Хронология</h2><div class="wrap"><table><tr><th>Когда</th><th>Событие</th><th>Подробности</th></tr>{evs}</table></div>"""
+<h2>Хронология</h2><div class="wrap"><table><thead><tr><th scope="col">Когда</th><th scope="col">Событие</th><th scope="col">Подробности</th></tr></thead><tbody>{evs}</tbody></table></div>"""
         return ctx.page(user, f"Сделка {deal_id}", "deals", body, msg)
 
     def back(deal_id: int, msg: str):
@@ -338,7 +339,7 @@ def build_router(ctx: Ctx) -> APIRouter:
             for ev in db.events(limit=500)
         ) or '<tr><td colspan="4" class="muted">Событий нет</td></tr>'
         body = f"""<h1>Журнал</h1><p class="muted">Последние 500 событий робота, новые сверху.</p>
-<div class="wrap"><table><tr><th>Когда</th><th>Сделка</th><th>Событие</th><th>Подробности</th></tr>{trs}</table></div>"""
+<div class="wrap"><table><thead><tr><th scope="col">Когда</th><th scope="col">Сделка</th><th scope="col">Событие</th><th scope="col">Подробности</th></tr></thead><tbody>{trs}</tbody></table></div>"""
         return ctx.page(user, "Журнал", "events", body)
 
     # ---------- проверка связи ----------
@@ -390,7 +391,7 @@ def build_router(ctx: Ctx) -> APIRouter:
                       f"<td>{e(d)}</td></tr>" for n, ok, d in rows)
         base = ctx.public_url(request)
         body = f"""<h1>Проверка связи</h1><p class="muted">Живой запрос к Битриксу и Орбите при открытии страницы.</p>
-<div class="wrap"><table><tr><th>Что</th><th></th><th>Результат</th></tr>{trs}</table></div>
+<div class="wrap"><table><thead><tr><th scope="col">Что</th><th scope="col">Состояние</th><th scope="col">Результат</th></tr></thead><tbody>{trs}</tbody></table></div>
 <h2>Адреса для настройки</h2><div class="card"><dl>
 <dt>Битрикс → исходящий вебхук «Создание сделки»</dt><dd><code>{e(base)}/bitrix/deal-add</code></dd>
 <dt>Орбита → Разработчикам → Вебхуки</dt><dd><code>{e(base)}/orbita/webhook</code></dd></dl></div>"""
