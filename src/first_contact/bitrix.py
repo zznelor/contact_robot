@@ -134,12 +134,25 @@ class Bitrix:
                 raise BitrixError(f"{method}: {code} — вызовы Битрикса приостановлены до "
                                   f"{until.isoformat(timespec='seconds')}", method, code, retry_at=until)
         # Соединение на вызов: нагрузка — единицы запросов в минуту, а адрес может смениться в панели
-        async with httpx.AsyncClient(base_url=self.webhook, timeout=self.timeout) as http:
-            r = await http.post(f"{method}.json", json=params or {})
+        host = httpx.URL(self.webhook).host
+        try:
+            async with httpx.AsyncClient(base_url=self.webhook, timeout=self.timeout) as http:
+                r = await http.post(f"{method}.json", json=params or {})
+        except httpx.TransportError as e:
+            raise BitrixError(f"{method}: нет связи с порталом {host}: {type(e).__name__}: {e} — проверьте адрес "
+                              "портала в адресе вебхука", method) from e
+        if r.is_redirect:
+            # Адрес облачного портала сменили: Битрикс отвечает 301/302 с новым адресом (change-domen.md). По
+            # редиректу не идём — POST превратился бы в GET без параметров; новый адрес вебхука вводит владелец
+            moved = r.headers.get("location", "")
+            new = moved.split("/rest/")[0] if "/rest/" in moved else moved
+            raise BitrixError(f"{method}: портал {host} переадресует на {new or 'другой адрес'} — адрес портала "
+                              "сменился? Возьмите новый адрес вебхука в Битриксе и сохраните в настройках", method)
         try:
             data = r.json()
         except ValueError:
-            raise BitrixError(f"{method}: HTTP {r.status_code}, ответ не JSON — проверьте адрес вебхука") from None
+            raise BitrixError(f"{method}: по адресу {host} ответил не Битрикс24 REST (HTTP {r.status_code}) — "
+                              "проверьте адрес вебхука: https://портал/rest/<пользователь>/<код>/", method) from None
         if not isinstance(data, dict) or "result" not in data and "error" not in data:
             raise BitrixError(f"{method}: HTTP {r.status_code}, неожиданный ответ")
         reset = _reset_at(data)

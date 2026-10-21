@@ -408,3 +408,25 @@ def test_lost_answer_repeats_with_name_of_that_number(portal_robot, orbita, cloc
     key = f"deal-106-first-{PHONE}-whatsapp"
     assert orbita.first == [(PHONE, "Борис", key), (PHONE, "Борис", key)]
     assert w.db.deal(106)["status"] == "sent_first"
+
+
+# ---------- неверный адрес портала ----------
+
+def test_portal_moved_shows_new_address(http):
+    """После смены адреса облачный Битрикс24 отвечает 301/302 с новым адресом в Location
+    (settings/how-to-call-rest-api/change-domen.md): владелец видит, куда переехал портал."""
+    new = "https://new-portal.bitrix24.ru/rest/1/x/crm.deal.get.json"
+    http(lambda req: httpx.Response(301, headers={"Location": new}, text="<html>Moved</html>"))
+    with pytest.raises(BitrixError) as e:
+        run(Bitrix(HOOK).get_deal(7))
+    assert "https://new-portal.bitrix24.ru" in str(e.value)
+
+
+def test_portal_unreachable_is_bitrix_error(http):
+    """Адрес портала не резолвится или порт закрыт — ошибка Битрикса с адресом портала, а не сырой сбой httpx."""
+    def refuse(req):
+        raise httpx.ConnectError("[Errno -2] Name or service not known", request=req)
+    http(refuse)
+    with pytest.raises(BitrixError) as e:
+        run(Bitrix(HOOK).get_deal(7))
+    assert "p.bitrix24.ru" in str(e.value)
