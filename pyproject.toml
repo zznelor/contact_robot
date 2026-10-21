@@ -26,3 +26,8 @@ packages = ["src/first_contact"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mutmut]
+source_paths = ["src/first_contact/"]
+# Командная строка: main() вызывается при импорте модуля, тестами не исполняется
+do_not_mutate = ["src/first_contact/__main__.py"]

@@ -1,173 +1,225 @@
-"""Проверки клиента REST API Орбиты и вебхуков на моках по спецификации (без сети).
+"""Клиент REST API Орбиты (orbita_api.py) на httpx.MockTransport по спецификации docs/orbita-openapi-*.json."""
 
-Запуск: uv run python test_orbita_api.py
-"""
-import asyncio, hashlib, hmac, json, sys, tempfile, time
+import json
+import time
+from datetime import datetime
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
-HERE = __import__("pathlib").Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+
 import httpx
+import pytest
+
+from conftest import UTC, run, sign
 from first_contact import orbita_api
-from first_contact.orbita_api import OrbitaAPI, verify_signature
 from first_contact.orbita import OrbitaError, client_replied
+from first_contact.orbita_api import OrbitaAPI, OrbitaAPIError, verify_signature
 
-ok = 0
-def check(cond, name):
-    global ok
-    assert cond, name; ok += 1; print("✔", name)
+SPEC = Path(__file__).resolve().parents[1] / "docs" / "orbita-openapi-2026-10-20.json"
+URL = "https://x/api/public/v1"
+ALL = ["whatsapp", "max", "telegram"]
+CONNECTED = (("whatsapp", True), ("telegram", False), ("max", True))
 
-# 1. подпись — пример из спецификации
-spec = json.load(open(HERE / "docs" / "orbita-openapi-2026-10-20.json"))["info"]["x-orbita-signature-example"]
-check(verify_signature(spec["secret"], spec["timestamp"], spec["body"].encode(), spec["signature"], max_skew=0), "подпись примера из спецификации")
-check(not verify_signature(spec["secret"], spec["timestamp"], spec["body"].encode()+b" ", spec["signature"], max_skew=0), "подделанное тело отвергнуто")
-check(not verify_signature(spec["secret"], spec["timestamp"], spec["body"].encode(), spec["signature"]), "старый timestamp отвергнут")
 
-# 2. мок API
-REAL = httpx.AsyncClient
-def mock(handler):
-    real = REAL
-    class C(real):
-        def __init__(self, **kw): super().__init__(transport=httpx.MockTransport(handler), **kw)
-    orbita_api.httpx.AsyncClient = C
+def not_found(code):
+    return 422, {"detail": {"code": code}}
 
-calls = []
-def make(responses, channels=(("whatsapp", True), ("telegram", False), ("max", True))):
-    def h(req):
-        calls.append((req.method, req.url.path, req.headers.get("idempotency-key"), req.content and json.loads(req.content)))
-        assert req.headers["x-api-key"] == "k"
-        if req.url.path.endswith("/channels"):
-            return httpx.Response(200, json={"items": [{"provider": p, "is_connected": c, "id": i} for i, (p, c) in enumerate(channels)]})
-        if req.url.path.endswith("/dialogs") and req.method == "POST":
-            ch = json.loads(req.content)["channel"]
-            st, body = responses[ch]
-            return httpx.Response(st, json=body)
-        if req.url.path.endswith("/messages") and req.method == "GET":
+
+@pytest.fixture
+def http(monkeypatch):
+    """Подменяет httpx.AsyncClient в orbita_api; calls — все запросы: (метод, путь, Idempotency-Key, тело, X-Api-Key)."""
+    calls = []
+    real = httpx.AsyncClient
+
+    def install(handler):
+        def recording(req):
+            body = json.loads(req.content) if req.content else None
+            calls.append((req.method, req.url.path, req.headers.get("idempotency-key"), body,
+                          req.headers.get("x-api-key")))
+            return handler(req)
+
+        class Client(real):
+            def __init__(self, **kw):
+                super().__init__(transport=httpx.MockTransport(recording), **kw)
+        monkeypatch.setattr(orbita_api.httpx, "AsyncClient", Client)
+        return calls
+    return install
+
+
+def orbita(dialogs=None, channels=CONNECTED):
+    """Обработчик по спецификации: /channels, POST /dialogs (ответ по каналу), история, ответ в диалог."""
+    dialogs = dialogs or {}
+
+    def handler(req):
+        path = req.url.path
+        if path.endswith("/channels"):
+            return httpx.Response(200, json={"items": [{"provider": p, "is_connected": c, "id": i}
+                                                       for i, (p, c) in enumerate(channels)]})
+        if path.endswith("/dialogs") and req.method == "POST":
+            status, body = dialogs[json.loads(req.content)["channel"]]
+            return httpx.Response(status, json=body)
+        if path.endswith("/messages") and req.method == "GET":
             return httpx.Response(200, json={"items": [
                 {"direction": "incoming", "sent_at": "2026-10-20T10:10:00+00:00"},
                 {"direction": "outgoing", "sent_at": "2026-10-20T10:00:00+00:00"}]})
-        if req.url.path.endswith("/messages") and req.method == "POST":
+        if path.endswith("/messages") and req.method == "POST":
             return httpx.Response(202, json={"request_key": "rk", "message_id": 5})
         return httpx.Response(404, json={"detail": {"code": "not_found"}})
-    return h
+    return handler
 
-api = OrbitaAPI("https://x/api/public/v1", "k", ["whatsapp", "max", "telegram"])
-run = asyncio.run
-nf = lambda c: (422, {"detail": {"code": c}})
 
-mock(make({"whatsapp": (201, {"dialog": {"id": 501}, "message_id": 1})}))
-r = run(api.send_first("+79990000001", "привет", "deal-1-first-+7999", "Анна"))
-check(r.status == "sent" and r.dialog_id == "501" and r.channel == "whatsapp", "201 → отправлено, диалог 501")
-check(calls[-1][2] == "deal-1-first-+7999-whatsapp" and calls[-1][3]["name"] == "Анна", "ключ идемпотентности по каналу, имя передано")
+def tried_channels(calls):
+    return [c[3]["channel"] for c in calls if c[0] == "POST" and c[1].endswith("/dialogs")]
 
-calls.clear()
-mock(make({"whatsapp": nf("not_on_whatsapp"), "max": (201, {"dialog": {"id": 7}})}))
-r = run(api.send_first("+7", "t", "k1"))
-check(r.status == "sent" and r.channel == "max", "нет в WhatsApp → написали в Max")
-check(not any(c[3] and c[3].get("channel") == "telegram" for c in calls), "telegram не подключён — не трогаем")
 
-calls.clear()
-api_max_first = OrbitaAPI("https://x/api/public/v1", "k", ["max", "whatsapp"])
-mock(make({"max": nf("max_not_found"), "whatsapp": (201, {"dialog": {"id": 8}})}))
-r = run(api_max_first.send_first("+7", "t", "k-order"))
-tried = [c[3]["channel"] for c in calls if c[1].endswith("/dialogs")]
-check(tried == ["max", "whatsapp"] and r.channel == "whatsapp", "порядок из настроек: сначала Max, потом WhatsApp")
+# ---------- «написать первым» ----------
 
-mock(make({"whatsapp": nf("not_on_whatsapp"), "max": nf("max_not_found")}))
-check(run(api.send_first("+7", "t", "k2")).status == "no_messenger", "нигде не найден → no_messenger")
+def test_send_first_201_sent(http):
+    calls = http(orbita({"whatsapp": (201, {"dialog": {"id": 501}, "message_id": 1})}))
+    r = run(OrbitaAPI(URL, "k", ALL).send_first("+79990000001", "привет", "deal-1-first-+7999", "Анна"))
+    assert (r.status, r.dialog_id, r.channel) == ("sent", "501", "whatsapp")
+    method, path, key, body, _ = calls[-1]
+    assert (method, path, key) == ("POST", "/api/public/v1/dialogs", "deal-1-first-+7999-whatsapp")
+    assert body == {"channel": "whatsapp", "phone": "+79990000001", "text": "привет", "name": "Анна"}
+    assert {c[4] for c in calls} == {"k"}, "ключ API в каждом запросе"
 
-mock(make({"whatsapp": nf("not_connected"), "max": nf("max_not_found")}))
-try: run(api.send_first("+7", "t", "k3")); check(False, "x")
-except OrbitaError as e: check("не проверен" in str(e), "WhatsApp лежит → ошибка, а не «не найден»")
 
-mock(make({"whatsapp": nf("daily_send_limit_exhausted")}))
-try: run(api.send_first("+7", "t", "k4")); check(False, "x")
-except OrbitaError as e: check("daily_send_limit" in str(e), "суточный лимит ключа → ошибка (повтор позже)")
+def test_not_found_tries_next_connected_channel(http):
+    calls = http(orbita({"whatsapp": not_found("not_on_whatsapp"), "max": (201, {"dialog": {"id": 7}})}))
+    r = run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k1"))
+    assert (r.status, r.channel) == ("sent", "max")
+    assert tried_channels(calls) == ["whatsapp", "max"], "telegram не подключён — не трогаем"
 
-mock(make({}, channels=[("whatsapp", False)]))
-try: run(api.send_first("+7", "t", "k5")); check(False, "x")
-except OrbitaError as e: check("нет подключённых" in str(e), "нет каналов → ошибка, а не «не найден»")
 
-mock(make({}, channels=[("whatsapp", False), ("whatsapp", True), ("max", False)]))
-check(run(api.channel_status()) == {"whatsapp": True, "max": False, "telegram": None},
-      "статус каналов: все три, даже не заведённый Telegram; два подключения WhatsApp — живо хоть одно")
+def test_channel_order_from_settings(http):
+    calls = http(orbita({"max": not_found("max_not_found"), "whatsapp": (201, {"dialog": {"id": 8}})}))
+    r = run(OrbitaAPI(URL, "k", ["max", "whatsapp"]).send_first("+7", "t", "k-order"))
+    assert tried_channels(calls) == ["max", "whatsapp"] and r.channel == "whatsapp"
 
-mock(make({"whatsapp": (202, {"request_key": "rk-1"})}))
-r = run(api.send_first("+7", "t", "k6"))
-check(r.status == "pending" and r.request_key == "rk-1", "202 → pending с request_key")
 
-def boom(req): raise httpx.ConnectTimeout("t")
-mock(boom)
-try: run(api.send_first("+7", "t", "k7")); check(False, "x")
-except OrbitaError: check(True, "обрыв связи → повторяемая ошибка (идемпотентно)")
+@pytest.mark.parametrize("channel, code", [
+    ("whatsapp", "not_on_whatsapp"),
+    ("max", "max_not_found"),
+    ("telegram", "telegram_recipient_not_found"),
+    ("telegram", "telegram_recipient_refused"),
+])
+def test_number_not_in_messenger_codes(http, channel, code):
+    http(orbita({channel: not_found(code)}, channels=[(channel, True)]))
+    assert run(OrbitaAPI(URL, "k", [channel]).send_first("+7", "t", "k2")).status == "no_messenger"
 
-mock(make({"whatsapp": (201, {"message_id": 1})}))
-r = run(api.send_first("+7", "t", "k-nodialog"))
-check(r.status == "sent" and r.dialog_id is None, "201 без диалога → номер диалога пустой, а не «None»")
-mock(lambda req: httpx.Response(502, json=["bad gateway"]))
-try: run(api.account()); check(False, "x")
-except OrbitaError as e: check("502" in str(e), "ошибка не в виде объекта — понятное исключение")
 
-mock(make({}))
-msgs = run(api.history("501"))
-check([m.outgoing for m in msgs] == [False, True], "история: направления")
-check(client_replied(msgs, datetime(2026,10,20,10,0,tzinfo=timezone.utc)) is True, "клиент ответил после нашего")
-check(client_replied(msgs, datetime(2026,10,20,10,30,tzinfo=timezone.utc)) is None, "старая реплика клиента не считается ответом")
-check(run(api.send_reply("501", "второе", "k8"))["request_key"] == "rk", "send_reply 202 — ок")
+def test_not_found_everywhere_is_no_messenger(http):
+    http(orbita({"whatsapp": not_found("not_on_whatsapp"), "max": not_found("max_not_found")}))
+    assert run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k2")).status == "no_messenger"
 
-# 3. воркер + HTTP вебхук
-import os
-tmp = tempfile.mkdtemp()
-os.environ["DB_PATH"] = f"{tmp}/s.sqlite3"
-from first_contact import config
-from first_contact.db import DB
-from first_contact.worker import Worker
-from first_contact.app import create_app
-from fastapi.testclient import TestClient
 
-class FakeBitrix:
-    notes = []
-    async def comment(self, d, t): self.notes.append((d, t))
-env = config.env()
-db = DB(env.db_path)
-s = config.load(db)
-s.orbita_webhook_secret = "whsec_t"
-w = Worker(env, s, db, FakeBitrix(), api)
-db.add_deal(10); db.update(10, status="sent_first", dialog_id="501", phone="+7")
-db.add_deal(11); db.update(11, status="pending_first", request_key="rk-9", channel="whatsapp", phone="+8")
-db.add_deal(12); db.update(12, status="pending_first", request_key="rk-10", channel="max", phone="+9")
+def test_unchecked_channel_is_error_not_no_messenger(http):
+    """Хоть один канал не смог проверить номер — ошибка с повтором, а не «нет мессенджера»."""
+    http(orbita({"whatsapp": not_found("not_connected"), "max": not_found("max_not_found")}))
+    with pytest.raises(OrbitaError):
+        run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k3"))
 
-app = create_app(w)
-client = TestClient(app)  # без with — фоновый цикл не стартует
-def send(ev, secret="whsec_t", eid=None):
-    body = json.dumps(ev).encode(); ts = str(int(time.time()))
-    sig = "v1=" + hmac.new(secret.encode(), ts.encode()+b"."+body, hashlib.sha256).hexdigest()
-    r = client.post("/orbita/webhook", content=body, headers={"X-Orbita-Signature": sig, "X-Orbita-Timestamp": ts, "X-Orbita-Event-Id": eid or str(ev["id"])})
-    time.sleep(0.2); return r
-check(send({"id": 1, "type": "message.received", "data": {"dialog_id": 501, "direction": "incoming"}}, secret="bad").status_code == 401, "вебхук с чужой подписью → 401")
-check(send({"id": 2, "type": "message.received", "data": {"dialog_id": 501, "direction": "incoming"}}).json()["ok"], "вебхук принят")
-check(db.deal(10)["status"] == "replied", "message.received → клиент ответил")
-check(send({"id": 2, "type": "message.received", "data": {}}).json().get("duplicate"), "повтор события отсечён")
-send({"id": 3, "type": "message.sent", "data": {"request_key": "rk-9", "dialog_id": 777, "direction": "outgoing"}})
-check(db.deal(11)["status"] == "sent_first" and db.deal(11)["dialog_id"] == "777" and db.deal(11)["followup_due_at"], "message.sent → sent_first, диалог 777, второе запланировано")
-send({"id": 4, "type": "message.failed", "data": {"request_key": "rk-10", "reason_code": "send_failed"}})
-check(db.deal(12)["status"] == "needs_check", "message.failed → проверить вручную")
-check(len(FakeBitrix.notes) == 3, "комментарии в сделки: 3")
-db.update(10, status="sent_first")
-def send_noid(ev):
-    body = json.dumps(ev).encode(); ts = str(int(time.time()))
-    sig = "v1=" + hmac.new(b"whsec_t", ts.encode()+b"."+body, hashlib.sha256).hexdigest()
-    r = client.post("/orbita/webhook", content=body, headers={"X-Orbita-Signature": sig, "X-Orbita-Timestamp": ts})
-    time.sleep(0.2); return r
-send_noid({"type": "channel.connected", "data": {"provider": "max"}})
-check(not send_noid({"type": "message.received", "data": {"dialog_id": 501, "direction": "incoming"}}).json().get("duplicate")
-      and db.deal(10)["status"] == "replied", "события без номера не считаются дублями друг друга")
-orig = w.on_orbita_event
-async def broken(ev): raise RuntimeError("сбой")
-w.on_orbita_event = broken
-send({"id": 50, "type": "message.received", "data": {}})
-check(any(e["event"] == "Орбита: ошибка обработки события" for e in db.events()), "сбой обработки вебхука — в журнале")
-w.on_orbita_event = orig
-check(not send({"id": 50, "type": "message.received", "data": {}}).json().get("duplicate"),
-      "после сбоя повторная доставка обрабатывается")
-print(f"\nВсе проверки пройдены: {ok}")
+
+def test_key_level_refusal_raised_without_trying_other_channels(http):
+    calls = http(orbita({"whatsapp": not_found("daily_send_limit_exhausted")}))
+    with pytest.raises(OrbitaAPIError) as exc:
+        run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k4"))
+    assert exc.value.code == "daily_send_limit_exhausted"
+    assert tried_channels(calls) == ["whatsapp"]
+
+
+def test_no_connected_channels_is_error(http):
+    calls = http(orbita(channels=[("whatsapp", False)]))
+    with pytest.raises(OrbitaError):
+        run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k5"))
+    assert tried_channels(calls) == []
+
+
+def test_202_is_pending_with_request_key(http):
+    http(orbita({"whatsapp": (202, {"request_key": "rk-1"})}))
+    r = run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k6"))
+    assert (r.status, r.request_key) == ("pending", "rk-1")
+
+
+def test_201_without_dialog_gives_empty_dialog_id(http):
+    http(orbita({"whatsapp": (201, {"message_id": 1})}))
+    r = run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k-nodialog"))
+    assert r.status == "sent" and r.dialog_id is None
+
+
+def test_connection_failure_is_retryable_orbita_error(http):
+    def boom(req):
+        raise httpx.ConnectTimeout("t")
+    http(boom)
+    with pytest.raises(OrbitaError):
+        run(OrbitaAPI(URL, "k", ALL).send_first("+7", "t", "k7"))
+
+
+def test_error_body_not_object_still_api_error(http):
+    http(lambda req: httpx.Response(502, json=["bad gateway"]))
+    with pytest.raises(OrbitaAPIError) as exc:
+        run(OrbitaAPI(URL, "k", ALL).account())
+    assert exc.value.status == 502
+
+
+# ---------- каналы, история, ответ ----------
+
+def test_channel_status_all_three_messengers(http):
+    http(orbita(channels=[("whatsapp", False), ("whatsapp", True), ("max", False)]))
+    assert run(OrbitaAPI(URL, "k", ALL).channel_status()) == {"whatsapp": True, "max": False, "telegram": None}
+
+
+def test_history_directions_and_client_reply(http):
+    http(orbita())
+    msgs = run(OrbitaAPI(URL, "k", ALL).history("501"))
+    assert [m.outgoing for m in msgs] == [False, True]
+    assert client_replied(msgs, datetime(2026, 10, 20, 10, 0, tzinfo=UTC)) is True
+    assert client_replied(msgs, datetime(2026, 10, 20, 10, 30, tzinfo=UTC)) is None, "старая реплика — не ответ"
+
+
+def test_send_reply_202_ok_with_idempotency_key(http):
+    calls = http(orbita())
+    assert run(OrbitaAPI(URL, "k", ALL).send_reply("501", "второе", "k8"))["request_key"] == "rk"
+    assert calls[-1][:4] == ("POST", "/api/public/v1/dialogs/501/messages", "k8", {"text": "второе"})
+
+
+# ---------- подпись вебхука ----------
+
+@pytest.fixture(scope="module")
+def spec_example():
+    return json.loads(SPEC.read_text(encoding="utf-8"))["info"]["x-orbita-signature-example"]
+
+
+def test_signature_example_from_spec(spec_example):
+    s = spec_example
+    assert verify_signature(s["secret"], s["timestamp"], s["body"].encode(), s["signature"], max_skew=0)
+
+
+def test_signature_tampered_body_rejected(spec_example):
+    s = spec_example
+    assert not verify_signature(s["secret"], s["timestamp"], s["body"].encode() + b" ", s["signature"], max_skew=0)
+
+
+def test_signature_stale_timestamp_rejected(spec_example):
+    s = spec_example
+    assert not verify_signature(s["secret"], s["timestamp"], s["body"].encode(), s["signature"])
+
+
+def test_signature_one_of_several_matches():
+    ts, body = str(int(time.time())), b'{"id":1}'
+    good = sign("whsec", ts, body)
+    assert verify_signature("whsec", ts, body, f"v1=00ff, {good}")
+    assert not verify_signature("whsec", ts, body, "v1=00ff, v1=11ee")
+
+
+@pytest.mark.parametrize("secret, timestamp, signature", [
+    ("", "now", "good"),            # секрет не задан — вебхуки не принимаются
+    ("whsec", "", "good"),
+    ("whsec", "now", ""),
+    ("whsec", "abc", "good"),       # нечисловой timestamp
+    ("whsec", "old", "good"),       # старше max_skew
+])
+def test_signature_rejected(secret, timestamp, signature):
+    now = str(int(time.time()))
+    ts = {"now": now, "old": str(int(time.time()) - 301)}.get(timestamp, timestamp)
+    body = b'{"id":1}'
+    sig = sign(secret or "whsec", ts, body) if signature == "good" else signature
+    assert not verify_signature(secret, ts, body, sig)

@@ -1,209 +1,392 @@
-"""Логика робота на подделках Битрикса и Орбиты (без сети).
+"""Логика робота (worker.py) на подделках Битрикса и Орбиты. Эталон — docs/РАЗРАБОТЧИКУ.md."""
 
-Запуск: uv run python test_worker.py
-"""
-import asyncio, os, sys, tempfile
 from datetime import datetime, timedelta, timezone
-HERE = __import__("pathlib").Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-os.environ["DB_PATH"] = f"{tempfile.mkdtemp()}/w.sqlite3"
+
+import pytest
+
+from conftest import PHONE, UTC, ago, run, start_deal
 from first_contact import config
-from first_contact.bitrix import Deal
-from first_contact.db import DB
-from first_contact.orbita import FirstSendResult, Message, OrbitaError
-from first_contact.worker import Worker
+from first_contact import worker as worker_mod
+from first_contact.orbita import Message
+from first_contact.worker import render
 
-ok = 0
-def check(cond, name):
-    global ok
-    assert cond, name; ok += 1; print("✔", name)
 
-UTC = timezone.utc
-def ago(**kw): return datetime.now(UTC) - timedelta(**kw)
+def out(at):
+    return Message("", "", at, True)
 
-class FakeBitrix:
-    def __init__(self): self.notes, self.stages_set, self.max_id, self.new_ids, self.category, self.stage = [], [], 100, [], "0", "NEW"
-    async def max_deal_id(self): return self.max_id
-    async def deal_ids_after(self, last, cat): return [i for i in self.new_ids if i > last]
-    async def get_deal(self, i): return Deal(i, "Заявка", self.stage, "P", self.category, 1)
-    async def get_contact(self, c): return "Анна", ["+79990000001"]
-    async def set_stage(self, d, st): self.stages_set.append((d, st)); self.stage = st
-    async def comment(self, d, t): self.notes.append((d, t))
 
-class FakeOrbita:
-    def __init__(self): self.sent, self.history_items, self.keys, self.mode = [], {}, [], "sent"
-    async def send_first(self, phone, text, key, name=None):
-        self.keys.append(key)
-        if self.mode == "none": return FirstSendResult("no_messenger")
-        if self.mode == "boom": raise OrbitaError("HTTP 503: Орбита недоступна")
-        self.sent.append(("first", phone, text)); return FirstSendResult("sent", "D1", "whatsapp")
-    async def send_reply(self, dialog, text, key):
-        self.sent.append(("reply", dialog, text, key)); return {}
-    async def history(self, dialog): return self.history_items.get(dialog, [])
+def inc(at):
+    return Message("", "", at, False)
 
-env = config.env()
-env.dry_run = False
-db = DB(env.db_path)
-s = config.load(db)
-s.bitrix_webhook, s.no_messenger_stage, s.orbita_api_key = "https://b/rest/1/x/", "NO_MESSENGER", "k"
-s.window_start, s.window_end = "00:00", "23:59"
-bx, orb = FakeBitrix(), FakeOrbita()
-w = Worker(env, s, db, bx, orb)
-run = asyncio.run
 
-# 1. выключенный робот ничего не делает
-bx.new_ids = [101]
-run(w.tick())
-check(db.get("last_deal_id") is None and not orb.sent, "робот выключен — ничего не делает")
-run(w.on_deal_added(101))
-check(db.deal(101) is None, "событие Битрикса при выключенном роботе игнорируется")
+def event(kind, **data):
+    return {"type": kind, "data": data}
 
-# 2. включение: старые сделки не трогаем
-bx.max_id = 101
-run(w.enable())
-check(s.enabled and db.get("last_deal_id") == "101", "включение запоминает последнюю сделку")
-check(config.load(db).enabled, "флаг «включён» сохранён в базе")
-bx.new_ids = [101, 102]
-run(w.tick())
-check(db.deal(101) is None and db.deal(102)["status"] == "sent_first", "сделка до включения не тронута, новая — написали")
-check(orb.sent[-1][2].startswith("Анна"), "имя подставлено в первое сообщение")
 
-# 3. клиент ответил → ответ по шаблону после паузы
-s.reply_on, s.reply_delay_minutes = True, 0
-first_at = datetime.fromisoformat(db.deal(102)["first_sent_at"])
-orb.history_items["D1"] = [Message("", "", first_at, True), Message("", "", datetime.now(UTC), False)]
-run(w._client_replied(102, "тест"))
-check(db.deal(102)["status"] == "replied" and db.deal(102)["reply_due_at"], "ответ клиента → ответ по шаблону запланирован")
-run(w.tick())
-check(orb.sent[-1][0] == "reply" and orb.sent[-1][3] == "deal-102-reply", "ответ по шаблону отправлен")
-check(db.deal(102)["reply_sent_at"] and not db.deal(102)["reply_due_at"], "отмечен как отправленный")
-n = len(orb.sent); run(w._client_replied(102, "ещё раз")); run(w.tick())
-check(len(orb.sent) == n, "второй раз ответ по шаблону не уходит")
+# ---------- включение и выключение ----------
 
-# 4. менеджер ответил сам за время паузы → шаблон не нужен
-bx.new_ids = [103]; run(w.tick())
-first_at = datetime.fromisoformat(db.deal(103)["first_sent_at"])
-client_at = datetime.now(UTC)
-orb.history_items["D1"] = [Message("", "", first_at, True), Message("", "", client_at, False),
-                           Message("", "", client_at + timedelta(seconds=30), True)]
-run(w._client_replied(103, "тест")); n = len(orb.sent); run(w.tick())
-check(len(orb.sent) == n and not db.deal(103)["reply_due_at"], "менеджер ответил сам — шаблон не отправлен")
+def test_disabled_robot_does_nothing(worker, bitrix, orbita):
+    bitrix.new_ids = [101]
+    run(worker.tick())
+    run(worker.on_deal_added(101))
+    assert worker.db.get("last_deal_id") is None
+    assert worker.db.deal(101) is None
+    assert orbita.keys == []
 
-# 5. клиент написал давно → шаблон не отправляем
-bx.new_ids = [104]; run(w.tick())
-db.update(104, first_sent_at=ago(hours=3).isoformat())
-orb.history_items["D1"] = [Message("", "", ago(hours=3), True), Message("", "", ago(hours=2), False)]
-run(w._client_replied(104, "тест")); n = len(orb.sent); run(w.tick())
-check(len(orb.sent) == n, "клиент написал больше 30 мин назад — шаблон не отправлен")
 
-# 6. ответ по шаблону выключен
-s.reply_on = False
-bx.new_ids = [105]; run(w.tick())
-run(w._client_replied(105, "тест"))
-check(not db.deal(105)["reply_due_at"], "ответ по шаблону выключен — не планируется")
+def test_enable_remembers_last_deal_and_skips_older(worker, bitrix, orbita):
+    bitrix.max_id = 101
+    run(worker.enable())
+    assert worker.s.enabled and worker.db.get("last_deal_id") == "101"
+    assert config.load(worker.db).enabled, "флаг «включён» сохранён в базе"
 
-# 7. напоминание выключено → статус «не ответил», ничего не шлём
-s.followup_on = False
-bx.new_ids = [106]; run(w.tick())
-db.update(106, followup_due_at=ago(minutes=1).isoformat(), first_sent_at=ago(hours=25).isoformat())
-orb.history_items["D1"] = [Message("", "", ago(hours=25), True)]
-n = len(orb.sent); run(w.tick())
-check(db.deal(106)["status"] == "no_reply" and len(orb.sent) == n, "напоминание выключено → «не ответил», без сообщения")
+    bitrix.new_ids = [101, 102]
+    run(worker.tick())
+    assert worker.db.deal(101) is None
+    assert worker.db.deal(102)["status"] == "sent_first"
 
-# 8. напоминание включено → уходит
-s.followup_on = True
-bx.new_ids = [107]; run(w.tick())
-db.update(107, followup_due_at=ago(minutes=1).isoformat(), first_sent_at=ago(hours=25).isoformat())
-run(w.tick())
-check(db.deal(107)["status"] == "sent_followup" and orb.sent[-1][3] == "deal-107-followup", "напоминание отправлено")
 
-# 9. опрос ответов без вебхуков
-s.reply_on, s.orbita_webhook_secret = True, ""
-bx.new_ids = [108]; run(w.tick())
-first_at = datetime.fromisoformat(db.deal(108)["first_sent_at"])
-orb.history_items["D1"] = [Message("", "", first_at, True), Message("", "", datetime.now(UTC), False)]
-run(w.tick())
-check(db.deal(108)["status"] == "sent_first", "опрос истории не чаще раза в 5 минут")
-db.update(108, checked_at=ago(minutes=6).isoformat())
-run(w.tick())
-check(db.deal(108)["status"] == "replied", "без вебхуков ответ клиента найден опросом истории")
+def test_disable_stops_taking_new_deals(running, bitrix):
+    running.disable()
+    bitrix.new_ids = [110]
+    run(running.tick())
+    assert running.db.deal(110) is None
+    assert not config.load(running.db).enabled
 
-# 10. другая воронка
-s.deal_category_id = "0"; bx.category = "5"
-bx.new_ids = [109]; run(w.tick())
-check(db.deal(109)["status"] == "skipped", "сделка другой воронки пропущена")
-bx.category = "0"
 
-# 10a. шаги по одному (кнопка в панели)
-n = len(orb.sent)
-bx.new_ids = [111]; run(w.run_step("poll"))
-check(db.deal(111)["status"] == "new" and len(orb.sent) == n, "шаг «забрать сделки» только ставит в очередь")
-run(w.run_step("first"))
-check(db.deal(111)["status"] == "sent_first" and len(orb.sent) == n + 1, "шаг «написать первым» отправляет")
-try: run(w.run_step("oops")); check(False, "x")
-except KeyError: check(True, "неизвестный шаг не выполняется")
+# ---------- первое сообщение ----------
 
-# 12. «Повторить» после «нет мессенджера»: этап робота не мешает, ключ идемпотентности новый
-s.reply_on = False; orb.history_items = {}
-orb.mode = "none"; bx.new_ids = [120]; run(w.tick())
-check(db.deal(120)["status"] == "no_messenger" and bx.stage == "NO_MESSENGER", "нет мессенджера → этап сменён")
-seen_at = db.deal(120)["created_at"]
-orb.mode = "sent"
-check(w.retry(120, "a@x.ru") == "new", "повтор без отправленного первого → в очередь")
-run(w.on_deal_added(120))
-check(db.deal(120)["status"] == "sent_first", "после «Повторить» робот написал, хотя этап «Не нашёл мессенджер»")
-check(orb.keys[-1].endswith("-r1") and orb.keys[-2] == "deal-120-first-+79990000001", "у повтора новый ключ идемпотентности")
-check(db.deal(120)["created_at"] == seen_at and db.deal(120)["retried_at"], "время появления заявки не затёрто")
-bx.stage = "NO_MESSENGER"; bx.new_ids = [121]; run(w.tick())
-check(db.deal(121)["status"] == "skipped", "без ручного повтора сделку на этапе «Не нашёл мессенджер» робот не трогает")
-bx.stage = "NEW"
-try: w.retry(120, "a@x.ru"); check(False, "x")
-except ValueError: check(True, "сделку в работе повторить нельзя")
+def test_first_message_substitutes_name_and_title(running, bitrix, orbita):
+    running.s.tpl_first = "{name} / {deal_title}"
+    row = start_deal(running, bitrix, 102)
+    assert row["status"] == "sent_first"
+    assert orbita.first == [(PHONE, "Анна / Заявка", f"deal-102-first-{PHONE}")]
 
-# 13. «Повторить» после сбоя напоминания не шлёт первое сообщение второй раз
-db.update(120, status="error", followup_due_at=ago(minutes=1).isoformat())
-n = len([x for x in orb.sent if x[0] == "first"])
-check(w.retry(120, "a@x.ru") == "sent_first", "первое уже ушло → повтор продолжает с напоминания")
-orb.history_items["D1"] = [Message("", "", ago(hours=1), True)]
-db.update(120, first_sent_at=ago(hours=1).isoformat())
-run(w.tick())
-check(db.deal(120)["status"] == "sent_followup" and len([x for x in orb.sent if x[0] == "first"]) == n,
-      "после повтора ушло напоминание, первое не повторилось")
 
-# 14. счётчик ошибок обнуляется, когда сделка продвинулась
-orb.mode = "boom"; bx.new_ids = [122]; run(w.tick())
-for _ in range(3): run(w._guarded(122, w.first_contact))
-check(db.deal(122)["attempts"] == 4 and db.deal(122)["status"] == "new", "4 сбоя — ещё в очереди")
-orb.mode = "sent"; run(w._guarded(122, w.first_contact))
-check(db.deal(122)["status"] == "sent_first" and db.deal(122)["attempts"] == 0, "отправлено → счётчик ошибок обнулён")
+@pytest.mark.parametrize("deal_category_id, deal_category, expected", [
+    ("0", "5", "skipped"),       # другая воронка
+    (None, "5", "skipped"),      # воронка не выбрана → основная «0», как в панели
+    (None, "0", "sent_first"),
+    ("3", "3", "sent_first"),
+])
+def test_only_selected_funnel(running, bitrix, deal_category_id, deal_category, expected):
+    running.s.deal_category_id = deal_category_id
+    bitrix.category = deal_category
+    assert start_deal(running, bitrix, 109)["status"] == expected
 
-# 15. итог после напоминания: «не ответил» или «ответил»
-db.update(120, followup_sent_at=ago(hours=25).isoformat())
-orb.history_items["D1"] = [Message("", "", ago(hours=1), True)]
-run(w.tick())
-check(db.deal(120)["status"] == "no_reply", "молчит и после напоминания → «не ответил»")
-db.update(122, status="sent_followup", followup_sent_at=ago(hours=25).isoformat(), first_sent_at=ago(hours=50).isoformat())
-orb.history_items["D1"] = [Message("", "", ago(hours=50), True), Message("", "", ago(hours=2), False)]
-run(w.tick())
-check(db.deal(122)["status"] == "replied", "ответил после напоминания → «ответил»")
-db.update(122, status="sent_followup", followup_sent_at=ago(hours=1).isoformat())
-run(w.tick())
-check(db.deal(122)["status"] == "sent_followup", "срок итога не наступил — ждём")
 
-# 16. воронка не выбрана → основная, как в панели
-s.deal_category_id = None; bx.category = "5"; bx.new_ids = [123]; run(w.tick())
-check(db.deal(123)["status"] == "skipped", "воронка не выбрана → сделка другой воронки пропущена")
-bx.category = "0"
+def test_no_messenger_moves_deal_to_stage(running, bitrix, orbita):
+    orbita.mode = "none"
+    assert start_deal(running, bitrix, 120)["status"] == "no_messenger"
+    assert bitrix.stages_set == [(120, "NO_MESSENGER")]
 
-# 17. напоминание без номера диалога → проверить вручную, без запроса в Орбиту
-db.add_deal(124); db.update(124, status="sent_first", dialog_id=None, first_sent_at=ago(hours=25).isoformat(),
-                            followup_due_at=ago(minutes=1).isoformat())
-run(w.tick())
-check(db.deal(124)["status"] == "needs_check", "нет диалога → «проверить вручную»")
 
-# 11. выключение
-w.disable()
-bx.new_ids = [110]; run(w.tick())
-check(db.deal(110) is None and not config.load(db).enabled, "после выключения новые сделки не берёт")
+def test_deal_on_no_messenger_stage_untouched_without_manual_retry(running, bitrix, orbita):
+    bitrix.stage = "NO_MESSENGER"
+    assert start_deal(running, bitrix, 121)["status"] == "skipped"
+    assert orbita.keys == []
 
-print(f"\nВсе проверки пройдены: {ok}")
+
+# ---------- шаги по одному (кнопка в панели) ----------
+
+def test_steps_one_by_one(running, bitrix, orbita):
+    bitrix.new_ids = [111]
+    run(running.run_step("poll"))
+    assert running.db.deal(111)["status"] == "new" and orbita.keys == [], "«забрать сделки» только ставит в очередь"
+    run(running.run_step("first"))
+    assert running.db.deal(111)["status"] == "sent_first" and len(orbita.first) == 1
+
+
+def test_unknown_step_rejected(running):
+    with pytest.raises(KeyError):
+        run(running.run_step("oops"))
+
+
+# ---------- ошибки и «Повторить» ----------
+
+def test_failures_count_and_reset_when_deal_moves(running, bitrix, orbita):
+    orbita.mode = "boom"
+    bitrix.new_ids = [122]
+    for _ in range(4):
+        run(running.tick())
+    row = running.db.deal(122)
+    assert (row["status"], row["attempts"]) == ("new", 4)
+
+    orbita.mode = "sent"
+    run(running.tick())
+    row = running.db.deal(122)
+    assert (row["status"], row["attempts"]) == ("sent_first", 0)
+
+
+def test_five_failures_in_a_row_is_error(running, bitrix, orbita):
+    orbita.mode = "boom"
+    bitrix.new_ids = [123]
+    for _ in range(5):
+        run(running.tick())
+    assert running.db.deal(123)["status"] == "error"
+
+
+def test_retry_after_no_messenger_sends_with_new_idempotency_key(running, bitrix, orbita):
+    orbita.mode = "none"
+    created_at = start_deal(running, bitrix, 120)["created_at"]
+    assert bitrix.stage == "NO_MESSENGER"
+
+    orbita.mode = "sent"
+    assert running.retry(120, "a@x.ru") == "new"
+    run(running.on_deal_added(120))
+
+    row = running.db.deal(120)
+    assert row["status"] == "sent_first", "этап «Не нашёл мессенджер» поставил сам робот — после «Повторить» не помеха"
+    assert orbita.keys == [f"deal-120-first-{PHONE}", f"deal-120-first-{PHONE}-r1"]
+    assert row["created_at"] == created_at and row["retried_at"]
+
+
+def test_retry_rejected_for_deal_in_progress(running, bitrix):
+    start_deal(running, bitrix, 120)
+    with pytest.raises(ValueError):
+        running.retry(120, "a@x.ru")
+
+
+def test_retry_after_failed_followup_does_not_resend_first(running, bitrix, orbita):
+    start_deal(running, bitrix, 120)
+    running.db.update(120, status="error", first_sent_at=ago(hours=1).isoformat(),
+                      followup_due_at=ago(minutes=1).isoformat())
+    orbita.history_items["D1"] = [out(ago(hours=1))]
+
+    assert running.retry(120, "a@x.ru") == "sent_first"
+    run(running.tick())
+
+    assert running.db.deal(120)["status"] == "sent_followup"
+    assert len(orbita.first) == 1
+    assert [k for _, _, k in orbita.replies] == ["deal-120-followup"]
+
+
+# ---------- напоминание и итог ----------
+
+@pytest.mark.parametrize("followup_on, expected_status, expected_keys", [
+    (False, "no_reply", []),
+    (True, "sent_followup", ["deal-106-followup"]),
+])
+def test_followup_when_client_silent(running, bitrix, orbita, followup_on, expected_status, expected_keys):
+    running.s.followup_on = followup_on
+    start_deal(running, bitrix, 106)
+    running.db.update(106, followup_due_at=ago(minutes=1).isoformat(), first_sent_at=ago(hours=25).isoformat())
+    orbita.history_items["D1"] = [out(ago(hours=25))]
+
+    run(running.tick())
+
+    assert running.db.deal(106)["status"] == expected_status
+    assert [k for _, _, k in orbita.replies] == expected_keys
+
+
+def test_followup_without_dialog_needs_check_without_asking_orbita(running, orbita):
+    running.db.add_deal(124)
+    running.db.update(124, status="sent_first", dialog_id=None, first_sent_at=ago(hours=25).isoformat(),
+                      followup_due_at=ago(minutes=1).isoformat())
+    run(running.tick())
+    assert running.db.deal(124)["status"] == "needs_check"
+    assert orbita.history_calls == [] and orbita.replies == []
+
+
+@pytest.mark.parametrize("followup_sent_hours_ago, history, expected", [
+    (25, [out(ago(hours=50))], "no_reply"),                       # молчит и после напоминания
+    (25, [out(ago(hours=50)), inc(ago(hours=2))], "replied"),     # ответил после напоминания
+    (1, [out(ago(hours=50)), inc(ago(hours=2))], "sent_followup"),  # срок итога не наступил
+])
+def test_outcome_after_followup(running, orbita, followup_sent_hours_ago, history, expected):
+    running.db.add_deal(122)
+    running.db.update(122, status="sent_followup", dialog_id="D1", first_sent_at=ago(hours=50).isoformat(),
+                      followup_sent_at=ago(hours=followup_sent_hours_ago).isoformat())
+    orbita.history_items["D1"] = history
+    run(running.tick())
+    assert running.db.deal(122)["status"] == expected
+
+
+# ---------- клиент ответил: ответ по шаблону ----------
+
+@pytest.fixture
+def replying(running):
+    running.s.reply_on, running.s.reply_delay_minutes = True, 0
+    return running
+
+
+def client_writes(w, bitrix, orbita, deal_id, history):
+    """Сделка с ушедшим первым сообщением, клиент написал — вебхук message.received."""
+    start_deal(w, bitrix, deal_id)
+    orbita.history_items["D1"] = history(datetime.fromisoformat(w.db.deal(deal_id)["first_sent_at"]))
+    run(w.on_orbita_event(event("message.received", dialog_id="D1", direction="incoming")))
+
+
+def test_reply_by_template_sent_once_after_pause(replying, bitrix, orbita):
+    client_writes(replying, bitrix, orbita, 102, lambda first: [out(first), inc(datetime.now(UTC))])
+    row = replying.db.deal(102)
+    assert row["status"] == "replied" and row["reply_due_at"]
+
+    run(replying.tick())
+    row = replying.db.deal(102)
+    assert [k for _, _, k in orbita.replies] == ["deal-102-reply"]
+    assert row["reply_sent_at"] and not row["reply_due_at"]
+
+
+@pytest.mark.parametrize("again", ["webhook", "retry"])
+def test_reply_by_template_not_sent_twice(replying, bitrix, orbita, again):
+    client_writes(replying, bitrix, orbita, 102, lambda first: [out(first), inc(datetime.now(UTC))])
+    run(replying.tick())
+    if again == "webhook":
+        run(replying.on_orbita_event(event("message.received", dialog_id="D1", direction="incoming")))
+    else:
+        replying.db.update(102, status="error")
+        assert replying.retry(102, "a@x.ru") == "replied"
+    run(replying.tick())
+    assert len(orbita.replies) == 1
+
+
+def test_no_template_reply_when_manager_answered(replying, bitrix, orbita):
+    now = datetime.now(UTC)
+    client_writes(replying, bitrix, orbita, 103,
+                  lambda first: [out(first), inc(now), out(now + timedelta(seconds=30))])
+    run(replying.tick())
+    assert orbita.replies == []
+    assert not replying.db.deal(103)["reply_due_at"]
+
+
+def test_no_template_reply_when_client_wrote_long_ago(replying, bitrix, orbita):
+    start_deal(replying, bitrix, 104)
+    replying.db.update(104, first_sent_at=ago(hours=3).isoformat())
+    orbita.history_items["D1"] = [out(ago(hours=3)), inc(ago(hours=2))]
+    run(replying.on_orbita_event(event("message.received", dialog_id="D1", direction="incoming")))
+    run(replying.tick())
+    assert orbita.replies == []
+    assert not replying.db.deal(104)["reply_due_at"]
+
+
+def test_reply_by_template_off_not_planned(running, bitrix, orbita):
+    client_writes(running, bitrix, orbita, 105, lambda first: [out(first), inc(datetime.now(UTC))])
+    row = running.db.deal(105)
+    assert row["status"] == "replied" and not row["reply_due_at"]
+
+
+# ---------- поиск ответа опросом истории (без вебхуков) ----------
+
+def silent_deal_with_reply(w, orbita, checked_at):
+    w.db.add_deal(108)
+    w.db.update(108, status="sent_first", dialog_id="D1", first_sent_at=ago(minutes=10).isoformat(),
+                followup_due_at=ago(hours=-20).isoformat(), checked_at=checked_at)
+    orbita.history_items["D1"] = [out(ago(minutes=10)), inc(ago(minutes=1))]
+
+
+@pytest.mark.parametrize("checked_minutes_ago, expected", [
+    (1, "sent_first"),    # смотрели меньше 5 минут назад — не чаще раза в 5 минут
+    (6, "replied"),
+    (None, "replied"),    # ещё не смотрели
+])
+def test_poll_replies_without_webhooks(running, orbita, checked_minutes_ago, expected):
+    running.s.reply_on, running.s.orbita_webhook_secret = True, ""
+    checked = ago(minutes=checked_minutes_ago).isoformat() if checked_minutes_ago is not None else None
+    silent_deal_with_reply(running, orbita, checked)
+    run(running.tick())
+    assert running.db.deal(108)["status"] == expected
+
+
+def test_poll_replies_not_automatic_with_webhooks(running, orbita):
+    running.s.reply_on, running.s.orbita_webhook_secret = True, "whsec"
+    silent_deal_with_reply(running, orbita, None)
+    run(running.tick())
+    assert running.db.deal(108)["status"] == "sent_first"
+
+
+def test_poll_replies_by_button_ignores_webhooks_and_pause(running, orbita):
+    running.s.reply_on, running.s.orbita_webhook_secret = True, "whsec"
+    silent_deal_with_reply(running, orbita, ago(minutes=1).isoformat())
+    run(running.run_step("replies"))
+    assert running.db.deal(108)["status"] == "replied"
+
+
+# ---------- события Орбиты (подпись и дубли — test_app.py) ----------
+
+@pytest.mark.parametrize("status", ["sent_first", "sent_followup", "no_reply"])
+def test_message_received_marks_client_replied(worker, bitrix, status):
+    worker.db.add_deal(10)
+    worker.db.update(10, status=status, dialog_id="501", phone="+7")
+    run(worker.on_orbita_event(event("message.received", dialog_id=501, direction="incoming")))
+    row = worker.db.deal(10)
+    assert row["status"] == "replied" and row["client_replied_at"]
+    assert bitrix.noted(10)
+
+
+def test_outgoing_message_received_is_not_client_reply(worker):
+    worker.db.add_deal(10)
+    worker.db.update(10, status="sent_first", dialog_id="501")
+    run(worker.on_orbita_event(event("message.received", dialog_id=501, direction="outgoing")))
+    assert worker.db.deal(10)["status"] == "sent_first"
+
+
+def test_message_sent_confirms_pending_first(worker, bitrix):
+    worker.db.add_deal(11)
+    worker.db.update(11, status="pending_first", request_key="rk-9", channel="whatsapp", phone="+8")
+    run(worker.on_orbita_event(event("message.sent", request_key="rk-9", dialog_id=777, direction="outgoing")))
+    row = worker.db.deal(11)
+    assert (row["status"], row["dialog_id"]) == ("sent_first", "777")
+    assert row["followup_due_at"], "напоминание запланировано"
+    assert bitrix.noted(11)
+
+
+def test_message_failed_needs_check(worker, bitrix):
+    worker.db.add_deal(12)
+    worker.db.update(12, status="pending_first", request_key="rk-10", channel="max", phone="+9")
+    run(worker.on_orbita_event(event("message.failed", request_key="rk-10", reason_code="send_failed")))
+    assert worker.db.deal(12)["status"] == "needs_check"
+    assert bitrix.noted(12)
+
+
+def test_test_event_changes_nothing(worker):
+    worker.db.add_deal(10)
+    worker.db.update(10, status="sent_first", dialog_id="501")
+    run(worker.on_orbita_event({"type": "message.received", "is_test": True,
+                                "data": {"dialog_id": 501, "direction": "incoming"}}))
+    assert worker.db.deal(10)["status"] == "sent_first"
+
+
+# ---------- окно отправки ----------
+
+class _FixedNow(datetime):
+    moment = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.moment.astimezone(tz)
+
+
+@pytest.mark.parametrize("utc_moment, inside", [
+    ("2026-10-21T05:59:59+00:00", False),   # 08:59:59 по Москве
+    ("2026-10-21T06:00:00+00:00", True),    # «С 09:00» — включительно
+    ("2026-10-21T17:59:59+00:00", True),
+    ("2026-10-21T18:00:00+00:00", False),   # «До 21:00» — в 21:00 уже нельзя
+    ("2026-10-21T22:00:00+00:00", False),   # 01:00 по Москве, хотя в UTC ещё вечер
+])
+def test_in_window_bounds_in_robot_timezone(worker, monkeypatch, utc_moment, inside):
+    worker.s.window_start, worker.s.window_end, worker.s.tz_name = "09:00", "21:00", "Europe/Moscow"
+    monkeypatch.setattr(_FixedNow, "moment", datetime.fromisoformat(utc_moment))
+    monkeypatch.setattr(worker_mod, "datetime", _FixedNow)
+    assert worker.in_window() is inside
+
+
+# ---------- шаблоны ----------
+
+def test_render_substitutes_name_and_title():
+    assert render("  {name}, заявка «{deal_title}»  ", "Анна", "Окна") == "Анна, заявка «Окна»"
+
+
+@pytest.mark.parametrize("tpl, error", [
+    ("{name} {oops}", KeyError),
+    ("{0}", IndexError),
+    ("{name", ValueError),
+])
+def test_render_template_errors(tpl, error):
+    with pytest.raises(error):
+        render(tpl, "Анна")
+
+
+def test_no_name_uses_fallback_greeting(worker):
+    worker.s.tpl_first, worker.s.tpl_no_name = "{name}!", "Здравствуйте"
+    assert worker.render("first", "") == "Здравствуйте!"
