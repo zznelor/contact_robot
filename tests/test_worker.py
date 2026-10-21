@@ -747,6 +747,22 @@ def test_early_client_reply_survives_restart_while_confirming(replying, bitrix, 
     assert row["status"] == "replied" and row["client_replied_at"]
 
 
+def test_processed_orbita_events_older_than_30_days_removed(worker):
+    """Проход чистит обработанные события старше 30 дней; ждущие обработки и свежие остаются."""
+    db = worker.db
+    for eid in ("old", "legacy", "recent", "queued"):
+        db.accept_event(eid, "message.received", "{}", "D1")
+    for eid in ("old", "legacy", "recent"):
+        db.event_done(eid)
+    long_ago = ago(days=31).isoformat(timespec="seconds")
+    db.conn.execute("UPDATE orbita_events SET at=?, done_at=? WHERE id='old'",
+                    (long_ago, ago(days=30, hours=1).isoformat(timespec="seconds")))
+    db.conn.execute("UPDATE orbita_events SET at=?, done_at=NULL WHERE id='legacy'", (long_ago,))   # версия без done_at
+    db.conn.execute("UPDATE orbita_events SET at=? WHERE id='queued'", (long_ago,))
+    run(worker.tick())
+    assert {r["id"] for r in db.conn.execute("SELECT id FROM orbita_events")} == {"recent", "queued"}
+
+
 def test_test_event_changes_nothing(worker):
     worker.db.add_deal(10)
     worker.db.update(10, status="sent_first", dialog_id="501")

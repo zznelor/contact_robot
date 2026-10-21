@@ -34,6 +34,9 @@ REPLY_MAX_LATE = timedelta(minutes=30)
 # Без вебхуков Орбиты ответ клиента ищем опросом истории — не чаще, чем раз в столько
 REPLY_POLL = timedelta(minutes=5)
 REPLY_POLL_DAYS = timedelta(days=3)
+# Обработанные вебхуки Орбиты хранятся столько: дубли доставки и сверка ответа клиента до подтверждения
+# первого сообщения смотрят только недавние события
+EVENTS_KEEP = timedelta(days=30)
 
 
 # Какие статусы можно вернуть в работу кнопкой «Повторить»
@@ -129,6 +132,7 @@ class Worker:
     # Шаги прохода — по порядку; в панели их можно запустить по одному
     STEPS = {
         "events": "Обработать принятые события Орбиты",
+        "cleanup": "Удалить обработанные события Орбиты старше 30 дней",
         "poll": "Забрать новые сделки из Битрикса",
         "first": "Написать первым по новым сделкам",
         "followup": "Напоминания и итог по тем, кто молчит",
@@ -140,12 +144,13 @@ class Worker:
 
     async def tick(self) -> None:
         async with self._pass:
-            # Принятые события Орбиты разбираются и при выключенном роботе: они только записывают исходы
+            # Принятые события Орбиты разбираются (и старые обработанные чистятся) и при выключенном роботе
             await self._isolated("events")
+            await self._isolated("cleanup")
             if not self.active:
                 return
             for step in self.STEPS:
-                if step != "events":
+                if step not in ("events", "cleanup"):
                     await self._isolated(step)
 
     async def _isolated(self, step: str) -> None:
@@ -170,6 +175,10 @@ class Worker:
         # проходят ручные действия и события Орбиты, а выключение останавливает оставшуюся очередь.
         if step == "events":
             await self.process_inbox()
+        elif step == "cleanup":
+            before = (datetime.now(timezone.utc) - EVENTS_KEEP).isoformat(timespec="seconds")
+            if n := self.db.purge_events(before):
+                log.info("удалено обработанных событий Орбиты старше %s дней: %s", EVENTS_KEEP.days, n)
         elif step == "poll":
             async with self.lock:
                 if self.active:

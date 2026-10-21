@@ -85,6 +85,14 @@ CREATE TABLE IF NOT EXISTS invites (
 );
 """
 
+# Индексы — после MIGRATIONS: на старой установке их колонки появляются только миграцией
+INDEXES = """
+-- очередь необработанных событий (pending_events) и чистка обработанных (purge_events)
+CREATE INDEX IF NOT EXISTS orbita_events_state ON orbita_events (state, at);
+-- ответы клиента в диалоге после момента (incoming_since)
+CREATE INDEX IF NOT EXISTS orbita_events_dialog ON orbita_events (dialog_id, type, at);
+"""
+
 # Колонки, добавленные после первых установок: (таблица, колонка, тип)
 MIGRATIONS = [
     ("deals", "request_key", "TEXT"),        # REST API Орбиты, 20.10.2026
@@ -167,6 +175,7 @@ class DB:
             cols = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        self.conn.executescript(INDEXES)
         # Статус версий с MCP: сделка ждала действия «написать первым» — теперь оно есть
         self.conn.execute("UPDATE deals SET status='new' WHERE status='waiting_orbita'")
 
@@ -264,6 +273,13 @@ class DB:
     def event_done(self, event_id: str) -> None:
         self.conn.execute("UPDATE orbita_events SET state='done', done_at=?, last_error=NULL WHERE id=?",
                           (now(), str(event_id)))
+
+    def purge_events(self, before: str) -> int:
+        """Удалить обработанные (done) события, закрытые раньше before (у строк старых версий done_at нет —
+        по времени приёма). Ждущие обработки и failed не трогаются. Возвращает число удалённых."""
+        return self.conn.execute(
+            "DELETE FROM orbita_events WHERE state='done' AND at<? AND coalesce(done_at, at)<?",
+            (before, before)).rowcount
 
     def event_failed(self, event_id: str, error: str, give_up: bool) -> None:
         self.conn.execute("UPDATE orbita_events SET attempts=attempts+1, last_error=?, state=? WHERE id=?",
