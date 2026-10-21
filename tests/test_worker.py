@@ -551,6 +551,20 @@ def test_message_sent_confirms_pending_first(worker, bitrix):
     assert bitrix.noted(11)
 
 
+def test_late_message_sent_after_timeout_confirms_first(running, bitrix, orbita, clock):
+    """Орбита подтвердила первое сообщение позже 30 минут: сделка уже «проверить вручную» — подтверждение
+    по сохранённому request_key возвращает её в работу, «Повторить» второе первое не выпустит."""
+    orbita.answers["whatsapp"] = "pending"
+    rk = start_deal(running, bitrix, 187)["request_key"]
+    clock.advance(minutes=31)
+    run(running.tick())
+    assert running.db.deal(187)["status"] == "needs_check"
+
+    run(running.on_orbita_event(event("message.sent", request_key=rk, dialog_id=778)))
+    row = running.db.deal(187)
+    assert (row["status"], row["dialog_id"]) == ("sent_first", "778") and row["first_sent_at"]
+
+
 def test_message_failed_needs_check(worker, bitrix):
     worker.db.add_deal(12)
     worker.db.update(12, status="pending_first", request_key="rk-10", channel="max", phone="+9")

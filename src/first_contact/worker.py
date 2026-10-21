@@ -297,7 +297,8 @@ class Worker:
         if status == "replied" and not row["reply_sent_at"] and row["reply_due_at"] and self.s.reply_on:
             fields.update(reply_retry_n=(row["reply_retry_n"] or 0) + 1, reply_due_at=now())
         if status == "new":
-            fields.update(retry_n=(row["retry_n"] or 0) + 1, retried_at=now())
+            # Прежняя отправка с 202 больше не ждёт исхода: решение человека — новая попытка
+            fields.update(retry_n=(row["retry_n"] or 0) + 1, retried_at=now(), request_key=None, pending_at=None)
             if row["status"] == "needs_check":
                 # Человек проверил переписку (панель предупреждает о втором сообщении) — неизвестный исход
                 # прошлой отправки больше не выясняем
@@ -348,7 +349,7 @@ class Worker:
         row = self.db.deal(deal_id)
         if row is None or row["status"] != "pending_first":
             return
-        if datetime.now(timezone.utc) - _ts(row["updated_at"]) <= PENDING_TIMEOUT:
+        if datetime.now(timezone.utc) - _ts(row["pending_at"] or row["updated_at"]) <= PENDING_TIMEOUT:
             return
         self.db.update(deal_id, status="needs_check", last_error="нет подтверждения отправки от Орбиты")
         self.event(deal_id, "нет подтверждения отправки", row["request_key"] or "")
@@ -786,7 +787,10 @@ class Worker:
         rk = data["request_key"]
         reason = str(data.get("reason_code") or "причина не указана")
         row = self.db.deal_by("request_key", rk)
-        if row and row["status"] == "pending_first":
+        # Ждём исход первой отправки: pending_first или «проверить вручную» по таймауту этой же отправки
+        # (pending_at остаётся, пока исход не пришёл и человек не нажал «Повторить»)
+        if row and (row["status"] == "pending_first"
+                    or (row["status"] == "needs_check" and row["pending_at"] and not row["first_sent_at"])):
             deal_id = row["deal_id"]
             if ok:
                 dialog = str(data["dialog_id"]) if data.get("dialog_id") is not None else None
@@ -810,7 +814,7 @@ class Worker:
                     await self.note(deal_id, "Клиент ответил в мессенджере.")
                 await self._restore_stage(deal_id)
             else:
-                self.db.update(deal_id, status="needs_check", last_error=f"не доставлено: {reason}")
+                self.db.update(deal_id, status="needs_check", last_error=f"не доставлено: {reason}", pending_at=None)
                 self.event(deal_id, "первое сообщение не доставлено", reason)
                 await self.note(deal_id, f"Первое сообщение не доставлено ({reason}). Нужен звонок менеджера.")
             return
