@@ -461,12 +461,14 @@ class Worker:
 
         if row["intent_key"]:
             # Прошлая попытка оборвалась с неизвестным исходом: сообщение могло уйти. Узнаём исход повтором
-            # того же запроса (тот же канал, ключ и текст) — в другой канал нельзя, клиент получит два первых
+            # того же запроса — в другой канал нельзя, клиент получит два первых. Тело — исходное целиком: канал,
+            # номер, ключ, текст и имя (first_text и name записаны той же попыткой до запроса); имя из Битрикса
+            # могли поправить, а с другим телом Орбита ответит idempotency_key_reused
             if row["intent_channel"] not in connected:
                 raise UnknownOutcome(f"исход отправки в {row['intent_channel']} ({row['intent_phone']}) неизвестен, "
                                      f"а канал сейчас не подключён")
             res = await self._start(deal_id, row["intent_phone"], row["intent_channel"], row["first_text"],
-                                    row["intent_key"], name)
+                                    row["intent_key"], row["name"] or "")
             if await self._first_done(deal_id, row["intent_phone"], res):
                 return
 

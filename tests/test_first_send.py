@@ -16,11 +16,13 @@ URL = "https://x/api/public/v1"
 
 class Orbita:
     """Орбита по спецификации: каналы подключены по connected, на POST /dialogs отвечает answers[канал]
-    (201, 422-код или "lost" — сообщение ушло, а ответ потерян). posts — (канал, Idempotency-Key)."""
+    (201, 422-код или "lost" — сообщение ушло, а ответ потерян). posts — (канал, Idempotency-Key).
+    Ключ, уже пришедший с другим телом, — 422 idempotency_key_reused."""
 
     def __init__(self, connected, answers, invalid_phones=()):
         self.connected, self.answers, self.posts = set(connected), dict(answers), []
         self.invalid_phones = set(invalid_phones)       # на них 400 invalid_request
+        self.bodies: dict[str, dict] = {}               # Idempotency-Key → тело первого запроса с ним
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         if req.url.path.endswith("/channels"):
@@ -28,8 +30,10 @@ class Orbita:
                                                        for i, c in enumerate(config.CHANNELS)]})
         if req.url.path.endswith("/dialogs") and req.method == "POST":
             body = json.loads(req.content)
-            ch = body["channel"]
-            self.posts.append((ch, req.headers["idempotency-key"]))
+            ch, key = body["channel"], req.headers["idempotency-key"]
+            self.posts.append((ch, key))
+            if self.bodies.setdefault(key, body) != body:
+                return httpx.Response(422, json={"detail": {"code": "idempotency_key_reused"}})
             if body["phone"] in self.invalid_phones:
                 return httpx.Response(400, json={"detail": {"code": "invalid_request"}})
             answer = self.answers[ch]
@@ -149,3 +153,18 @@ def test_telegram_flood_wait_postpones_without_attempt(robot, bitrix, clock):
     clock.advance(seconds=301)
     run(w.tick())
     assert len(orbita.posts) == 4, "срок прошёл — каналы проверяются снова"
+
+
+def test_retry_after_lost_answer_repeats_whole_original_request(robot, bitrix, clock):
+    """Ответ на «написать первым» потерян, к повтору менеджер поправил имя контакта. Повтор тем же ключом несёт тело
+    исходного запроса целиком, с прежним именем: с другим телом Орбита ответила бы idempotency_key_reused, и
+    исход отправки выяснял бы человек."""
+    orbita = Orbita({"whatsapp"}, {"whatsapp": "lost"})
+    w = robot(orbita, ["whatsapp"])
+    bitrix.new_ids.append(147)
+    run(w.tick())
+    bitrix.name = "Анна Иванова"
+    clock.advance(minutes=3)
+    run(w.tick())
+    assert w.db.deal(147)["status"] == "sent_first"
+    assert len(orbita.posts) == 2
