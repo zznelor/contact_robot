@@ -24,10 +24,23 @@ def create_app(worker: Worker) -> FastAPI:
     ctx = Ctx(worker, users)
     background: set[asyncio.Task] = set()   # ссылки на фоновые задачи, иначе их может собрать сборщик мусора
 
-    def spawn(coro) -> None:
+    def spawn(coro, what: str, deal_id: int | None = None) -> None:
+        """Фоновая задача после ответа на вебхук. Её исключение некому получить — пишем в лог и журнал."""
         task = asyncio.create_task(coro)
         background.add(task)
-        task.add_done_callback(background.discard)
+
+        def done(t: asyncio.Task) -> None:
+            background.discard(t)
+            if t.cancelled() or t.exception() is None:
+                return
+            ex = t.exception()
+            log.error("фоновая задача «%s» (сделка %s) упала: %s: %s", what, deal_id, type(ex).__name__, ex,
+                      exc_info=ex)
+            try:
+                worker.event(deal_id, "ошибка фоновой обработки", f"{what}: {type(ex).__name__}: {ex}")
+            except Exception:  # noqa: BLE001 — база недоступна: остаётся запись в логе
+                log.exception("журнал недоступен")
+        task.add_done_callback(done)
 
     async def loop():
         while True:
@@ -87,7 +100,7 @@ def create_app(worker: Worker) -> FastAPI:
         if not raw_id.isdigit():
             return Response(status_code=400)
         if deal_id := int(raw_id):
-            spawn(worker.on_deal_added(deal_id))
+            spawn(worker.on_deal_added(deal_id), "событие Битрикса о новой сделке", deal_id)
         return {"ok": True}
 
     @app.post("/orbita/webhook")
@@ -114,7 +127,7 @@ def create_app(worker: Worker) -> FastAPI:
         if not worker.db.accept_event(event_id, str(ev.get("type") or ""), body.decode("utf-8", "replace"),
                                       str(dialog) if dialog is not None else None):
             return {"ok": True, "duplicate": True}
-        spawn(worker.process_inbox())
+        spawn(worker.process_inbox(), "события Орбиты")
         return {"ok": True}
 
     @app.get("/health")

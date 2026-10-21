@@ -1,5 +1,6 @@
 """HTTP-входы app.py: вебхуки Орбиты и Битрикса, /healthz и /ready. Логика событий — test_worker.py."""
 
+import logging
 import time
 
 import pytest
@@ -145,3 +146,18 @@ def test_orbita_webhook_not_ascii_signature_401(webhook_app):
     r = TestClient(webhook_app).post("/orbita/webhook", content=b"{}", headers={
         "X-Orbita-Timestamp": ts, "X-Orbita-Signature": "v1=\xff\xfe".encode("latin-1")})
     assert r.status_code == 401
+
+
+def test_bitrix_event_processing_failure_logged(client, worker, monkeypatch, caplog):
+    """Событие Битрикса принято (200), обработка в фоне упала — ошибка в логе с трассировкой и в журнале сделки."""
+    worker.s.bitrix_app_token = "T"
+
+    async def broken(deal_id):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(worker, "on_deal_added", broken)
+    with caplog.at_level(logging.ERROR, logger="first_contact"):
+        r = client.post("/bitrix/deal-add", data={"auth[application_token]": "T", "event": "ONCRMDEALADD",
+                                                  "data[FIELDS][ID]": "5"})
+        assert r.status_code == 200
+        wait_for(lambda: worker.db.events(5))
+    assert any(rec.name == "first_contact" and rec.levelno == logging.ERROR and rec.exc_info for rec in caplog.records)
