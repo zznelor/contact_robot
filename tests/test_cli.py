@@ -1,10 +1,12 @@
 """Командная строка (__main__.py) отдельным процессом: разовые команды и запущенный сервис."""
 
+import socket
 import subprocess
 import sys
 
 import pytest
 
+from conftest import midday_tz
 from first_contact import config
 from first_contact.db import DB, service_lock
 
@@ -33,3 +35,34 @@ def test_robot_commands_refuse_while_service_holds_database(args):
 @pytest.mark.parametrize("args", [("once",), ("process", "5")])
 def test_robot_commands_run_when_service_stopped(args):
     assert cli(*args).returncode == 0
+
+
+@pytest.mark.parametrize("args", [("once",), ("process", "5")])
+def test_robot_command_holds_database_while_it_works(args):
+    """Разовая команда уже работает (ждёт ответа Битрикса) — сервис на ту же базу не запускается."""
+    path = config.env().db_path
+    db = DB(path)
+    hang = socket.create_server(("127.0.0.1", 0))           # «Битрикс» принимает запрос и молчит
+    port = hang.getsockname()[1]
+    config.save(db, config.load(db), enabled=True, bitrix_webhook=f"http://127.0.0.1:{port}/rest/1/x/",
+                no_messenger_stage="NO_MESSENGER", orbita_api_key="k", orbita_channels=["whatsapp"],
+                window_start="06:00", window_end="18:00", tz_name=midday_tz())
+    db.put("last_deal_id", 1)
+    db.put("start_deal_id", 1)
+    db.conn.close()
+    hang.settimeout(20)
+    proc = subprocess.Popen([sys.executable, "-m", "first_contact", *args],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        conn, _ = hang.accept()                               # команда дошла до работы с Битриксом
+        try:
+            held = service_lock(path)
+            free = held is not None
+            if held is not None:
+                held.close()
+        finally:
+            conn.close()
+    finally:
+        hang.close()
+        proc.wait(timeout=30)
+    assert not free, "пока команда работает, замок базы занят"

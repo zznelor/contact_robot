@@ -77,7 +77,8 @@ BUSY = ("Робот уже работает с этой базой (запуще
 
 def _hold_robot(w: Worker):
     """Замок робота на базу (db.service_lock) или выход с кодом 1: второй процесс робота на той же базе
-    отправлял бы и писал статусы мимо замка сервиса."""
+    отправлял бы и писал статусы мимо замка сервиса. Возвращает открытый файл замка — держать его
+    (`with _hold_robot(w): …`) всё время работы команды: закрытие файла отпускает замок."""
     held = service_lock(w.env.db_path)
     if held is None:
         print(BUSY, file=sys.stderr)
@@ -95,13 +96,13 @@ def main() -> None:
     if cmd == "check":
         asyncio.run(check(w))
     elif cmd == "once":
-        _hold_robot(w)
-        asyncio.run(w.tick())
+        with _hold_robot(w):
+            asyncio.run(w.tick())
     elif cmd == "process":
         deal_id = int(args[1])
-        _hold_robot(w)
-        w.db.add_deal(deal_id)
-        asyncio.run(w._guarded(deal_id, w.first_contact))
+        with _hold_robot(w):
+            w.db.add_deal(deal_id)
+            asyncio.run(w._guarded(deal_id, w.first_contact))
         print(dict(w.db.deal(deal_id)))
     elif cmd == "setup-code":
         code = users.setup_code()
@@ -139,12 +140,12 @@ def main() -> None:
     elif cmd == "run":
         import uvicorn
         from .app import create_app
-        held = _hold_robot(w)     # noqa: F841 — держим замок, пока сервис работает
         port = int(args[1]) if len(args) > 1 else w.env.port
-        # proxy_headers: за Caddy адрес клиента и https берём из X-Forwarded-* — но только от доверенных адресов.
-        # По умолчанию слушаем только сам компьютер; в Docker HOST=0.0.0.0 (см. Dockerfile)
-        uvicorn.run(create_app(w), host=w.env.host, port=port, proxy_headers=True,
-                    forwarded_allow_ips=w.env.forwarded_allow_ips)
+        with _hold_robot(w):      # замок — пока сервис работает
+            # proxy_headers: за Caddy адрес клиента и https берём из X-Forwarded-* — но только от доверенных
+            # адресов. По умолчанию слушаем только сам компьютер; в Docker HOST=0.0.0.0 (см. Dockerfile)
+            uvicorn.run(create_app(w), host=w.env.host, port=port, proxy_headers=True,
+                        forwarded_allow_ips=w.env.forwarded_allow_ips)
     else:
         print(__doc__)
 
