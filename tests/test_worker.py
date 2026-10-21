@@ -117,6 +117,44 @@ def test_deal_on_no_messenger_stage_untouched_without_manual_retry(running, bitr
     assert orbita.keys == []
 
 
+# ---------- контакт привязывают к сделке позже ----------
+
+def test_contact_bound_after_deal_created_gets_message(running, bitrix, orbita, clock):
+    """Сделку создали без контакта (или контакт без телефона), телефон появился через пять минут: сделка ждёт в очереди,
+    этап не трогается, сообщение уходит."""
+    bitrix.phones = []
+    assert start_deal(running, bitrix, 130)["status"] == "new"
+    clock.advance(minutes=5)
+    run(running.tick())
+    assert running.db.deal(130)["status"] == "new" and bitrix.stages_set == []
+    bitrix.phones = [PHONE]
+    clock.advance(minutes=1)
+    run(running.tick())
+    assert running.db.deal(130)["status"] == "sent_first" and bitrix.stages_set == []
+
+
+def test_no_phone_after_ten_minutes_moves_stage(running, bitrix, orbita, clock):
+    bitrix.phones = []
+    start_deal(running, bitrix, 131)
+    clock.advance(minutes=9)
+    run(running.tick())
+    assert running.db.deal(131)["status"] == "new" and running.db.deal(131)["attempts"] == 0
+    clock.advance(minutes=2)
+    run(running.tick())
+    assert running.db.deal(131)["status"] == "no_phone"
+    assert bitrix.stages_set == [(131, "NO_MESSENGER")] and orbita.keys == []
+
+
+def test_no_phone_counted_from_deal_creation_and_retry_answers_at_once(running, bitrix, orbita):
+    """Десять минут — от создания сделки в Битриксе: сделка, которую робот увидел поздно (опрос отстал), и ручной
+    «Повторить» без телефона получают «нет телефона» сразу."""
+    bitrix.phones, bitrix.created = [], ago(minutes=11)
+    assert start_deal(running, bitrix, 132)["status"] == "no_phone"
+    assert run(running.retry(132, "a@x.ru")) == "new"
+    run(running.tick())
+    assert running.db.deal(132)["status"] == "no_phone"
+
+
 # ---------- шаги по одному (кнопка в панели) ----------
 
 def test_steps_one_by_one(running, bitrix, orbita):

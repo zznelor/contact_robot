@@ -28,6 +28,8 @@ RETRY_PAUSE = timedelta(minutes=2)
 # Сделки, которые ждали дольше (робот был выключен или лежала Орбита), не трогаем:
 # писать «вы оставили заявку» через неделю — плохо.
 MAX_AGE = timedelta(hours=48)
+# У контактов новой сделки нет телефона — ждём столько от её появления: контакт могут привязать позже
+PHONE_WAIT = timedelta(minutes=10)
 # Орбита ответила 202 на «написать первым», а вебхука с исходом нет так долго — зовём человека
 PENDING_TIMEOUT = timedelta(minutes=30)
 # Ответ по шаблону имеет смысл, только пока клиент ещё в разговоре
@@ -468,6 +470,17 @@ class Worker:
                 names.setdefault(p, contact.name)
         phones = list(names)
         if not phones:
+            # Источник заявки может создать сделку, а контакт привязать следующим вызовом (ONCRMDEALADD приходит
+            # при создании): сделка ждёт в очереди и перечитывается на проходах, пока с её появления не прошло
+            # PHONE_WAIT. Отсчёт — от DATE_CREATE (нет — от момента, когда робот её увидел), поэтому поздно
+            # увиденная сделка и ручной «Повторить» старой сделки получают «нет телефона» сразу
+            until = (deal.created_at or _ts(row["created_at"])) + PHONE_WAIT
+            if datetime.now(timezone.utc) < until:
+                reason = f"у контактов сделки пока нет телефона — ждём до {until.isoformat(timespec='seconds')}"
+                if row["last_error"] != reason:
+                    self.db.update(deal_id, last_error=reason)
+                    self.event(deal_id, "ждём телефон", reason)
+                return
             await self._no_messenger(deal_id, "no_phone", "у контактов сделки нет телефона", deal.stage_id)
             return
 
