@@ -647,6 +647,37 @@ def test_late_confirmation_after_timeout_returns_deal(running, bitrix, orbita, c
     assert row["status"] == expected and not row[f"{step}_request_key"]
 
 
+@pytest.mark.parametrize("step, waiting", [("followup", "sent_followup"), ("reply", "replied")])
+def test_late_confirmation_between_retry_and_resend_is_applied(running, bitrix, orbita, clock, step, waiting):
+    """«Повторить» после таймаута подтверждения, а message.sent прежней отправки пришёл раньше, чем робот
+    повторил запрос: шаг сделан, повтор не нужен."""
+    passed_without_confirmation(running, bitrix, orbita, step, 175)
+    clock.advance(minutes=31)
+    run(running.tick())
+    run(running.retry(175, "a@x.ru"))
+    run(running.on_orbita_event(event("message.sent", request_key=f"rk-deal-175-{step}", dialog_id="D1")))
+    row = running.db.deal(175)
+    assert row["status"] == waiting and row[f"{step}_sent_at"] and not row[f"{step}_request_key"]
+    run(running.tick())
+    assert len(orbita.replies) == 1, "повтора нет"
+
+
+@pytest.mark.parametrize("step", ["followup", "reply"])
+def test_late_failure_between_retry_and_resend_sends_with_new_key(running, bitrix, orbita, clock, step):
+    """«Повторить» после таймаута подтверждения, а message.failed прежней отправки пришёл раньше повтора: она
+    точно не ушла — робот выполняет решение человека новой отправкой (с прежним ключом Орбита вернула бы
+    прежний исход)."""
+    passed_without_confirmation(running, bitrix, orbita, step, 176)
+    clock.advance(minutes=31)
+    run(running.tick())
+    run(running.retry(176, "a@x.ru"))
+    run(running.on_orbita_event(event("message.failed", request_key=f"rk-deal-176-{step}", reason_code="send_failed")))
+    orbita.reply_mode = "sent"
+    run(running.tick())
+    assert [k for _, _, k in orbita.replies] == [f"deal-176-{step}", f"deal-176-{step}-r1"]
+    assert running.db.deal(176)[f"{step}_sent_at"]
+
+
 def test_late_reminder_confirmation_does_not_undo_client_reply(running, bitrix, orbita, clock):
     """Напоминание и ответ по шаблону переданы (202), клиент между ними ответил; ответ по шаблону не подтвердили
     за 30 минут. Позднее подтверждение напоминания не возвращает сделку в «отправлено напоминание»."""

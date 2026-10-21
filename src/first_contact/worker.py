@@ -307,17 +307,19 @@ class Worker:
         fields: dict = {"status": status, "attempts": 0, "last_error": None, "next_attempt_at": None}
         # Повтор шага после определённого отказа — новый ключ идемпотентности этого шага (-r<n>): с прежним
         # Орбита вернула бы исход прошлой попытки и сообщение не ушло бы. Исход прошлой попытки неизвестен
-        # (сохранён followup_key / reply_key) — тот же ключ: если сообщение дошло, Орбита второе не отправит
+        # (сохранён followup_key / reply_key) — тот же ключ: если сообщение дошло, Орбита второе не отправит.
+        # request_key прежней отправки (202) остаётся, пока повтор не ушёл: её исход, пришедший в этот промежуток,
+        # применяется (_send_outcome), а не теряется
         if status == "sent_first":
             if followup_unconfirmed:
-                fields.update(followup_sent_at=None, followup_request_key=None)
+                fields.update(followup_sent_at=None)
             elif not row["followup_key"]:
                 fields["followup_retry_n"] = (row["followup_retry_n"] or 0) + 1
         if status == "replied" and self.s.reply_on and \
                 (reply_unconfirmed or (not row["reply_sent_at"] and row["reply_due_at"])):
             # Ручной повтор продлевает срок: ответ уходит, даже если с сообщения клиента прошло больше 30 мин
             fields.update(reply_due_at=now(), reply_retried_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                          reply_sent_at=None, reply_request_key=None)
+                          reply_sent_at=None)
             if not row["reply_key"] and not reply_unconfirmed:
                 fields["reply_retry_n"] = (row["reply_retry_n"] or 0) + 1
         if status == "new":
@@ -892,20 +894,33 @@ class Worker:
             waiting = "sent_followup" if step == "followup" else "replied"
             # Напоминание после ответа клиента значения не имеет: его исход — только в журнал
             mine = step == "reply" or not row["client_replied_at"]
+            # «Повторить» после таймаута уже нажат, а повтор той же отправки ещё не ушёл: статус вернулся туда,
+            # откуда шаг отправляется, момент отправки стёрт, request_key прежней отправки сохранён (_retry)
+            retrying = mine and not row[f"{step}_sent_at"] and \
+                row["status"] == ("sent_first" if step == "followup" else "replied")
             if ok:
                 fields: dict = {column: None}
-                if row["status"] == "needs_check" and mine:
+                if mine and (row["status"] == "needs_check" or retrying):
                     # «Проверить вручную» по таймауту этой отправки (другого needs_check при неснятом ключе шага
-                    # нет): подтверждение пришло позже — шаг сделан, сделка возвращается туда, где ждала
+                    # нет) или повтор после него: подтверждение пришло позже — шаг сделан, повтор не нужен
                     fields.update(status=waiting, last_error=None)
+                    if retrying:
+                        sent_at = _parse_time(data.get("sent_at")) or datetime.now(timezone.utc)
+                        fields[f"{step}_sent_at"] = sent_at.isoformat(timespec="seconds")
+                        if step == "reply":
+                            fields["reply_due_at"] = None
                 self.db.update(deal_id, **fields)
                 self.event(deal_id, f"{title}: мессенджер подтвердил доставку")
                 return
             # Сообщение не ушло: шаг не сделан, намерение снято. Человек решает, повторять ли («Повторить» —
             # с новым ключом). Итог «не ответил» по недоставленному напоминанию тоже снимается
             fields = {column: None, f"{step}_key": None, f"{step}_text": None}
-            act = mine and (row["status"] in (waiting, "needs_check")
-                            or (step == "followup" and row["status"] == "no_reply"))
+            if retrying:
+                # Человек уже решил повторить: прежняя отправка точно не ушла — повтор пойдёт новым ключом (с прежним
+                # Орбита вернула бы этот же отказ); статус и срок ответа не трогаем
+                fields[f"{step}_retry_n"] = (row[f"{step}_retry_n"] or 0) + 1
+            act = mine and not retrying and (row["status"] in (waiting, "needs_check")
+                                             or (step == "followup" and row["status"] == "no_reply"))
             if act:
                 fields.update(status="needs_check", last_error=f"{title} не доставлен(о): {reason}")
                 if step == "followup":
