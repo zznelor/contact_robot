@@ -131,11 +131,12 @@ def test_unknown_step_rejected(running):
 
 # ---------- ошибки и «Повторить» ----------
 
-def test_failures_count_and_reset_when_deal_moves(running, bitrix, orbita):
+def test_failures_count_and_reset_when_deal_moves(running, bitrix, orbita, clock):
     orbita.mode = "boom"
     bitrix.new_ids = [122]
     for _ in range(4):
         run(running.tick())
+        clock.advance(hours=1)
     row = running.db.deal(122)
     assert (row["status"], row["attempts"]) == ("new", 4)
 
@@ -145,11 +146,12 @@ def test_failures_count_and_reset_when_deal_moves(running, bitrix, orbita):
     assert (row["status"], row["attempts"]) == ("sent_first", 0)
 
 
-def test_five_failures_in_a_row_is_error(running, bitrix, orbita):
+def test_five_failures_in_a_row_is_error(running, bitrix, orbita, clock):
     orbita.mode = "boom"
     bitrix.new_ids = [123]
     for _ in range(5):
         run(running.tick())
+        clock.advance(hours=1)
     assert running.db.deal(123)["status"] == "error"
 
 
@@ -187,6 +189,32 @@ def test_retry_after_failed_followup_does_not_resend_first(running, bitrix, orbi
     assert running.db.deal(120)["status"] == "sent_followup"
     assert len(orbita.first) == 1
     assert [k for _, _, k in orbita.replies] == ["deal-120-followup-r1"], "повтор шага — новый ключ"
+
+
+def test_bitrix_down_does_not_stop_other_steps(replying, bitrix, orbita):
+    """Опрос Битрикса падает — ответ по шаблону и таймаут неподтверждённой отправки всё равно идут."""
+    client_writes(replying, bitrix, orbita, 170, lambda first: [out(first), inc(datetime.now(UTC))])
+    replying.db.add_deal(171)
+    replying.db.update(171, status="pending_first", request_key="rk-171")
+    replying.db.conn.execute("UPDATE deals SET updated_at=? WHERE deal_id=171", (ago(hours=1).isoformat(),))
+
+    async def down(*a):
+        raise RuntimeError("Битрикс недоступен")
+    bitrix.deal_ids_after = down
+    run(replying.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-170-reply"]
+    assert replying.db.deal(171)["status"] == "needs_check"
+
+
+def test_failed_attempt_waits_before_next(running, bitrix, orbita, clock):
+    """После сбоя следующая попытка — не на ближайшем проходе, а после паузы."""
+    orbita.mode = "boom"
+    start_deal(running, bitrix, 172)
+    run(running.tick())
+    assert len(orbita.keys) == 1 and running.db.deal(172)["attempts"] == 1
+    clock.advance(minutes=3)
+    run(running.tick())
+    assert len(orbita.keys) == 2, "пауза прошла — новая попытка"
 
 
 # ---------- напоминание и итог ----------

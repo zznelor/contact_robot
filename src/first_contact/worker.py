@@ -21,6 +21,8 @@ from .orbita_api import OrbitaAPI, OrbitaAPIError
 log = logging.getLogger("first_contact")
 
 MAX_ATTEMPTS = 5
+# Пауза перед следующей попыткой после сбоя шага: 2, 4, 8, 16 мин — пятая (последняя) примерно через полчаса
+RETRY_PAUSE = timedelta(minutes=2)
 # Сделки, которые ждали дольше (робот был выключен или лежала Орбита), не трогаем:
 # писать «вы оставили заявку» через неделю — плохо.
 MAX_AGE = timedelta(hours=48)
@@ -137,12 +139,20 @@ class Worker:
     async def tick(self) -> None:
         async with self._pass:
             # Принятые события Орбиты разбираются и при выключенном роботе: они только записывают исходы
-            await self._step("events", manual=False)
+            await self._isolated("events")
             if not self.active:
                 return
             for step in self.STEPS:
                 if step != "events":
-                    await self._step(step, manual=False)
+                    await self._isolated(step)
+
+    async def _isolated(self, step: str) -> None:
+        """Сбой одного шага (например, Битрикс недоступен для опроса) не отменяет остальные шаги прохода:
+        ответы по шаблону, таймауты, напоминания по уже сохранённым сделкам Битрикс-опроса не ждут."""
+        try:
+            await self._step(step, manual=False)
+        except Exception:  # noqa: BLE001
+            log.exception("проход: шаг %s (%s) не выполнен", step, self.STEPS[step])
 
     async def run_step(self, step: str) -> None:
         """Один шаг прохода по кнопке из панели."""
@@ -219,6 +229,8 @@ class Worker:
     async def _attempt(self, deal_id: int, step) -> None:
         """Шаг с учётом ошибок. Вызывается под self.lock."""
         before = self.db.deal(deal_id)
+        if before and before["next_attempt_at"] and datetime.now(timezone.utc) < _ts(before["next_attempt_at"]):
+            return                                      # пауза после сбоя или срок, названный Орбитой
         try:
             await step(deal_id)
         except UnknownOutcome as e:
@@ -226,18 +238,29 @@ class Worker:
             self.event(deal_id, "исход отправки неизвестен", str(e))
             await self.note(deal_id, "Не уверен, ушло ли сообщение клиенту. Проверьте переписку в Орбите.")
         except Exception as e:  # noqa: BLE001
+            retry_at = getattr(e, "retry_at", None)
+            if retry_at is not None:
+                # Орбита назвала срок (Retry-After, retry_after, суточный лимит) — ждём его, попытку не тратим
+                self.db.update(deal_id, next_attempt_at=retry_at.isoformat(timespec="seconds"),
+                               last_error=f"{type(e).__name__}: {e}")
+                self.event(deal_id, "отложено", f"до {retry_at.isoformat(timespec='seconds')}: {e}")
+                return
             row = self.db.deal(deal_id)
             attempts = (row["attempts"] if row else 0) + 1
             status = "error" if attempts >= MAX_ATTEMPTS else (row["status"] if row else "new")
-            self.db.update(deal_id, attempts=attempts, last_error=f"{type(e).__name__}: {e}", status=status)
+            pause = datetime.now(timezone.utc) + RETRY_PAUSE * 2 ** (attempts - 1)
+            self.db.update(deal_id, attempts=attempts, last_error=f"{type(e).__name__}: {e}", status=status,
+                           next_attempt_at=None if status == "error" else pause.isoformat(timespec="seconds"))
             self.event(deal_id, "ошибка", f"попытка {attempts}: {e}")
             if status == "error":
+                log.error("сделка %s: ошибка после %s попыток: %s: %s", deal_id, attempts, type(e).__name__, e)
                 await self.note(deal_id, f"Не смог обработать заявку после {attempts} попыток: {e}")
         else:
             # Сделка продвинулась — прошлые сбои не должны копиться до «ошибки» на следующем шаге
             after = self.db.deal(deal_id)
-            if before and after and after["attempts"] and after["status"] != before["status"]:
-                self.db.update(deal_id, attempts=0)
+            if before and after and (after["attempts"] or after["next_attempt_at"]) \
+                    and after["status"] != before["status"]:
+                self.db.update(deal_id, attempts=0, next_attempt_at=None)
 
     async def retry(self, deal_id: int, who: str) -> str:
         """«Повторить» из панели: вернуть сделку туда, где робот остановился. Возвращает новый статус.
@@ -261,7 +284,7 @@ class Worker:
             status = "sent_first"
         else:
             status = "new"
-        fields: dict = {"status": status, "attempts": 0, "last_error": None}
+        fields: dict = {"status": status, "attempts": 0, "last_error": None, "next_attempt_at": None}
         # Повтор шага после ошибки — новый ключ идемпотентности этого шага (-r<n>): с прежним Орбита вернула
         # бы исход прошлой попытки и сообщение не ушло бы
         if status == "sent_first":
@@ -387,10 +410,12 @@ class Worker:
         self.db.update(deal_id, name=name, phone=", ".join(phones), first_text=text)
         suffix = f"-r{row['retry_n']}" if row["retry_n"] else ""
         not_found, unchecked, invalid = [], [], []
+        unchecked_waits: list[datetime | None] = []
         for phone in phones:
             for ch in order:
                 if ch not in connected:
                     unchecked.append(f"{ch}: не подключён")
+                    unchecked_waits.append(None)
                     continue
                 res = await self._start(deal_id, phone, ch, text, f"deal-{deal_id}-first-{phone}{suffix}-{ch}", name)
                 if await self._first_done(deal_id, phone, res):
@@ -403,6 +428,7 @@ class Worker:
                     not_found.append(f"{ch}: {phone}")
                 else:
                     unchecked.append(f"{ch}: {res.raw}")
+                    unchecked_waits.append(res.retry_at)
             else:
                 self.event(deal_id, "нет мессенджера на номере", phone)
 
@@ -410,8 +436,12 @@ class Worker:
             await self._no_messenger(deal_id, "no_phone", f"Орбита не приняла номера: {', '.join(invalid)}")
             return
         if unchecked:
-            # Хотя бы один выбранный канал не проверил номер — не утверждаем, что мессенджера нет
-            raise OrbitaError(f"не найден: {', '.join(not_found) or '—'}; не проверен: {'; '.join(unchecked)}")
+            # Хотя бы один выбранный канал не проверил номер — не утверждаем, что мессенджера нет. Если каждый
+            # непроверенный канал назвал срок (лимит, flood wait) — ждём ближайший, не тратя попытку
+            waits = [w for w in unchecked_waits if w is not None]
+            retry_at = min(waits) if waits and len(waits) == len(unchecked) else None
+            raise OrbitaError(f"не найден: {', '.join(not_found) or '—'}; не проверен: {'; '.join(unchecked)}",
+                              retry_at)
         await self._no_messenger(deal_id, "no_messenger", f"мессенджер не найден: {', '.join(phones)}")
 
     async def _start(self, deal_id: int, phone: str, channel: str, text: str, key: str,

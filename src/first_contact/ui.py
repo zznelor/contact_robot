@@ -239,7 +239,9 @@ def build_router(ctx: Ctx) -> APIRouter:
                    if r["reply_sent_at"] else
                    (f"запланирован на {when(r['reply_due_at'])}" if r["reply_due_at"] and r["status"] == "replied"
                     else "не отправлен — «Повторить» отправит" if r["reply_due_at"] else "")),
-                  ("Попыток с ошибкой", str(r["attempts"] or 0)), ("Комментарий", e(r["last_error"])),
+                  ("Попыток с ошибкой", str(r["attempts"] or 0)),
+                  ("Следующая попытка", when(r["next_attempt_at"]) if r["status"] not in ("error", "skipped") else ""),
+                  ("Комментарий", e(r["last_error"])),
                   ("Увидели заявку", when(r["created_at"])), ("Обновлено", when(r["updated_at"]))]
         dl = "".join(f"<dt>{k}</dt><dd>{v or '—'}</dd>" for k, v in fields)
         actions = []

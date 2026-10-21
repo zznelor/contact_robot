@@ -14,7 +14,7 @@ dialogs:read, messages:send, dialogs:start.
 
 import hashlib
 import hmac
-from datetime import datetime
+from datetime import datetime, time, timedelta, timezone
 
 import httpx
 
@@ -29,12 +29,41 @@ KEY_LEVEL_CODES = {"idempotency_in_progress", "key_lacks_right", "subscription_i
                    "daily_send_limit_exhausted", "executor_inactive", "idempotency_key_reused"}
 
 
+# Суточные лимиты. daily_send_limit_exhausted — «1000 отправок в сутки UTC» (спецификация).
+# telegram_search_limit_exhausted — «30 поисков в сутки»; когда сбрасывается, спецификация не говорит —
+# ПРЕДПОЛОЖЕНИЕ: в полночь UTC, как суточный потолок ключа. Ошибка в нём безвредна: в полночь робот
+# проверит снова и, если лимит ещё исчерпан, снова подождёт, не тратя попытку.
+DAILY_LIMIT_CODES = {"daily_send_limit_exhausted", "telegram_search_limit_exhausted"}
+
+
+def _next_utc_midnight() -> datetime:
+    today = datetime.now(timezone.utc).date()
+    return datetime.combine(today + timedelta(days=1), time(0, 0), tzinfo=timezone.utc)
+
+
+def wait_until(code: str, retry_after_header, detail) -> datetime | None:
+    """Срок из ответа Орбиты: заголовок Retry-After (429, idempotency_in_progress), detail.retry_after
+    (telegram_flood_wait), суточный лимит — до полуночи UTC. Нет срока — None."""
+    seconds = None
+    for raw in (retry_after_header, detail.get("retry_after") if isinstance(detail, dict) else None):
+        try:
+            seconds = int(raw)
+            break
+        except (TypeError, ValueError):
+            continue
+    if seconds is not None and seconds > 0:
+        return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    if code in DAILY_LIMIT_CODES:
+        return _next_utc_midnight()
+    return None
+
+
 class OrbitaAPIError(OrbitaError):
     """Орбита ответила ошибкой. definite — Орбита точно ничего не отправила по этому запросу (4xx);
     5xx и idempotency_in_progress — исход неизвестен."""
 
-    def __init__(self, status: int, code: str, detail):
-        super().__init__(f"HTTP {status} {code}: {detail}")
+    def __init__(self, status: int, code: str, detail, retry_at: datetime | None = None):
+        super().__init__(f"HTTP {status} {code}: {detail}", retry_at)
         self.status, self.code, self.detail = status, code, detail
 
     @property
@@ -68,7 +97,7 @@ class OrbitaAPI:
                 body = None
             detail = body.get("detail") if isinstance(body, dict) else r.text[:300]
             code = detail.get("code", "") if isinstance(detail, dict) else ""
-            raise OrbitaAPIError(r.status_code, code, detail)
+            raise OrbitaAPIError(r.status_code, code, detail, wait_until(code, r.headers.get("retry-after"), detail))
         return r.status_code, (r.json() if r.content else {})
 
     # ---------- проверка ----------
@@ -114,7 +143,7 @@ class OrbitaAPI:
                 # Адресат у нас ровно один, текст не пустой — по спецификации 400 здесь значит невалидный номер
                 return FirstSendResult("invalid_phone", channel=channel, raw=e.code)
             if e.status == 422 and e.code not in KEY_LEVEL_CODES:
-                return FirstSendResult("unchecked", channel=channel, raw=e.code)
+                return FirstSendResult("unchecked", channel=channel, raw=e.code, retry_at=e.retry_at)
             raise
         if status == 202:
             return FirstSendResult("pending", None, channel, data, request_key=data.get("request_key"))

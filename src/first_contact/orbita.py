@@ -13,7 +13,12 @@ CLOCK_SKEW = timedelta(minutes=2)
 
 
 class OrbitaError(RuntimeError):
-    pass
+    """Отказ или сбой Орбиты. retry_at — Орбита назвала срок, раньше которого повторять бессмысленно
+    (Retry-After, retry_after, суточный лимит): робот ждёт его, не тратя попытку."""
+
+    def __init__(self, message: str, retry_at: datetime | None = None):
+        super().__init__(message)
+        self.retry_at = retry_at
 
 
 @dataclass
@@ -23,6 +28,7 @@ class FirstSendResult:
     channel: str | None = None
     raw: Any = None
     request_key: str | None = None   # pending (202): исход придёт вебхуком с этим ключом
+    retry_at: datetime | None = None  # unchecked: канал назвал срок, когда проверять снова
 
 
 @dataclass

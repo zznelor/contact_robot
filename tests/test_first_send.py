@@ -33,6 +33,8 @@ class Orbita:
             if body["phone"] in self.invalid_phones:
                 return httpx.Response(400, json={"detail": {"code": "invalid_request"}})
             answer = self.answers[ch]
+            if isinstance(answer, httpx.Response):
+                return answer
             if answer == "lost":
                 self.answers[ch] = 201              # повтор с тем же ключом вернёт исход первого вызова
                 raise httpx.ReadTimeout("ответ не дошёл")
@@ -54,7 +56,7 @@ def robot(db, settings, bitrix, http):
 
 
 @pytest.mark.parametrize("change", ["disconnected", "reordered"])
-def test_retry_after_lost_answer_never_goes_to_another_channel(robot, bitrix, change):
+def test_retry_after_lost_answer_never_goes_to_another_channel(robot, bitrix, change, clock):
     """WhatsApp отправил, ответ потерян; к повтору WhatsApp отключился или порядок каналов сменили."""
     orbita = Orbita({"whatsapp", "max"}, {"whatsapp": "lost", "max": 201})
     w = robot(orbita, ["whatsapp", "max"])
@@ -67,6 +69,7 @@ def test_retry_after_lost_answer_never_goes_to_another_channel(robot, bitrix, ch
     else:
         w.s.orbita_channels = ["max", "whatsapp"]            # как после сохранения в панели (reconnect)
         w.orbita = OrbitaAPI(URL, "k", ["max", "whatsapp"])
+    clock.advance(minutes=3)
     run(w.tick())
 
     assert [ch for ch, _ in orbita.posts] == ["whatsapp"] * len(orbita.posts), "в Max второе первое не ушло"
@@ -114,3 +117,35 @@ def test_all_numbers_invalid_is_no_phone(robot, bitrix):
     run(w.tick())
     assert w.db.deal(144)["status"] == "no_phone"
     assert bitrix.stages_set == [(144, "NO_MESSENGER")]
+
+
+@pytest.mark.parametrize("answer", [
+    httpx.Response(429, headers={"Retry-After": "120"}, json={"detail": {"code": "rate_limited"}}),
+    httpx.Response(422, json={"detail": {"code": "daily_send_limit_exhausted"}}),
+    httpx.Response(422, headers={"Retry-After": "5"}, json={"detail": {"code": "idempotency_in_progress"}}),
+])
+def test_known_wait_does_not_spend_attempts(robot, bitrix, answer):
+    orbita = Orbita({"whatsapp"}, {"whatsapp": answer})
+    w = robot(orbita, ["whatsapp"])
+    bitrix.new_ids.append(145)
+    run(w.tick())
+    run(w.tick())
+    row = w.db.deal(145)
+    assert (row["status"], row["attempts"]) == ("new", 0)
+    assert len(orbita.posts) == 1, "до срока Орбиту не дёргаем"
+
+
+def test_telegram_flood_wait_postpones_without_attempt(robot, bitrix, clock):
+    """WhatsApp: «не найден», Telegram: подождите retry_after — сделка ждёт, попытка не тратится."""
+    flood = httpx.Response(422, json={"detail": {"code": "telegram_flood_wait", "retry_after": 300}})
+    orbita = Orbita({"whatsapp", "telegram"}, {"whatsapp": "not_on_whatsapp", "telegram": flood})
+    w = robot(orbita, ["whatsapp", "telegram"])
+    bitrix.new_ids.append(146)
+    run(w.tick())
+    run(w.tick())
+    row = w.db.deal(146)
+    assert (row["status"], row["attempts"]) == ("new", 0)
+    assert len(orbita.posts) == 2
+    clock.advance(seconds=301)
+    run(w.tick())
+    assert len(orbita.posts) == 4, "срок прошёл — каналы проверяются снова"

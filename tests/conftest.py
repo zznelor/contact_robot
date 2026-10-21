@@ -231,6 +231,28 @@ def async_panel(w: Worker, role: str = "admin"):
                              headers=ORIGIN, cookies={SESSION_COOKIE: users.new_session(uid)})
 
 
+class Clock:
+    """Часы робота (worker.datetime), которые можно перевести вперёд: паузы между попытками без ожидания."""
+
+    def __init__(self):
+        self.shift = timedelta(0)
+
+    def advance(self, **kw) -> None:
+        self.shift += timedelta(**kw)
+
+
+@pytest.fixture
+def clock(monkeypatch) -> Clock:
+    c = Clock()
+
+    class Shifted(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + c.shift
+    monkeypatch.setattr(worker_mod, "datetime", Shifted)
+    return c
+
+
 def start_deal(w: Worker, bitrix: FakeBitrix, deal_id: int):
     """Новая сделка из Битрикса → проход робота. Возвращает строку сделки из базы."""
     bitrix.new_ids.append(deal_id)
