@@ -52,9 +52,26 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 
     # ---------- страница ----------
 
-    async def robot_section() -> str:
+    async def bitrix_live():
+        """Воронки и этапы в работе выбранной воронки из Битрикса — (воронки, этапы); не ответил — исключение."""
+        try:
+            return await worker.bitrix.categories(), await worker.bitrix.stages(worker.s.category)
+        except Exception as ex:  # noqa: BLE001
+            return ex
+
+    def stage_problem(live) -> str:
+        """Сохранённый этап «Не нашёл мессенджер» не среди этапов в работе: закрывающий (сохранён версией без
+        проверки) или удалён в Битриксе. Пусто — этап в порядке или проверить не удалось."""
         s = worker.s
-        steps = [(s.bitrix_ok, "Битрикс подключён, этап «Не нашёл мессенджер» выбран", "#bitrix"),
+        if not s.no_messenger_stage or not isinstance(live, tuple) or s.no_messenger_stage in dict(live[1]):
+            return ""
+        return (f"Этап «Не нашёл мессенджер» ({s.no_messenger_stage}) — не этап в работе этой воронки: он закрывает "
+                "сделку (успех или провал) или удалён. Перенесённую на закрывающий этап сделку робот не вернёт и "
+                "после «Повторить». Выберите этап в работе и сохраните.")
+
+    async def robot_section(problem: str = "") -> str:
+        s = worker.s
+        steps = [(s.bitrix_ok and not problem, "Битрикс подключён, этап «Не нашёл мессенджер» выбран", "#bitrix"),
                  (s.orbita_ok, "Орбита подключена", "#orbita"),
                  (bool(db.get("test_sent_at")), "Тестовое сообщение отправлено", "#test")]
         lis = "".join(f'<li><span class="m {"ok" if done else "muted"}">{"✓" if done else "○"}</span>'
@@ -70,6 +87,11 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
                      'Старые сделки не тронет.</span></form>')
         else:
             state = '<p><span class="badge b-off">выключен</span> Сначала подключите Битрикс и Орбиту.</p>'
+        if problem:
+            state += ('<p class="bad" role="alert">Ошибка настройки: этап «Не нашёл мессенджер» не в работе — '
+                      '<a href="#bitrix">исправьте</a>. '
+                      + ("Робот работает, но переносит сделки на этот этап." if s.enabled else "Робот не включится.")
+                      + '</p>')
         last_test = db.get("test_result") or ""
         test_disabled = "" if s.orbita_ok else "disabled"
         return f"""<div class="card" id="robot"><h2 style="margin-top:0">Робот</h2>{state}
@@ -83,14 +105,15 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 <button class="primary" {test_disabled}>Отправить</button></form>
 {f'<p class="hint">Последний тест: {e(last_test)}</p>' if last_test else ''}</div>"""
 
-    async def bitrix_section(base: str) -> str:
+    async def bitrix_section(base: str, fetched, problem: str) -> str:
         s = worker.s
         live = ""
         if worker.bitrix:
             try:
-                cats = await worker.bitrix.categories()
+                if isinstance(fetched, Exception):
+                    raise fetched
+                cats, stages = fetched
                 cat = s.category
-                stages = await worker.bitrix.stages(cat)
                 cat_opts = "".join(f'<option value="{e(i)}" {"selected" if i == cat else ""}>{e(n)}</option>'
                                    for i, n in cats)
                 st_opts = '<option value="">— выберите —</option>' + "".join(
@@ -99,9 +122,12 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
                 live = f"""<label class="field"><span>Воронка</span><select name="category">{cat_opts}</select>
 <span class="hint">Робот пишет только по сделкам этой воронки.</span></label>
 <label class="field"><span>Этап «Не нашёл мессенджер»</span><select name="stage">{st_opts}</select>
-<span class="hint">Куда переносить сделку, если номера клиента нет ни в одном мессенджере. Нет такого этапа —
+<span class="hint">Куда переносить сделку, если номера клиента нет ни в одном мессенджере. В списке — только этапы
+в работе: закрывающий этап закрыл бы сделку, и «Повторить» её бы не вернул. Нет такого этапа —
 создайте его в Битриксе (CRM → Сделки → Настроить воронку) и обновите страницу.
 После смены воронки сохраните и выберите этап заново.</span></label>"""
+                if problem:
+                    live += f'<p class="bad" role="alert" id="stage-problem">{e(problem)}</p>'
             except Exception as ex:  # noqa: BLE001
                 live = f'<p class="bad">Битрикс не отвечает: {e(type(ex).__name__)}: {e(ex)}</p>'
         status = (f'<span class="badge b-ok">подключён</span> <span class="muted">{e(s.portal)}</span>'
@@ -225,8 +251,10 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         toc = "".join(f'<a href="#{a}">{t}</a>' for a, t in (
             ("robot", "Робот"), ("bitrix", "Битрикс"), ("orbita", "Орбита"), ("messages", "Сообщения"),
             ("schedule", "Расписание"), ("team", "Команда")))
+        fetched = await bitrix_live() if worker.bitrix else None
+        problem = stage_problem(fetched)
         body = (f'<h1>Настройки</h1><p class="muted">Изменения действуют сразу, перезапуск не нужен.</p>'
-                f'<div class="toc">{toc}</div>{await robot_section()}{await bitrix_section(base)}'
+                f'<div class="toc">{toc}</div>{await robot_section(problem)}{await bitrix_section(base, fetched, problem)}'
                 f'{await orbita_section(base)}{messages_section()}{schedule_section()}'
                 f'{team_section(user, new_link)}')
         return ctx.page(user, "Настройки", "settings", body, msg)
@@ -285,7 +313,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
                     changes["deal_category_id"] = category
                     changes["no_messenger_stage"] = stage
                 else:
-                    msg = "!Такого этапа нет в выбранной воронке"
+                    msg = "!Такого этапа в работе нет в выбранной воронке (закрывающий этап выбрать нельзя)"
             else:
                 msg = "!Выберите этап «Не нашёл мессенджер»" if not s.no_messenger_stage else msg
         worker.save(**changes)
@@ -388,6 +416,13 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
     async def enable(user=Depends(admin_dep)):
         if not worker.s.configured:
             return go("/settings#robot", "!Сначала подключите Битрикс (с этапом) и Орбиту")
+        try:
+            stages = dict(await worker.bitrix.stages(worker.s.category))
+        except Exception as ex:  # noqa: BLE001
+            return go("/settings#robot", f"!Не получилось включить: Битрикс не отдал этапы воронки ({ex})")
+        if worker.s.no_messenger_stage not in stages:
+            return go("/settings#bitrix", "!Робот не включён: этап «Не нашёл мессенджер» — не этап в работе этой "
+                                          "воронки (закрывающий или удалён). Выберите этап в работе")
         try:
             start = await worker.enable()
         except Exception as ex:  # noqa: BLE001

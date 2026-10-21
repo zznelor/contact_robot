@@ -31,6 +31,8 @@ PERMANENT_CODES = {"NO_AUTH_FOUND", "INVALID_REQUEST", "OVERLOAD_LIMIT", "ACCESS
 # (например, перевод) — обычный сбой с повторами: так безопаснее, чем принять сбой за окончательный
 NOT_FOUND_TEXTS = {"not found"}
 ACCESS_DENIED_TEXTS = {"access denied"}
+# SEMANTICS закрывающих этапов (crm.status.list): S — успешная, F — провальная
+CLOSED = {"S", "F"}
 # Методы, чьё «Not found» значит: сделки нет (удалили)
 DEAL_METHODS = {"crm.deal.get", "crm.deal.update", "crm.deal.contact.items.get"}
 
@@ -189,10 +191,12 @@ class Bitrix:
         return items
 
     async def stages(self, category_id: str | None) -> list[tuple[str, str]]:
-        """Этапы воронки: [(STATUS_ID, название)]."""
+        """Этапы воронки в работе: [(STATUS_ID, название)]. Закрывающие — SEMANTICS «S» (успешная) и «F»
+        (провальная) — не входят (crm.status.list: «null — стадия в работе»; crm.status.fields: «"" — в работе»):
+        этап «Не нашёл мессенджер» из них закрыл бы сделку, а закрытые сделки робот не трогает и после «Повторить»."""
         entity = "DEAL_STAGE" if category_id in (None, "", "0") else f"DEAL_STAGE_{category_id}"
         rows = await self.call_all("crm.status.list", {"filter": {"ENTITY_ID": entity}, "order": {"SORT": "ASC"}})
-        return [(r["STATUS_ID"], r.get("NAME") or r["STATUS_ID"]) for r in rows]
+        return [(r["STATUS_ID"], r.get("NAME") or r["STATUS_ID"]) for r in rows if r.get("SEMANTICS") not in CLOSED]
 
     async def get_deal(self, deal_id: int) -> Deal:
         d = await self.call("crm.deal.get", {"id": deal_id})

@@ -334,7 +334,8 @@ def post_orbita(client: TestClient, ev, *, secret: str = "whsec_t", event_id: st
 # ---------- приложение: панель ----------
 
 class PanelBitrix:
-    """Битрикс для панели: адрес с «bad» не принимается, две воронки со своими этапами."""
+    """Битрикс для панели: адрес с «bad» не принимается, две воронки со своими этапами (stages — только этапы в
+    работе, как Bitrix.stages)."""
 
     def __init__(self, webhook="", *a):
         self.webhook = webhook

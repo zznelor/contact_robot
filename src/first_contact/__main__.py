@@ -42,7 +42,7 @@ async def check(w: Worker) -> None:
         stages = dict(await w.bitrix.stages(cat))
         print(f"  {s.portal}, воронка {cat}, этапов {len(stages)}")
         print(f"  этап «Не нашёл мессенджер»: "
-              f"{stages.get(s.no_messenger_stage) or 'НЕ ВЫБРАН — Настройки → Битрикс'}")
+              f"{stages.get(s.no_messenger_stage) or 'НЕ ВЫБРАН или не в работе — Настройки → Битрикс'}")
         print(f"  последняя сделка: ID {await w.bitrix.max_deal_id()}")
     print("Орбита:")
     if not w.orbita:

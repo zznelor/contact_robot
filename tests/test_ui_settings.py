@@ -5,7 +5,11 @@ import re
 import pytest
 
 from conftest import run
-from first_contact import config
+from first_contact import config, ui_settings
+from first_contact import worker as worker_mod
+from first_contact.bitrix import Bitrix
+
+from test_bitrix import DOC_STAGES, method_of, ok, status
 
 from test_ui_auth import is_error
 
@@ -188,3 +192,57 @@ def test_test_message_not_sent_in_dry_run(configured, admin, monkeypatch):
     r = admin.post("/settings/test", data={"phone": "8 999 000-00-01"}, follow_redirects=False)
     assert is_error(r)
     assert configured.worker.orbita.sent == [] and not configured.db.get("test_sent_at")
+
+
+# ---------- этап «Не нашёл мессенджер» — только в работе (настоящий клиент Битрикса) ----------
+
+NO_MESSENGER = status("NO_MESSENGER", "Не нашёл мессенджер", None, 45)
+
+
+def bitrix_portal(req):
+    """Портал по документации: воронка «Общая» (crm.category.list), её этапы — пример из статьи crm.status.list и
+    свой этап в работе «Не нашёл мессенджер»."""
+    m = method_of(req)
+    if m == "crm.category.list":
+        return ok({"categories": [{"id": 0, "name": "Общая", "sort": 100, "entityTypeId": 2, "isDefault": "Y"}]})
+    if m == "crm.status.list":
+        return ok(sorted([*DOC_STAGES, NO_MESSENGER], key=lambda r: int(r["SORT"])))
+    if m == "crm.deal.list":
+        return ok([{"ID": "40"}])
+    return ok(True)
+
+
+@pytest.fixture
+def real_bitrix(panel, http, monkeypatch):
+    monkeypatch.setattr(ui_settings, "Bitrix", Bitrix)
+    monkeypatch.setattr(worker_mod, "Bitrix", Bitrix)
+    http(bitrix_portal)
+    panel.worker.save(bitrix_webhook="https://p.bitrix24.ru/rest/1/good/", orbita_api_key="orb_pk_secret123456",
+                      orbita_channels=["whatsapp"])
+    return panel
+
+
+def test_closing_stage_not_offered(real_bitrix, admin):
+    page = admin.get("/settings").text
+    assert 'value="NO_MESSENGER"' in page and 'value="NEW"' in page
+    assert not any(f'value="{s}"' in page for s in ("WON", "LOSE", "APOLOGY"))
+
+
+@pytest.mark.parametrize("stage", ["LOSE", "WON", "APOLOGY"])
+def test_closing_stage_rejected_from_forged_form(real_bitrix, admin, stage):
+    r = admin.post("/settings/bitrix", data={"category": "0", "stage": stage}, follow_redirects=False)
+    assert is_error(r) and real_bitrix.s.no_messenger_stage == ""
+    admin.post("/settings/bitrix", data={"category": "0", "stage": "NO_MESSENGER"})
+    assert real_bitrix.s.no_messenger_stage == "NO_MESSENGER"
+
+
+def test_saved_closing_stage_is_setup_error(real_bitrix, admin):
+    """Установка старой версии сохранила провальный этап: панель показывает ошибку настройки, робот не включается."""
+    real_bitrix.worker.save(no_messenger_stage="LOSE")
+    assert 'id="stage-problem"' in admin.get("/settings").text
+    r = admin.post("/settings/enable", follow_redirects=False)
+    assert is_error(r) and not real_bitrix.s.enabled
+    real_bitrix.worker.save(no_messenger_stage="NO_MESSENGER")
+    assert 'id="stage-problem"' not in admin.get("/settings").text
+    admin.post("/settings/enable")
+    assert real_bitrix.s.enabled

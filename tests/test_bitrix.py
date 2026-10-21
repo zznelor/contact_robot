@@ -302,3 +302,28 @@ def test_stage_return_waits_out_rate_limit_without_attempts(portal_robot, orbita
     assert row["first_sent_at"] and row["stage_before"] == "NEW" and row["stage_attempts"] == 0
     run(w.tick())
     assert portal.stage == "NEW" and w.db.deal(103)["stage_before"] is None
+
+
+# ---------- этапы воронки ----------
+
+def status(status_id: str, name: str, semantics: str | None, sort: int) -> dict:
+    """Строка crm.status.list (api-reference/crm/status/crm-status-list.md): SEMANTICS S — успешная, F — провальная,
+    null — в работе."""
+    return {"ID": str(sort), "ENTITY_ID": "DEAL_STAGE", "STATUS_ID": status_id, "NAME": name, "NAME_INIT": name,
+            "SORT": str(sort), "SYSTEM": "N", "CATEGORY_ID": None, "COLOR": "#39A8EF", "SEMANTICS": semantics,
+            "EXTRA": {"SEMANTICS": {"S": "success", "F": "failure"}.get(semantics, "process"), "COLOR": "#39A8EF"}}
+
+
+# Пример ответа из статьи crm.status.list: пять этапов в работе, успех, провал и «Анализ причины провала» (тоже F)
+DOC_STAGES = [status("NEW", "Новая", None, 10), status("PREPARATION", "Подготовка документов", None, 20),
+              status("PREPAYMENT_INVOICE", "Cчет на предоплату", None, 30), status("EXECUTING", "В работе", None, 40),
+              status("FINAL_INVOICE", "Финальный счет", None, 50), status("WON", "Сделка успешна", "S", 60),
+              status("LOSE", "Сделка провалена", "F", 70), status("APOLOGY", "Анализ причины провала", "F", 80)]
+
+
+def test_stages_only_in_progress(http):
+    """Этап «Не нашёл мессенджер» выбирается только из этапов в работе: закрывающий закрыл бы сделку, и «Повторить»
+    её не вернул бы (робот пропускает закрытые сделки)."""
+    http(lambda req: ok(DOC_STAGES))
+    assert [i for i, _ in run(Bitrix(HOOK).stages("0"))] == [
+        "NEW", "PREPARATION", "PREPAYMENT_INVOICE", "EXECUTING", "FINAL_INVOICE"]

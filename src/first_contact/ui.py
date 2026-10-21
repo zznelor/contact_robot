@@ -371,7 +371,7 @@ def build_router(ctx: Ctx) -> APIRouter:
             stages = dict(await worker.bitrix.stages(s.category))
             has = s.no_messenger_stage in stages
             return (f"последняя сделка {await worker.bitrix.max_deal_id()}; этап «Не нашёл мессенджер»: "
-                    f"{stages.get(s.no_messenger_stage) if has else 'НЕ НАЙДЕН — выберите в настройках'}")
+                    f"{stages.get(s.no_messenger_stage) if has else 'НЕ НАЙДЕН среди этапов в работе — выберите в настройках'}")
 
         async def orbita_info():
             acc = await worker.orbita.account()
