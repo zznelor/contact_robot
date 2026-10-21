@@ -91,6 +91,7 @@ class FakeBitrix:
         self.new_ids: list[int] = []
         self.category, self.stage, self.semantic = "0", "NEW", "P"
         self.name, self.phones = "Анна", [PHONE]
+        self.created: datetime | None = None          # DATE_CREATE сделки; None — Битрикс его не отдал
 
     async def max_deal_id(self):
         return self.max_id
@@ -99,7 +100,9 @@ class FakeBitrix:
         return [i for i in self.new_ids if i > last]   # фильтр >ID, как в crm.deal.list
 
     async def get_deal(self, deal_id):
-        return Deal(deal_id, "Заявка", self.stage, self.semantic, self.category, 1)
+        deal = Deal(deal_id, "Заявка", self.stage, self.semantic, self.category, 1)
+        deal.created_at = self.created
+        return deal
 
     async def get_contact(self, contact_id):
         return self.name, list(self.phones)

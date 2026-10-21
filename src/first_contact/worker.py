@@ -58,6 +58,9 @@ class Worker:
         self._inbox = asyncio.Lock()     # события Орбиты из базы разбираются по одному разу
         if bitrix is None and orbita is None:
             self.reconnect()
+        if s.enabled and db.get("start_deal_id") is None and db.get("last_deal_id") is not None:
+            # Установка, включённая до появления границы: исходной границы не знаем, берём курсор опроса
+            db.put("start_deal_id", db.get("last_deal_id"))
 
     def reconnect(self) -> None:
         """Пересобрать клиенты после смены настроек в панели."""
@@ -106,7 +109,8 @@ class Worker:
         """Включить робота. Сделки, созданные до включения, не трогаем."""
         async with self.lock:
             start = await self.bitrix.max_deal_id()
-            self.db.put("last_deal_id", start)
+            self.db.put("last_deal_id", start)      # курсор опроса: растёт
+            self.db.put("start_deal_id", start)     # граница включения: неизменна до следующего включения
             self.save(enabled=True)
             self.event(None, "робот включён", f"сделки до ID {start} включительно не трогаем")
             return start
@@ -182,6 +186,12 @@ class Worker:
         async with self.lock:
             if not self.active:
                 return
+            start = self.db.get("start_deal_id")
+            if self.db.deal(deal_id) is None and start is not None and deal_id <= int(start):
+                # Запоздавшее событие о сделке, созданной до включения: её робот не трогает
+                # (взять такую можно вручную — «Взять в работу»)
+                log.info("сделка %s: событие о сделке до включения (граница %s) пропущено", deal_id, start)
+                return
             if self.db.add_deal(deal_id):
                 self.event(deal_id, "новая сделка (событие)")
             await self._attempt(deal_id, self.first_contact)
@@ -192,6 +202,7 @@ class Worker:
         if last is None:
             start = await self.bitrix.max_deal_id()
             self.db.put("last_deal_id", start)
+            self.db.put("start_deal_id", start)
             self.event(None, "старт", f"сделки до ID {start} включительно не трогаем")
             return
         for deal_id in await self.bitrix.deal_ids_after(int(last), self.s.category):
@@ -293,6 +304,8 @@ class Worker:
             if not self.active:
                 return
             self.db.add_deal(deal_id)
+            # Ручной путь: граница включения не действует, 48 ч считаются от этого момента
+            self.db.update(deal_id, retried_at=now())
             self.event(deal_id, "вручную: взять в работу", who)
             await self._attempt(deal_id, self.first_contact)
 
@@ -313,16 +326,16 @@ class Worker:
         row = self.db.deal(deal_id)
         if row is None or row["status"] != "new":
             return
-        # 48 ч — от появления заявки или от ручного повтора, что позже
-        seen = max(filter(None, (_ts(row["created_at"]), _ts(row["retried_at"]))))
-        if datetime.now(timezone.utc) - seen > MAX_AGE:
-            self.db.update(deal_id, status="skipped", last_error="заявка старше 48 ч")
-            self.event(deal_id, "пропущена", "заявка старше 48 ч")
+        # 48 ч — от создания сделки в Битриксе (DATE_CREATE; пока не спросили Битрикс — от момента, когда
+        # робот её увидел, это не раньше) или от ручного повтора / «Взять в работу», что позже
+        if self._too_old(deal_id, row, _ts(row["created_at"])):
             return
         if not self.in_window():
             return
 
         deal = await self.bitrix.get_deal(deal_id)
+        if deal.created_at and self._too_old(deal_id, row, deal.created_at):
+            return
         if deal.category_id != self.s.category:
             self.db.update(deal_id, status="skipped", last_error=f"другая воронка ({deal.category_id})")
             self.event(deal_id, "пропущена", f"другая воронка ({deal.category_id})")
@@ -427,6 +440,14 @@ class Worker:
                        f"{phone} {res.channel} {res.request_key}")
             return True
         return False
+
+    def _too_old(self, deal_id: int, row, created: datetime | None) -> bool:
+        start = max(filter(None, (created, _ts(row["retried_at"]))), default=None)
+        if start is None or datetime.now(timezone.utc) - start <= MAX_AGE:
+            return False
+        self.db.update(deal_id, status="skipped", last_error="заявка старше 48 ч")
+        self.event(deal_id, "пропущена", "заявка старше 48 ч")
+        return True
 
     def _mark_sent_first(self, deal_id: int, phone: str | None, dialog_id: str | None,
                          channel: str | None) -> None:

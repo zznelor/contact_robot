@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
 
@@ -18,6 +19,16 @@ class Deal:
     stage_semantic: str   # P — в работе, S — успех, F — провал
     category_id: str
     contact_id: int | None
+    created_at: datetime | None = None   # DATE_CREATE; нет или не разобрать — None
+
+
+def _parse_date(value) -> datetime | None:
+    """DATE_CREATE Битрикса: 2026-10-21T13:00:00+03:00. Без смещения — считаем UTC."""
+    try:
+        d = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
 def normalize_phone(raw: str) -> str | None:
@@ -81,6 +92,7 @@ class Bitrix:
             stage_semantic=d.get("STAGE_SEMANTIC_ID") or "P",
             category_id=str(d.get("CATEGORY_ID") or "0"),
             contact_id=int(d["CONTACT_ID"]) if d.get("CONTACT_ID") else None,
+            created_at=_parse_date(d.get("DATE_CREATE")) if d.get("DATE_CREATE") else None,
         )
 
     async def get_contact(self, contact_id: int) -> tuple[str, list[str]]:

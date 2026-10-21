@@ -55,6 +55,32 @@ def test_disable_stops_taking_new_deals(running, bitrix):
     assert not config.load(running.db).enabled
 
 
+def test_late_bitrix_event_for_deal_before_enable_ignored(running, orbita):
+    """Робот включён при последней сделке 100: запоздавшее событие о сделке 90 её не берёт."""
+    run(running.on_deal_added(90))
+    assert running.db.deal(90) is None and orbita.keys == []
+
+
+def test_boundary_survives_polling_cursor(running, bitrix, orbita):
+    """Граница включения не растёт вместе с курсором опроса: сделка 105 после опроса 110 — не «старая»."""
+    start_deal(running, bitrix, 110)
+    run(running.on_deal_added(105))
+    assert running.db.deal(105)["status"] == "sent_first"
+
+
+def test_take_into_work_allowed_for_deal_before_enable(running, bitrix, orbita):
+    bitrix.created = ago(days=5)
+    run(running.take(90, "a@x.ru"))
+    assert running.db.deal(90)["status"] == "sent_first"
+
+
+@pytest.mark.parametrize("created_hours_ago, expected", [(49, "skipped"), (47, "sent_first"), (None, "sent_first")])
+def test_age_counted_from_deal_creation_in_bitrix(running, bitrix, created_hours_ago, expected):
+    """48 ч — от DATE_CREATE сделки, а не от момента, когда робот её увидел (робот стоял, опрос отстал)."""
+    bitrix.created = ago(hours=created_hours_ago) if created_hours_ago is not None else None
+    assert start_deal(running, bitrix, 150)["status"] == expected
+
+
 # ---------- первое сообщение ----------
 
 def test_first_message_substitutes_name_and_title(running, bitrix, orbita):
