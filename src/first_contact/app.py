@@ -122,7 +122,24 @@ def create_app(worker: Worker) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        # Старый адрес проверки из первых версий образа; новые — /healthz и /ready
         return {"ok": True, "enabled": worker.s.enabled}
+
+    @app.get("/healthz")
+    async def healthz():
+        """Liveness: процесс отвечает. Зависимости не проверяет — иначе сбой базы перезапускал бы сервис."""
+        return {"ok": True}
+
+    @app.get("/ready")
+    async def ready():
+        """Readiness: база открывается и читается. Битрикс и Орбита — внешние сервисы, их сбой не делает
+        робота неготовым: сделки дождутся в очереди, а панель должна открываться."""
+        try:
+            worker.db.conn.execute("SELECT 1 FROM deals LIMIT 1").fetchall()
+        except Exception as ex:  # noqa: BLE001
+            log.error("ready: база недоступна: %s", ex)
+            return Response(status_code=503)
+        return {"ok": True}
 
     app.include_router(build_router(ctx))
     app.include_router(build_settings_router(ctx))
