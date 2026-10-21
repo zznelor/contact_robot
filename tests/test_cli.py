@@ -66,3 +66,36 @@ def test_robot_command_holds_database_while_it_works(args):
         hang.close()
         proc.wait(timeout=30)
     assert not free, "пока команда работает, замок базы занят"
+
+
+def backup_with_marker(tmp_path, marker: str):
+    """Копия базы, где в kv лежит marker."""
+    copy = DB(tmp_path / "copy.sqlite3")
+    copy.put("marker", marker)
+    copy.conn.close()
+    return tmp_path / "copy.sqlite3"
+
+
+def test_restore_refuses_while_service_holds_database(tmp_path):
+    """Сервис работает с базой: restore её не подменяет — иначе работающий робот продолжил бы на чужом состоянии
+    (сделка, получившая первое сообщение после копии, снова «новая»)."""
+    path = config.env().db_path
+    live = DB(path)
+    live.put("marker", "live")
+    live.conn.close()
+    copy = backup_with_marker(tmp_path, "copy")
+    held = service_lock(path)
+    try:
+        r = cli("restore", str(copy))
+    finally:
+        held.close()
+    assert r.returncode != 0
+    assert DB(path).get("marker") == "live"
+
+
+def test_restore_replaces_database_when_service_stopped(tmp_path):
+    path = config.env().db_path
+    DB(path).conn.close()
+    r = cli("restore", str(backup_with_marker(tmp_path, "copy")))
+    assert r.returncode == 0
+    assert DB(path).get("marker") == "copy"

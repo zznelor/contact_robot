@@ -8,7 +8,7 @@
   python -m first_contact create-admin ПОЧТА   — создать администратора (пароль спросит)
   python -m first_contact reset-password ПОЧТА — задать новый пароль пользователю
   python -m first_contact backup               — копия базы рядом с ней: backup-ГГГГ-ММ-ДД.sqlite3
-  python -m first_contact restore ФАЙЛ         — заменить базу копией (потом перезапустить сервис)
+  python -m first_contact restore ФАЙЛ         — заменить базу копией (только при остановленном сервисе)
 """
 
 import asyncio
@@ -73,15 +73,18 @@ def _ask_password() -> str:
 
 BUSY = ("Робот уже работает с этой базой (запущен сервис). Остановите сервис или нажмите "
         "«Выполнить сейчас» в панели.")
+RESTORE_BUSY = ("Робот работает с этой базой (запущен сервис) — подменять её под ним нельзя. Остановите сервис "
+                "(docker compose stop app) и восстановите копию отдельным запуском: "
+                "docker compose run --rm app python -m first_contact restore ФАЙЛ")
 
 
-def _hold_robot(w: Worker):
+def _hold_robot(w: Worker, busy: str = BUSY):
     """Замок робота на базу (db.service_lock) или выход с кодом 1: второй процесс робота на той же базе
     отправлял бы и писал статусы мимо замка сервиса. Возвращает открытый файл замка — держать его
     (`with _hold_robot(w): …`) всё время работы команды: закрытие файла отпускает замок."""
     held = service_lock(w.env.db_path)
     if held is None:
-        print(BUSY, file=sys.stderr)
+        print(busy, file=sys.stderr)
         sys.exit(1)
     return held
 
@@ -134,9 +137,14 @@ def main() -> None:
         if not src.exists():
             print(f"Нет файла {src}")
             sys.exit(1)
-        with sqlite3.connect(src) as source:
-            source.backup(w.db.conn)
-        print("База заменена копией. Перезапустите сервис: docker compose restart app")
+        # Под замком робота: работающий сервис продолжил бы проход на подменённой базе (сделка, получившая первое
+        # сообщение после копии, снова «новая», шаг пишет результат по прежнему снимку строки)
+        with _hold_robot(w, RESTORE_BUSY):
+            with sqlite3.connect(src) as source:
+                source.backup(w.db.conn)
+        print("База заменена копией. Запустите сервис: docker compose start app\n"
+              "Сделки, которые робот обработал после момента копии, в ней — в прежнем состоянии, и робот обработает "
+              "их заново (теми же ключами идемпотентности). Проверьте переписку в Орбите по сделкам после даты копии.")
     elif cmd == "run":
         import uvicorn
         from .app import create_app
