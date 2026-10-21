@@ -61,6 +61,19 @@ CREATE TABLE IF NOT EXISTS orbita_events (
     dialog_id  TEXT,
     done_at    TEXT
 );
+-- Исходы отправок Орбиты по request_key (вебхуки message.sent / message.failed на отправки с ответом 202).
+-- Исход сопоставляется с отправкой по ключу, а не по статусу сделки: применяется сразу, если ключ уже записан
+-- в сделку (request_key / followup_request_key / reply_request_key), иначе ждёт здесь, и запись ключа сверяется
+-- с ним той же транзакцией. applied_at пуст — исход ещё не нашёл свою отправку. Хранится EVENTS_KEEP по at.
+CREATE TABLE IF NOT EXISTS send_outcomes (
+    request_key TEXT PRIMARY KEY,
+    ok          INTEGER NOT NULL,      -- 1 — message.sent, 0 — message.failed
+    reason      TEXT,                  -- reason_code отказа
+    dialog_id   TEXT,
+    sent_at     TEXT,                  -- момент отправки из события, как прислала Орбита
+    at          TEXT NOT NULL,         -- когда принят
+    applied_at  TEXT
+);
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     at      TEXT NOT NULL,
@@ -260,11 +273,43 @@ class DB:
         self.conn.execute(f"UPDATE deals SET {cols} WHERE deal_id=?", (*fields.values(), deal_id))
 
     def deal_by(self, column: str, value) -> sqlite3.Row | None:
-        if column not in ("dialog_id", "request_key", "followup_request_key", "reply_request_key"):
+        if column != "dialog_id":
             raise ValueError(column)
         return self.conn.execute(
             f"SELECT * FROM deals WHERE {column}=? ORDER BY deal_id DESC LIMIT 1", (str(value),)
         ).fetchone()
+
+    # ---------- исходы отправок по request_key ----------
+
+    # Шаг → колонка request_key отправки этого шага, ждущей исхода (ответ Орбиты 202)
+    SEND_KEYS = {"first": "request_key", "followup": "followup_request_key", "reply": "reply_request_key"}
+
+    def deal_by_send_key(self, request_key: str) -> tuple[sqlite3.Row, str] | None:
+        """Сделка и шаг (first / followup / reply), чья отправка с этим request_key ждёт исхода."""
+        for step, col in self.SEND_KEYS.items():
+            row = self.conn.execute(f"SELECT * FROM deals WHERE {col}=? ORDER BY deal_id DESC LIMIT 1",
+                                    (str(request_key),)).fetchone()
+            if row is not None:
+                return row, step
+        return None
+
+    def save_outcome(self, request_key: str, ok: bool, reason: str | None, dialog_id: str | None,
+                     sent_at: str | None) -> None:
+        """Сохранить исход отправки (последний по ключу) как ещё не применённый."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO send_outcomes (request_key, ok, reason, dialog_id, sent_at, at, applied_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, NULL)", (str(request_key), int(ok), reason, dialog_id, sent_at, now()))
+
+    def outcome(self, request_key: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM send_outcomes WHERE request_key=?", (str(request_key),)).fetchone()
+
+    def outcome_applied(self, request_key: str) -> None:
+        self.conn.execute("UPDATE send_outcomes SET applied_at=? WHERE request_key=?", (now(), str(request_key)))
+
+    def purge_outcomes(self, before: str) -> int:
+        """Удалить исходы, принятые раньше before (применённые и так и не нашедшие отправку — например, исходы
+        тестовых сообщений из настроек или чужих отправок тем же ключом API)."""
+        return self.conn.execute("DELETE FROM send_outcomes WHERE at<?", (before,)).rowcount
 
     # ---------- входящие события Орбиты ----------
 

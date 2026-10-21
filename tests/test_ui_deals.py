@@ -1,5 +1,7 @@
 """Панель: список и карточка сделки, ручные действия, шаги робота по кнопке, поиск."""
 
+import re
+
 import pytest
 
 from conftest import run
@@ -74,3 +76,24 @@ def test_search_and_counter_over_whole_base(deals, admin):
     rows, total = db.find()
     assert (len(rows), total) == (300, 1202)
     assert "1202" in admin.get("/").text, "«показано из» — по всей базе"
+
+
+def retry_hint(admin, deal_id: int) -> str:
+    """Подсказка у кнопки «Повторить» в карточке сделки."""
+    page = admin.get(f"/deal/{deal_id}").text
+    m = re.search(rf'action="/deal/{deal_id}/retry"><button[^>]*>[^<]*</button> <span class="small muted">([^<]*)<', page)
+    assert m, "кнопка «Повторить» есть"
+    return m.group(1)
+
+
+def test_retry_warns_of_second_first_message_while_send_unconfirmed(deals, admin):
+    """Первое сообщение передано (202) и не подтверждено, сделку остановили: повтор пойдёт новым ключом — панель
+    предупреждает о возможном втором сообщении так же, как при «проверить вручную»."""
+    db = deals.db
+    db.add_deal(43)
+    db.update(43, status="needs_check", last_error="нет подтверждения отправки от Орбиты")
+    db.add_deal(44)
+    db.update(44, status="skipped", request_key="rk-44", last_error="остановлено вручную")
+    db.add_deal(45)
+    db.update(45, status="skipped", last_error="другая воронка")
+    assert retry_hint(admin, 44) == retry_hint(admin, 43) != retry_hint(admin, 45)

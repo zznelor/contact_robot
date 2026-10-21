@@ -250,7 +250,9 @@ def build_router(ctx: Ctx) -> APIRouter:
         if r["status"] in RETRYABLE:
             hint = ("Робот продолжит с того места, где остановился" if r["first_sent_at"] else
                     "Вернуть в очередь: робот ещё раз попробует написать первым")
-            if r["status"] == "needs_check" and not r["first_sent_at"]:
+            # Исход первой отправки неизвестен («проверить вручную») или передана с 202 и не подтверждена (ключ
+            # ждёт исхода в любом статусе, например после «Остановить»): повтор идёт новым ключом
+            if not r["first_sent_at"] and (r["status"] == "needs_check" or r["request_key"]):
                 hint = ("Сначала откройте переписку в Орбите: если первое сообщение дошло, "
                         "повтор отправит его второй раз")
             actions.append(_btn(deal_id, "retry", "Повторить", "primary", hint))

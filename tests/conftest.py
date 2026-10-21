@@ -123,7 +123,8 @@ class FakeBitrix:
 class FakeOrbita:
     """Орбита: mode — sent | none (номера нигде нет) | boom (Орбита отказала, 503).
     connected — подключённые каналы (по умолчанию все); answers[канал] — исход в этом канале вместо mode
-    (ещё pending — 202, reused — 422 idempotency_key_reused)."""
+    (ещё pending — 202, reused — 422 idempotency_key_reused, lost — Орбита приняла запрос, а ответ до робота
+    не дошёл)."""
 
     def __init__(self):
         self.mode = "sent"
@@ -149,6 +150,8 @@ class FakeOrbita:
         if how in ("not_found", "unchecked", "invalid_phone"):
             return FirstSendResult(how, channel=channel, raw=how)
         self.first.append((phone, text, key))
+        if how == "lost":
+            raise OrbitaError("POST /dialogs: ReadTimeout: ответ не дошёл")
         if how == "pending":
             return FirstSendResult("pending", None, channel, request_key=f"rk-{key}")
         return FirstSendResult("sent", "D1", channel)

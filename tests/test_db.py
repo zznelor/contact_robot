@@ -106,3 +106,17 @@ def test_step_key_saved_without_text_is_repeated(bitrix, orbita):
     (_, text, key), = orbita.replies
     assert key == "deal-301-followup"
     assert w.db.deal(301)["followup_text"] == text
+
+
+def test_old_unconfirmed_first_message_in_needs_check_accepts_late_confirmation(bitrix, orbita):
+    """Установка 1b52a60: таймаут подтверждения первого сообщения уже поставил «проверить вручную» (момента передачи
+    та версия не хранила). После обновления исход этой отправки находит её по request_key; таблица исходов
+    отправок появляется сама."""
+    sent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+    old_install(deal_id=302, status="needs_check", phone=PHONE, channel="whatsapp", request_key="rk-302",
+                last_error="нет подтверждения отправки от Орбиты", created_at=sent, updated_at=sent)
+    w = robot_on(bitrix, orbita)
+    run(w.on_orbita_event({"type": "message.sent", "data": {"request_key": "rk-302", "dialog_id": 6,
+                                                            "sent_at": sent}}))
+    row = w.db.deal(302)
+    assert (row["status"], row["dialog_id"], row["first_sent_at"]) == ("sent_first", "6", sent)
