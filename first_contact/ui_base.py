@@ -123,6 +123,14 @@ dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dt{c
 .hint{font-size:12px;color:var(--muted)}
 """
 
+# Сохранение в настройках ждёт ответа Битрикса и Орбиты (1–3 с). Повторное нажатие обрывало запрос,
+# и «Сохранено» не появлялось: после первого нажатия кнопка блокируется до ответа.
+JS = """document.addEventListener("submit",function(ev){var f=ev.target,b=ev.submitter;
+if(f.dataset.busy){ev.preventDefault();return}f.dataset.busy="1";
+if(b&&b.tagName==="BUTTON")setTimeout(function(){b.disabled=true;b.dataset.label=b.textContent;b.textContent="Подождите…"},0)});
+window.addEventListener("pageshow",function(){document.querySelectorAll("form[data-busy]").forEach(function(f){delete f.dataset.busy});
+document.querySelectorAll("button[data-label]").forEach(function(b){b.disabled=false;b.textContent=b.dataset.label;delete b.dataset.label})});"""
+
 
 def shell(title: str, body: str, *, nav: str = "", me: str = "", narrow: bool = False) -> HTMLResponse:
     head = f'<header><b>Робот первого контакта</b><nav>{nav}</nav>{me}</header>' if nav or me else ""
@@ -130,7 +138,7 @@ def shell(title: str, body: str, *, nav: str = "", me: str = "", narrow: bool = 
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(title)} · Первый контакт</title>
 <meta name="referrer" content="same-origin">
 <style>{CSS}</style></head><body>{head}
-<main class="{'narrow' if narrow else ''}">{body}</main></body></html>""")
+<main class="{'narrow' if narrow else ''}">{body}</main><script>{JS}</script></body></html>""")
 
 
 def flash_html(msg: str) -> str:
