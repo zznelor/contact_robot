@@ -712,6 +712,21 @@ def test_client_reply_after_reminder_timeout_counts(running, bitrix, orbita):
     assert [k for _, _, k in orbita.replies] == ["deal-178-followup", "deal-178-reply"]
 
 
+def test_late_failure_of_reminder_not_resent_after_retry_keeps_verdict(running, bitrix, orbita, clock):
+    """«Повторить» после таймаута подтверждения напоминания, а напоминания тем временем выключили: итог
+    «не ответил» без повторной отправки. Поздний message.failed прежней отправки этот итог не отменяет —
+    напоминание в нём не учтено."""
+    passed_without_confirmation(running, bitrix, orbita, "followup", 179)
+    clock.advance(minutes=31)
+    run(running.tick())
+    run(running.retry(179, "a@x.ru"))
+    running.s.followup_on = False
+    run(running.tick())
+    assert running.db.deal(179)["status"] == "no_reply"
+    run(running.on_orbita_event(event("message.failed", request_key="rk-deal-179-followup", reason_code="send_failed")))
+    assert running.db.deal(179)["status"] == "no_reply"
+
+
 def test_late_reminder_confirmation_does_not_undo_client_reply(running, bitrix, orbita, clock):
     """Напоминание и ответ по шаблону переданы (202), клиент между ними ответил; ответ по шаблону не подтвердили
     за 30 минут. Позднее подтверждение напоминания не возвращает сделку в «отправлено напоминание»."""

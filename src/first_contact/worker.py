@@ -927,8 +927,11 @@ class Worker:
                 # Человек уже решил повторить: прежняя отправка точно не ушла — повтор пойдёт новым ключом (с прежним
                 # Орбита вернула бы этот же отказ); статус и срок ответа не трогаем
                 fields[f"{step}_retry_n"] = (row[f"{step}_retry_n"] or 0) + 1
+            # Итог «не ответил» снимается, только если в нём учтено это напоминание (followup_sent_at): итог,
+            # вынесенный после «Повторить» без повторной отправки, на прежнем напоминании не основан
             act = mine and not retrying and (row["status"] in (waiting, "needs_check")
-                                             or (step == "followup" and row["status"] == "no_reply"))
+                                             or (step == "followup" and row["status"] == "no_reply"
+                                                 and row["followup_sent_at"]))
             if act:
                 fields.update(status="needs_check", last_error=f"{title} не доставлен(о): {reason}")
                 if step == "followup":
