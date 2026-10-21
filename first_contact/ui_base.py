@@ -105,7 +105,6 @@ form.inline{display:inline}
 input[type=search],input[type=password],input[type=text],input[type=email],input[type=tel],input[type=number],input[type=time],select,textarea{
 font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 10px;max-width:100%}
 .field{display:grid;gap:4px;margin:0 0 12px}.field>span{font-weight:500}.field input:not([type=checkbox]),.field select,.field textarea{width:100%}
-.secret:not(:placeholder-shown){-webkit-text-security:disc;text-security:disc}
 .check{display:flex;gap:8px;align-items:flex-start;margin:0 0 8px}
 textarea{width:100%;min-height:96px;font:14px/1.5 system-ui,-apple-system,sans-serif}
 code{font:12px ui-monospace,Menlo,monospace;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 4px;word-break:break-all}
