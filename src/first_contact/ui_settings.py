@@ -8,11 +8,12 @@ import json
 import time
 from zoneinfo import ZoneInfo, available_timezones
 
+import httpx
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 
 from .auth import ROLES
-from .bitrix import Bitrix, normalize_phone
+from .bitrix import Bitrix, BitrixError, normalize_phone
 from .config import CHANNEL_RU, CHANNELS
 from .orbita_api import OrbitaAPI
 from .ui_base import Ctx, e, go, mask
@@ -258,32 +259,35 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
             changes["bitrix_app_token"] = ""
         msg = "Сохранено"
         current_cat = s.category
-        try:
-            if webhook:
-                # Новый адрес — списки воронок и этапов на странице были от старого; оставляем этап, если он есть и тут
+        if webhook:
+            # Новый адрес — списки воронок и этапов на странице были от старого; оставляем этап, если он есть и тут
+            try:
                 stages = dict(await client.stages(current_cat))
-                if s.no_messenger_stage not in stages:
-                    changes["no_messenger_stage"] = ""
-                    msg = "Битрикс подключён. Теперь выберите этап «Не нашёл мессенджер»"
-            elif client and category is not None:
-                if category != current_cat:
-                    changes["deal_category_id"] = category
-                    changes["no_messenger_stage"] = ""
-                    msg = "Воронка сменена — выберите этап «Не нашёл мессенджер» для неё"
-                elif stage:
-                    if stage in dict(await client.stages(category)):
-                        changes["deal_category_id"] = category
-                        changes["no_messenger_stage"] = stage
-                    else:
-                        msg = "!Такого этапа нет в выбранной воронке"
-                else:
-                    msg = "!Выберите этап «Не нашёл мессенджер»" if not s.no_messenger_stage else msg
-        except Exception as ex:  # noqa: BLE001
-            if webhook:   # адрес рабочий (max_deal_id прошёл), а этапы не получили — сохраняем адрес, этап выберут позже
+            except (BitrixError, httpx.HTTPError) as ex:
+                # Адрес рабочий (max_deal_id прошёл), а этапы не получили — сохраняем адрес, этап выберут позже
                 changes["no_messenger_stage"] = ""
                 msg = f"!Адрес сохранён, но Битрикс не отдал этапы воронки: {ex}. Обновите страницу и выберите этап"
             else:
-                return go("/settings#bitrix", f"!Битрикс не отдал этапы воронки: {ex}")
+                if s.no_messenger_stage not in stages:
+                    changes["no_messenger_stage"] = ""
+                    msg = "Битрикс подключён. Теперь выберите этап «Не нашёл мессенджер»"
+        elif client and category is not None:
+            if category != current_cat:
+                changes["deal_category_id"] = category
+                changes["no_messenger_stage"] = ""
+                msg = "Воронка сменена — выберите этап «Не нашёл мессенджер» для неё"
+            elif stage:
+                try:
+                    stages = dict(await client.stages(category))
+                except (BitrixError, httpx.HTTPError) as ex:
+                    return go("/settings#bitrix", f"!Битрикс не отдал этапы воронки: {ex}")
+                if stage in stages:
+                    changes["deal_category_id"] = category
+                    changes["no_messenger_stage"] = stage
+                else:
+                    msg = "!Такого этапа нет в выбранной воронке"
+            else:
+                msg = "!Выберите этап «Не нашёл мессенджер»" if not s.no_messenger_stage else msg
         worker.save(**changes)
         worker.event(None, "настройки Битрикса изменены", user["email"])
         return go("/settings#bitrix", msg)
@@ -403,6 +407,11 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
         if worker.orbita is None:
             return go("/settings#test", "!Сначала подключите Орбиту")
         text = worker.render("first", name.strip(), SAMPLE_TITLE)
+        if worker.dry_run:
+            result = f"{p}: DRY_RUN — не отправлено (отправил бы: {text!r})"
+            db.put("test_result", result)
+            worker.event(None, "DRY_RUN: тест не отправлен", p)
+            return go("/settings#test", "!" + result)
         try:
             res = await worker.orbita.send_first(p, text, f"test-{int(time.time())}-{p}", name.strip() or None)
         except Exception as ex:  # noqa: BLE001

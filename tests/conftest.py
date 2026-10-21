@@ -17,7 +17,7 @@ from first_contact import orbita_api as orbita_api_mod
 from first_contact import worker as worker_mod
 from first_contact.app import create_app
 from first_contact.auth import SESSION_COOKIE, Users
-from first_contact.bitrix import Deal
+from first_contact.bitrix import BitrixError, Deal
 from first_contact.db import DB
 from first_contact.orbita import FirstSendResult, OrbitaError, ReplyResult
 from first_contact.worker import Worker
@@ -325,6 +325,8 @@ class PanelBitrix:
         return [("0", "Общая"), ("3", "Китай")]
 
     async def stages(self, category_id):
+        if "nostages" in self.webhook:
+            raise BitrixError("crm.status.list: ACCESS_DENIED")
         if category_id == "0":
             return [("NEW", "Новая"), ("NO_MESSENGER", "Не нашёл мессенджер")]
         return [("C3:NEW", "Новая"), ("C3:LOST", "Не дозвонились")]

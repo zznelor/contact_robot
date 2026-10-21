@@ -40,6 +40,14 @@ def test_bitrix_webhook_saved_stage_not_yet(panel, admin):
     assert "rest/1/good" not in page, "вебхук целиком не показан"
 
 
+def test_bitrix_webhook_saved_when_stages_unavailable(panel, admin):
+    """Адрес рабочий, а этапы Битрикс не отдал — адрес сохраняется, этап выбирают позже."""
+    r = admin.post("/settings/bitrix", data={"webhook": "https://p.bitrix24.ru/rest/1/nostages"},
+                   follow_redirects=False)
+    assert is_error(r)
+    assert panel.s.bitrix_webhook == "https://p.bitrix24.ru/rest/1/nostages/" and not panel.s.no_messenger_stage
+
+
 def test_bitrix_stage_and_funnel(panel, admin):
     admin.post("/settings/bitrix", data={"webhook": GOOD_WEBHOOK})
     admin.post("/settings/bitrix", data={"category": "0", "stage": "NO_MESSENGER"})
@@ -172,3 +180,11 @@ def test_disconnect_orbita_and_bitrix(configured, admin):
     admin.post("/settings/bitrix/disconnect")
     assert not configured.s.bitrix_webhook and not configured.s.no_messenger_stage
     assert onboarding_shown(admin)
+
+
+def test_test_message_not_sent_in_dry_run(configured, admin, monkeypatch):
+    """DRY_RUN — «ничего не отправлять»: тестовое сообщение тоже не уходит и шаг подключения не засчитан."""
+    monkeypatch.setattr(configured.worker.env, "dry_run", True)
+    r = admin.post("/settings/test", data={"phone": "8 999 000-00-01"}, follow_redirects=False)
+    assert is_error(r)
+    assert PanelOrbita.sent == [] and not configured.db.get("test_sent_at")
