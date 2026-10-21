@@ -280,6 +280,21 @@ class Worker:
                 return
             row = self.db.deal(deal_id)
             attempts = (row["attempts"] if row else 0) + 1
+            if getattr(e, "deal_missing", False):
+                # Сделку удалили в Битриксе: работы нет, комментарий оставить некуда
+                self.db.update(deal_id, status="skipped", attempts=attempts, last_error=f"сделки нет в Битриксе: {e}")
+                self.event(deal_id, "пропущена", f"сделки нет в Битриксе (удалена?): {e}")
+                return
+            if getattr(e, "permanent", False):
+                # Повтор не исправит (нет прав у пользователя вебхука, вебхук удалён, нет scope): сразу к человеку,
+                # не через пять пауз. «Повторить» вернёт сделку, когда права поправят
+                self.db.update(deal_id, attempts=attempts, status="error", next_attempt_at=None,
+                               last_error=f"{type(e).__name__}: {e} — повтор не поможет")
+                self.event(deal_id, "ошибка", f"повтор не поможет: {e}")
+                log.error("сделка %s: ошибка, которую повтор не исправит: %s: %s", deal_id, type(e).__name__, e)
+                await self.note(deal_id, f"Не смог обработать заявку: {e}. Повтор не поможет — проверьте права "
+                                         "пользователя вебхука в Битриксе, затем «Повторить» в панели робота.")
+                return
             status = "error" if attempts >= MAX_ATTEMPTS else (row["status"] if row else "new")
             pause = datetime.now(timezone.utc) + RETRY_PAUSE * 2 ** (attempts - 1)
             self.db.update(deal_id, attempts=attempts, last_error=f"{type(e).__name__}: {e}", status=status,
@@ -602,11 +617,17 @@ class Worker:
                 return
             await self.bitrix.set_stage(deal_id, before)
         except Exception as e:  # noqa: BLE001
+            retry_at = getattr(e, "retry_at", None)
+            if retry_at is not None:
+                # Лимит Битрикса назвал срок — ждём его, попытку возврата не тратим
+                self.db.update(deal_id, stage_retry_at=retry_at.isoformat(timespec="seconds"))
+                self.event(deal_id, "возврат этапа отложен", f"до {retry_at.isoformat(timespec='seconds')}: {e}")
+                return
             attempts = (row["stage_attempts"] or 0) + 1
             log.error("сделка %s: не удалось вернуть этап %s (попытка %s): %s: %s", deal_id, before, attempts,
                       type(e).__name__, e, exc_info=e)
             self.event(deal_id, "не удалось вернуть этап", f"{before}, попытка {attempts}: {type(e).__name__}: {e}")
-            if attempts >= MAX_ATTEMPTS:
+            if attempts >= MAX_ATTEMPTS or getattr(e, "permanent", False):
                 self.db.update(deal_id, **done)
                 await self.note(deal_id, f"Первое сообщение ушло, но вернуть сделку с этапа «Не нашёл мессенджер» "
                                          f"на прежний ({before}) не удалось — верните вручную.")

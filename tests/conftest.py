@@ -13,6 +13,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from first_contact import bitrix as bitrix_mod
 from first_contact import config, ui_settings
 from first_contact import orbita_api as orbita_api_mod
 from first_contact.orbita_api import OrbitaAPIError
@@ -246,7 +247,8 @@ def async_panel(w: Worker, role: str = "admin"):
 
 
 class Clock:
-    """Часы робота (worker.datetime), которые можно перевести вперёд: паузы между попытками без ожидания."""
+    """Часы робота (worker.datetime) и клиента Битрикса (bitrix.datetime — паузы после ошибок лимитов), которые можно
+    перевести вперёд: паузы между попытками без ожидания."""
 
     def __init__(self):
         self.shift = timedelta(0)
@@ -264,6 +266,7 @@ def clock(monkeypatch) -> Clock:
         def now(cls, tz=None):
             return datetime.now(tz) + c.shift
     monkeypatch.setattr(worker_mod, "datetime", Shifted)
+    monkeypatch.setattr(bitrix_mod, "datetime", Shifted)
     return c
 
 

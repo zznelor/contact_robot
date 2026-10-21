@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -11,8 +11,65 @@ import httpx
 PAGE = 50
 
 
+# Ошибки лимитов (_includes/system-errors.md, settings/performance/limits.md): повтор поможет, но позже, и попытку
+# он не тратит. QUERY_LIMIT_EXCEEDED — интенсивность запросов ко всему порталу (общая для приложений с одного IP):
+# «повторять вызовы с увеличивающейся задержкой». OPERATION_TIME_LIMIT — ресурсоёмкость одного метода для вебхука:
+# пауза до operating_reset_at последнего успешного ответа этого метода, нет его — та же нарастающая задержка
+LIMIT_CODES = {"QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT"}
+# Задержка после отказа по лимиту: 1, 2, 4 … мин, не больше 30. Счётчик опустошается на 2 запроса в секунду при
+# пороге 50 (тариф «Прочие», limits.md) — минута с запасом; рост — на случай соседей по IP с тем же порталом
+LIMIT_PAUSE = timedelta(minutes=1)
+LIMIT_PAUSE_MAX = timedelta(minutes=30)
+# Повтор не поможет: нет доступа, вебхук не найден или без нужных прав, метода нет, портал закрыт
+# (_includes/system-errors.md; NOT_FOUND / ACCESS_DENIED — crm.timeline.comment.add, crm.deal.contact.items.get).
+# OVERLOAD_LIMIT — «ручная индивидуальная блокировка», снимает только поддержка Битрикса, ожиданием не проходит
+PERMANENT_CODES = {"NO_AUTH_FOUND", "INVALID_REQUEST", "OVERLOAD_LIMIT", "ACCESS_DENIED", "INVALID_CREDENTIALS",
+                   "ERROR_METHOD_NOT_FOUND", "insufficient_scope", "expired_token", "user_access_error",
+                   "PORTAL_DELETED", "NOT_FOUND"}
+# Ошибки уровня метода приходят с пустым кодом, причина — только в error_description (_includes/error-info.md):
+# «Not found» и «Access denied» у crm.deal.get / update, crm.contact.get, crm.deal.contact.items.get. Другой текст
+# (например, перевод) — обычный сбой с повторами: так безопаснее, чем принять сбой за окончательный
+NOT_FOUND_TEXTS = {"not found"}
+ACCESS_DENIED_TEXTS = {"access denied"}
+# Методы, чьё «Not found» значит: сделки нет (удалили)
+DEAL_METHODS = {"crm.deal.get", "crm.deal.update", "crm.deal.contact.items.get"}
+
+
+def _text(description) -> str:
+    return str(description or "").strip().rstrip(".!").strip().lower()
+
+
 class BitrixError(RuntimeError):
-    pass
+    """Отказ или сбой Битрикса. retry_at — ошибка лимита: раньше этого срока вызывать бессмысленно (попытку шага не
+    тратит); permanent — повтор не исправит (доступ, адрес вебхука, удалённая запись)."""
+
+    def __init__(self, message: str, method: str = "", code: str = "", description: str = "",
+                 retry_at: datetime | None = None):
+        super().__init__(message)
+        self.method, self.code, self.description, self.retry_at = method, code, description, retry_at
+
+    @property
+    def not_found(self) -> bool:
+        return self.code == "NOT_FOUND" or (not self.code and _text(self.description) in NOT_FOUND_TEXTS)
+
+    @property
+    def permanent(self) -> bool:
+        return self.code in PERMANENT_CODES or self.not_found or (
+            not self.code and _text(self.description) in ACCESS_DENIED_TEXTS)
+
+    @property
+    def deal_missing(self) -> bool:
+        """Сделки в Битриксе нет: удалили после появления."""
+        return self.not_found and self.method in DEAL_METHODS
+
+
+def _reset_at(data: dict) -> datetime | None:
+    """operating_reset_at из объекта time ответа (timestamp; api-reference/data-types.md#time)."""
+    t = data.get("time")
+    try:
+        return datetime.fromtimestamp(float(t["operating_reset_at"]), timezone.utc)
+    except (TypeError, KeyError, ValueError, OverflowError):
+        return None
 
 
 @dataclass
@@ -55,8 +112,19 @@ class Bitrix:
     def __init__(self, webhook: str, timeout: float = 30):
         self.webhook = webhook.rstrip("/") + "/"
         self.timeout = timeout
+        # Ошибки лимитов: до срока клиент в Битрикс не ходит («уменьшить частоту запросов», limits.md).
+        # "*" — весь портал (QUERY_LIMIT_EXCEEDED), имя метода — только он (OPERATION_TIME_LIMIT). → (срок, код)
+        self._blocked: dict[str, tuple[datetime, str]] = {}
+        self._limit_streak = 0                          # отказов по лимиту подряд: растёт задержка
+        self._reset_at: dict[str, datetime] = {}        # operating_reset_at последнего успешного ответа метода
 
     async def _raw(self, method: str, params: dict | None = None) -> dict:
+        now = datetime.now(timezone.utc)
+        for key in ("*", method):
+            until, code = self._blocked.get(key, (None, ""))
+            if until is not None and now < until:
+                raise BitrixError(f"{method}: {code} — вызовы Битрикса приостановлены до "
+                                  f"{until.isoformat(timespec='seconds')}", method, code, retry_at=until)
         # Соединение на вызов: нагрузка — единицы запросов в минуту, а адрес может смениться в панели
         async with httpx.AsyncClient(base_url=self.webhook, timeout=self.timeout) as http:
             r = await http.post(f"{method}.json", json=params or {})
@@ -66,9 +134,29 @@ class Bitrix:
             raise BitrixError(f"{method}: HTTP {r.status_code}, ответ не JSON — проверьте адрес вебхука") from None
         if not isinstance(data, dict) or "result" not in data and "error" not in data:
             raise BitrixError(f"{method}: HTTP {r.status_code}, неожиданный ответ")
-        if "error" in data:
-            raise BitrixError(f"{method}: {data['error']} {data.get('error_description', '')}")
-        return data
+        reset = _reset_at(data)
+        if "error" not in data:
+            self._limit_streak = 0
+            if reset is not None:
+                self._reset_at[method] = reset
+            return data
+        code, description = str(data["error"] or ""), str(data.get("error_description") or "")
+        retry_at = self._limit_wait(method, code, reset, now) if code in LIMIT_CODES else None
+        detail = f" — повтор после {retry_at.isoformat(timespec='seconds')}" if retry_at else ""
+        raise BitrixError(f"{method}: {code} {description}".rstrip() + detail, method, code, description, retry_at)
+
+    def _limit_wait(self, method: str, code: str, reset: datetime | None, now: datetime) -> datetime:
+        """Срок после ошибки лимита; запоминается, и до него клиент Битрикс не вызывает."""
+        self._limit_streak += 1
+        until = now + min(LIMIT_PAUSE * 2 ** (self._limit_streak - 1), LIMIT_PAUSE_MAX)
+        if code == "OPERATION_TIME_LIMIT":
+            # Срок сброса корзины — из этого ответа, если Битрикс его прислал, иначе из последнего успешного ответа
+            # метода. Уже прошёл (ошибка повторилась после него) — ждём следующий сброс нарастающей задержкой
+            known = next((t for t in (reset, self._reset_at.get(method)) if t is not None and t > now), None)
+            if known is not None:
+                until = known
+        self._blocked["*" if code == "QUERY_LIMIT_EXCEEDED" else method] = (until, code)
+        return until
 
     async def call(self, method: str, params: dict | None = None):
         return (await self._raw(method, params))["result"]
