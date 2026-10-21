@@ -1,10 +1,11 @@
 """Логика робота (worker.py) на подделках Битрикса и Орбиты. Эталон — docs/РАЗРАБОТЧИКУ.md."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from conftest import PHONE, UTC, ago, run, start_deal
+from conftest import PHONE, UTC, Gate, WatchedLock, ago, async_panel, first_of, run, start_deal
 from first_contact import config
 from first_contact import worker as worker_mod
 from first_contact.orbita import Message
@@ -47,7 +48,7 @@ def test_enable_remembers_last_deal_and_skips_older(worker, bitrix, orbita):
 
 
 def test_disable_stops_taking_new_deals(running, bitrix):
-    running.disable()
+    run(running.disable())
     bitrix.new_ids = [110]
     run(running.tick())
     assert running.db.deal(110) is None
@@ -132,7 +133,7 @@ def test_retry_after_no_messenger_sends_with_new_idempotency_key(running, bitrix
     assert bitrix.stage == "NO_MESSENGER"
 
     orbita.mode = "sent"
-    assert running.retry(120, "a@x.ru") == "new"
+    assert run(running.retry(120, "a@x.ru")) == "new"
     run(running.on_deal_added(120))
 
     row = running.db.deal(120)
@@ -144,7 +145,7 @@ def test_retry_after_no_messenger_sends_with_new_idempotency_key(running, bitrix
 def test_retry_rejected_for_deal_in_progress(running, bitrix):
     start_deal(running, bitrix, 120)
     with pytest.raises(ValueError):
-        running.retry(120, "a@x.ru")
+        run(running.retry(120, "a@x.ru"))
 
 
 def test_retry_after_failed_followup_does_not_resend_first(running, bitrix, orbita):
@@ -153,7 +154,7 @@ def test_retry_after_failed_followup_does_not_resend_first(running, bitrix, orbi
                       followup_due_at=ago(minutes=1).isoformat())
     orbita.history_items["D1"] = [out(ago(hours=1))]
 
-    assert running.retry(120, "a@x.ru") == "sent_first"
+    assert run(running.retry(120, "a@x.ru")) == "sent_first"
     run(running.tick())
 
     assert running.db.deal(120)["status"] == "sent_followup"
@@ -236,7 +237,7 @@ def test_reply_by_template_not_sent_twice(replying, bitrix, orbita, again):
         run(replying.on_orbita_event(event("message.received", dialog_id="D1", direction="incoming")))
     else:
         replying.db.update(102, status="error")
-        assert replying.retry(102, "a@x.ru") == "replied"
+        assert run(replying.retry(102, "a@x.ru")) == "replied"
     run(replying.tick())
     assert len(orbita.replies) == 1
 
@@ -390,3 +391,62 @@ def test_render_template_errors(tpl, error):
 def test_no_name_uses_fallback_greeting(worker):
     worker.s.tpl_first, worker.s.tpl_no_name = "{name}!", "Здравствуйте"
     assert worker.render("first", "") == "Здравствуйте!"
+
+
+# ---------- ручные действия во время шага робота ----------
+
+def test_stop_while_first_message_in_progress_wins(running, bitrix, orbita):
+    """«Остановить», нажатое, пока шаг ждёт Битрикс, не затирается результатом шага."""
+    async def scenario():
+        running.lock = WatchedLock()
+        gate = Gate(bitrix, "get_contact")
+        bitrix.new_ids.append(130)
+        async with async_panel(running) as panel:
+            tick = asyncio.create_task(running.tick())
+            await gate.entered.wait()
+            stop = asyncio.create_task(panel.post("/deal/130/stop"))
+            await first_of(stop, running.lock.contended.wait())
+            gate.opened.set()
+            await asyncio.gather(tick, stop)
+    run(scenario())
+    assert running.db.deal(130)["status"] == "skipped"
+    run(running.tick())
+    assert running.db.deal(130)["status"] == "skipped" and orbita.replies == []
+
+
+def test_client_replied_while_followup_in_progress_wins(running, orbita):
+    running.db.add_deal(131)
+    running.db.update(131, status="sent_first", dialog_id="D1", first_sent_at=ago(hours=25).isoformat(),
+                      followup_due_at=ago(minutes=1).isoformat())
+    orbita.history_items["D1"] = [out(ago(hours=25))]
+
+    async def scenario():
+        running.lock = WatchedLock()
+        gate = Gate(orbita, "history")
+        async with async_panel(running) as panel:
+            tick = asyncio.create_task(running.tick())
+            await gate.entered.wait()
+            replied = asyncio.create_task(panel.post("/deal/131/replied"))
+            await first_of(replied, running.lock.contended.wait())
+            gate.opened.set()
+            await asyncio.gather(tick, replied)
+    run(scenario())
+    assert running.db.deal(131)["status"] == "replied"
+
+
+def test_disable_during_pass_stops_remaining_deals(running, bitrix, orbita):
+    async def scenario():
+        running.lock = WatchedLock()
+        gate = Gate(bitrix, "get_contact")
+        bitrix.new_ids += [132, 133]
+        async with async_panel(running) as panel:
+            tick = asyncio.create_task(running.tick())
+            await gate.entered.wait()
+            off = asyncio.create_task(panel.post("/settings/disable"))
+            await first_of(off, running.lock.contended.wait())
+            gate.opened.set()
+            await asyncio.gather(tick, off)
+    run(scenario())
+    assert not running.s.enabled
+    assert running.db.deal(133)["status"] == "new"
+    assert [k for _, _, k in orbita.first] == [f"deal-132-first-{PHONE}"]

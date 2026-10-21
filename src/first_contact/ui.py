@@ -11,7 +11,6 @@ from .auth import (MIN_PASSWORD, SESSION_COOKIE, SESSION_DAYS, RateLimit, email_
                    same_origin)
 from .ui_base import (ORDER, STATUS_RU, TONE, Ctx, badge, e, flash_html, go, shell, when)
 from .config import CHANNEL_RU
-from .db import now
 from .worker import RETRYABLE
 
 
@@ -275,7 +274,7 @@ def build_router(ctx: Ctx) -> APIRouter:
         if not worker.s.enabled:
             return back(deal_id, "!Робот выключен — сначала включите его в настройках")
         try:
-            status = worker.retry(deal_id, user["email"])
+            status = await worker.retry(deal_id, user["email"])
         except ValueError:
             return back(deal_id, "!Эту сделку сейчас нельзя повторить")
         if status == "new":
@@ -285,33 +284,24 @@ def build_router(ctx: Ctx) -> APIRouter:
 
     @router.post("/deal/{deal_id}/replied")
     async def replied(deal_id: int, user=Depends(user_dep)):
-        r = db.deal(deal_id)
-        if r is None:
+        if not await worker.mark_replied(deal_id, user["email"]):
             return back(deal_id, "!Сделки нет в базе робота")
-        db.update(deal_id, status="replied", reply_due_at=None, client_replied_at=r["client_replied_at"] or now())
-        worker.event(deal_id, "вручную: клиент ответил", user["email"])
         return back(deal_id, "Отмечено: клиент ответил, робот больше не пишет")
 
     @router.post("/deal/{deal_id}/stop")
     async def stop(deal_id: int, user=Depends(user_dep)):
-        r = db.deal(deal_id)
-        if r is None:
+        if not await worker.stop(deal_id, user["email"]):
             return back(deal_id, "!Сделки нет в базе робота")
-        if r["status"] == "replied":
-            db.update(deal_id, reply_due_at=None)
-        else:
-            db.update(deal_id, status="skipped", last_error="остановлено вручную", reply_due_at=None)
-        worker.event(deal_id, "вручную: остановить", user["email"])
         return back(deal_id, "Робот остановлен по этой сделке")
 
     @router.post("/deal/{deal_id}/add")
     async def add(deal_id: int, user=Depends(user_dep)):
         if not worker.s.enabled:
             return back(deal_id, "!Робот выключен — сначала включите его в настройках")
-        db.add_deal(deal_id)
-        worker.event(deal_id, "вручную: взять в работу", user["email"])
-        await worker.on_deal_added(deal_id)
+        await worker.take(deal_id, user["email"])
         r = db.deal(deal_id)
+        if r is None:
+            return back(deal_id, "!Робот выключен или не настроен")
         return back(deal_id, f"Статус: {STATUS_RU.get(r['status'], r['status'])}")
 
     @router.post("/actions/tick")

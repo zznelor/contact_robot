@@ -172,6 +172,48 @@ def running(worker, bitrix):
     return worker
 
 
+class WatchedLock(asyncio.Lock):
+    """Замок робота, который сообщает, что кто-то встал в очередь за ним (contended)."""
+
+    def __init__(self):
+        super().__init__()
+        self.contended = asyncio.Event()
+
+    async def acquire(self):
+        if self.locked():
+            self.contended.set()
+        return await super().acquire()
+
+
+class Gate:
+    """Подмена асинхронного метода подделки: вызов останавливается, пока тест не откроет ворота."""
+
+    def __init__(self, obj, name: str):
+        self.entered, self.opened = asyncio.Event(), asyncio.Event()
+        original = getattr(obj, name)
+
+        async def gated(*a, **kw):
+            self.entered.set()
+            await self.opened.wait()
+            return await original(*a, **kw)
+        setattr(obj, name, gated)
+
+
+async def first_of(*aws) -> None:
+    """Дождаться первого из: завершения задачи / события."""
+    tasks = [a if isinstance(a, asyncio.Task) else asyncio.ensure_future(a) for a in aws]
+    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+
+def async_panel(w: Worker, role: str = "admin"):
+    """Клиент панели в том же цикле событий, что и робот (для одновременных действий)."""
+    import httpx
+    users = Users(w.db)
+    uid = users.create(f"{role}@x.ru", "password1", role)
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(w)), base_url="http://testserver",
+                             headers=ORIGIN, cookies={SESSION_COOKIE: users.new_session(uid)})
+
+
 def start_deal(w: Worker, bitrix: FakeBitrix, deal_id: int):
     """Новая сделка из Битрикса → проход робота. Возвращает строку сделки из базы."""
     bitrix.new_ids.append(deal_id)

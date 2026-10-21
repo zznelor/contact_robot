@@ -48,7 +48,12 @@ class Worker:
     def __init__(self, env: Env, s: Settings, db: DB, bitrix=None, orbita=None):
         self.env, self.s, self.db = env, s, db
         self.bitrix, self.orbita = bitrix, orbita
+        # lock — состояние сделок и флаг «включён»: каждый шаг по одной сделке, ручные действия панели,
+        # события Орбиты и включение/выключение идут под ним по очереди. Шаг держит замок от проверки
+        # статуса до записи результата, поэтому ручное действие ждёт текущий шаг (секунды), а не весь проход.
+        # _pass — проходы целиком (фоновый цикл и кнопки панели) не идут одновременно.
         self.lock = asyncio.Lock()
+        self._pass = asyncio.Lock()
         if bitrix is None and orbita is None:
             self.reconnect()
 
@@ -91,17 +96,24 @@ class Worker:
         log.info("сделка %s: %s %s", deal_id, name, detail)
         self.db.log(deal_id, name, detail)
 
+    @property
+    def active(self) -> bool:
+        return self.s.enabled and self.s.configured
+
     async def enable(self) -> int:
         """Включить робота. Сделки, созданные до включения, не трогаем."""
-        start = await self.bitrix.max_deal_id()
-        self.db.put("last_deal_id", start)
-        self.save(enabled=True)
-        self.event(None, "робот включён", f"сделки до ID {start} включительно не трогаем")
-        return start
+        async with self.lock:
+            start = await self.bitrix.max_deal_id()
+            self.db.put("last_deal_id", start)
+            self.save(enabled=True)
+            self.event(None, "робот включён", f"сделки до ID {start} включительно не трогаем")
+            return start
 
-    def disable(self) -> None:
-        self.save(enabled=False)
-        self.event(None, "робот выключен")
+    async def disable(self) -> None:
+        """Выключить. Ждёт шаг, который уже идёт по одной сделке; после возврата робот ничего не отправит."""
+        async with self.lock:
+            self.save(enabled=False)
+            self.event(None, "робот выключен")
 
     # ---------- цикл ----------
 
@@ -116,9 +128,9 @@ class Worker:
     }
 
     async def tick(self) -> None:
-        if not (self.s.enabled and self.s.configured):
+        if not self.active:
             return
-        async with self.lock:
+        async with self._pass:
             for step in self.STEPS:
                 await self._step(step, manual=False)
 
@@ -126,14 +138,18 @@ class Worker:
         """Один шаг прохода по кнопке из панели."""
         if step not in self.STEPS:
             raise KeyError(step)
-        if not (self.s.enabled and self.s.configured):
+        if not self.active:
             return
-        async with self.lock:
+        async with self._pass:
             await self._step(step, manual=True)
 
     async def _step(self, step: str, manual: bool) -> None:
+        # Замок берётся на каждую сделку (в _guarded и ниже), а не на весь проход: между сделками
+        # проходят ручные действия и события Орбиты, а выключение останавливает оставшуюся очередь.
         if step == "poll":
-            await self.poll_new_deals()
+            async with self.lock:
+                if self.active:
+                    await self.poll_new_deals()
         elif step == "first":
             for row in self.db.by_status("new"):
                 await self._guarded(row["deal_id"], self.first_contact)
@@ -144,12 +160,7 @@ class Worker:
                 await self._guarded(row["deal_id"], self.after_followup)
         elif step == "pending":
             for row in self.db.by_status("pending_first"):
-                if datetime.now(timezone.utc) - _ts(row["updated_at"]) > PENDING_TIMEOUT:
-                    self.db.update(row["deal_id"], status="needs_check",
-                                   last_error="нет подтверждения отправки от Орбиты")
-                    self.event(row["deal_id"], "нет подтверждения отправки", row["request_key"] or "")
-                    await self.note(row["deal_id"], "Орбита не подтвердила, что первое сообщение ушло. "
-                                                    "Проверьте переписку.")
+                await self._guarded(row["deal_id"], self.pending_timeout)
         elif step == "replies":
             # Сам — только без вебхуков и при ответе по шаблону; по кнопке — всегда и без паузы REPLY_POLL
             if manual or (self.s.reply_on and not self.s.orbita_webhook_secret):
@@ -160,12 +171,12 @@ class Worker:
 
     async def on_deal_added(self, deal_id: int) -> None:
         """Событие ONCRMDEALADD из Битрикса: обработать сразу, не дожидаясь опроса."""
-        if not (self.s.enabled and self.s.configured):
-            return
         async with self.lock:
+            if not self.active:
+                return
             if self.db.add_deal(deal_id):
                 self.event(deal_id, "новая сделка (событие)")
-            await self._guarded(deal_id, self.first_contact)
+            await self._attempt(deal_id, self.first_contact)
 
     async def poll_new_deals(self) -> None:
         """Подстраховка к событиям: события Битрикса теряются, опрос — нет."""
@@ -181,6 +192,13 @@ class Worker:
             self.db.put("last_deal_id", deal_id)
 
     async def _guarded(self, deal_id: int, step) -> None:
+        """Шаг по одной сделке под замком; робот выключили, пока шаг ждал очереди, — ничего не делаем."""
+        async with self.lock:
+            if self.active:
+                await self._attempt(deal_id, step)
+
+    async def _attempt(self, deal_id: int, step) -> None:
+        """Шаг с учётом ошибок. Вызывается под self.lock."""
         before = self.db.deal(deal_id)
         try:
             await step(deal_id)
@@ -202,13 +220,17 @@ class Worker:
             if before and after and after["attempts"] and after["status"] != before["status"]:
                 self.db.update(deal_id, attempts=0)
 
-    def retry(self, deal_id: int, who: str) -> str:
+    async def retry(self, deal_id: int, who: str) -> str:
         """«Повторить» из панели: вернуть сделку туда, где робот остановился. Возвращает новый статус.
 
         Первое сообщение не ушло — снова в очередь, с новым ключом идемпотентности (иначе Орбита
         вернёт прежний исход) и без проверки этапа «Не нашёл мессенджер» (его поставил сам робот).
         Ушло — ждём напоминание или итог; клиент ответил — ответ по шаблону, если он ещё нужен.
         """
+        async with self.lock:
+            return self._retry(deal_id, who)
+
+    def _retry(self, deal_id: int, who: str) -> str:
         row = self.db.deal(deal_id)
         if row is None or row["status"] not in RETRYABLE:
             raise ValueError("эту сделку сейчас нельзя повторить")
@@ -226,6 +248,52 @@ class Worker:
         self.db.update(deal_id, **fields)
         self.event(deal_id, "вручную: повторить", f"{who} → {status}")
         return status
+
+    async def stop(self, deal_id: int, who: str) -> bool:
+        """«Остановить робота» по сделке. False — сделки нет в базе.
+
+        Ждёт шаг по сделке, который уже идёт; после возврата робот по ней ничего не отправит."""
+        async with self.lock:
+            row = self.db.deal(deal_id)
+            if row is None:
+                return False
+            if row["status"] == "replied":
+                self.db.update(deal_id, reply_due_at=None)
+            else:
+                self.db.update(deal_id, status="skipped", last_error="остановлено вручную", reply_due_at=None)
+            self.event(deal_id, "вручную: остановить", who)
+            return True
+
+    async def mark_replied(self, deal_id: int, who: str) -> bool:
+        """«Клиент ответил» из панели: робот больше не пишет, ответ по шаблону не отправляется."""
+        async with self.lock:
+            row = self.db.deal(deal_id)
+            if row is None:
+                return False
+            self.db.update(deal_id, status="replied", reply_due_at=None,
+                           client_replied_at=row["client_replied_at"] or now())
+            self.event(deal_id, "вручную: клиент ответил", who)
+            return True
+
+    async def take(self, deal_id: int, who: str) -> None:
+        """«Взять в работу» из панели: сделка, которой нет в базе робота, — как новая."""
+        async with self.lock:
+            if not self.active:
+                return
+            self.db.add_deal(deal_id)
+            self.event(deal_id, "вручную: взять в работу", who)
+            await self._attempt(deal_id, self.first_contact)
+
+    async def pending_timeout(self, deal_id: int) -> None:
+        """202 на «написать первым», а исхода так и нет — зовём человека."""
+        row = self.db.deal(deal_id)
+        if row is None or row["status"] != "pending_first":
+            return
+        if datetime.now(timezone.utc) - _ts(row["updated_at"]) <= PENDING_TIMEOUT:
+            return
+        self.db.update(deal_id, status="needs_check", last_error="нет подтверждения отправки от Орбиты")
+        self.event(deal_id, "нет подтверждения отправки", row["request_key"] or "")
+        await self.note(deal_id, "Орбита не подтвердила, что первое сообщение ушло. Проверьте переписку.")
 
     # ---------- первое сообщение и «нет мессенджера» ----------
 
@@ -392,21 +460,28 @@ class Worker:
 
     async def poll_replies(self, force: bool = False) -> None:
         """Без вебхуков Орбиты: раз в REPLY_POLL смотрим историю свежих диалогов (force — не ждать паузу)."""
-        edge = datetime.now(timezone.utc) - REPLY_POLL
-        for row in self.db.by_status("sent_first", "sent_followup"):
-            sent = _ts(row["first_sent_at"])
-            if not row["dialog_id"] or not sent or datetime.now(timezone.utc) - sent > REPLY_POLL_DAYS:
-                continue
-            if not force and row["checked_at"] and _ts(row["checked_at"]) > edge:
-                continue
-            self.db.update(row["deal_id"], checked_at=now())
-            try:
-                replied = client_replied(await self.orbita.history(row["dialog_id"]), sent)
-            except Exception as e:  # noqa: BLE001
-                log.warning("сделка %s: история недоступна: %s", row["deal_id"], e)
-                continue
-            if replied:
-                await self._client_replied(row["deal_id"], "опрос")
+        for candidate in self.db.by_status("sent_first", "sent_followup"):
+            async with self.lock:
+                if self.active:
+                    await self._poll_reply(candidate["deal_id"], force)
+
+    async def _poll_reply(self, deal_id: int, force: bool) -> None:
+        row = self.db.deal(deal_id)
+        if row is None or row["status"] not in ("sent_first", "sent_followup"):
+            return
+        sent = _ts(row["first_sent_at"])
+        if not row["dialog_id"] or not sent or datetime.now(timezone.utc) - sent > REPLY_POLL_DAYS:
+            return
+        if not force and row["checked_at"] and _ts(row["checked_at"]) > datetime.now(timezone.utc) - REPLY_POLL:
+            return
+        self.db.update(deal_id, checked_at=now())
+        try:
+            replied = client_replied(await self.orbita.history(row["dialog_id"]), sent)
+        except Exception as e:  # noqa: BLE001
+            log.warning("сделка %s: история недоступна: %s", deal_id, e)
+            return
+        if replied:
+            await self._client_replied(deal_id, "опрос")
 
     async def auto_reply(self, deal_id: int) -> None:
         """Ответ клиенту по шаблону: один раз, если менеджер не успел ответить сам."""

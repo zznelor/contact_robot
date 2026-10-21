@@ -363,7 +363,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
     @router.post("/settings/bitrix/disconnect")
     async def disconnect_bitrix(user=Depends(admin_dep)):
         if worker.s.enabled:
-            worker.disable()
+            await worker.disable()
         worker.save(bitrix_webhook="", bitrix_app_token="", no_messenger_stage="", deal_category_id=None)
         worker.event(None, "Битрикс отключён", user["email"])
         return go("/settings#bitrix", "Битрикс отключён, робот выключен")
@@ -371,7 +371,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
     @router.post("/settings/orbita/disconnect")
     async def disconnect_orbita(user=Depends(admin_dep)):
         if worker.s.enabled:
-            worker.disable()
+            await worker.disable()
         worker.save(orbita_api_key="", orbita_webhook_secret="")
         worker.event(None, "Орбита отключена", user["email"])
         return go("/settings#orbita", "Орбита отключена, робот выключен")
@@ -390,7 +390,7 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 
     @router.post("/settings/disable")
     async def disable(user=Depends(admin_dep)):
-        worker.disable()
+        await worker.disable()
         return go("/settings#robot", "Робот выключен")
 
     @router.post("/settings/test")
