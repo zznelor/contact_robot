@@ -30,7 +30,10 @@ def _secret_input(name: str, current: str, placeholder: str, clearable: bool = F
             if current else "")
     clear = (f'<label class="check"><input type="checkbox" name="{name}_clear" value="1"> стереть</label>'
              if clearable and current else "")
-    return (f'<input type="password" name="{name}" placeholder="{e(placeholder)}" autocomplete="off">'
+    # Не type="password": Safari и менеджеры паролей принимают форму за вход и не дают сохранить
+    # без «Сохранить пароль?». Точки вместо символов — через CSS (.secret).
+    return (f'<input type="text" class="secret" name="{name}" placeholder="{e(placeholder)}" autocomplete="off" '
+            f'autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore>'
             f'{hint}{clear}')
 
 
