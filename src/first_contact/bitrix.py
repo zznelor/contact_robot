@@ -81,8 +81,14 @@ class Deal:
     stage_id: str
     stage_semantic: str   # P — в работе, S — успех, F — провал
     category_id: str
-    contact_id: int | None
     created_at: datetime | None = None   # DATE_CREATE; нет или не разобрать — None
+
+
+@dataclass
+class Contact:
+    id: int
+    name: str
+    phones: list[str]                    # нормализованные, без дублей
 
 
 def _parse_date(value) -> datetime | None:
@@ -108,7 +114,7 @@ def normalize_phone(raw: str) -> str | None:
 
 class Bitrix:
     """Всё, что робот делает в CRM. Чтобы подключить другую CRM, напишите класс с теми же
-    методами get_deal / get_contact / deal_ids_after / max_deal_id / set_stage / comment
+    методами get_deal / deal_contacts / deal_ids_after / max_deal_id / set_stage / comment
     (см. docs/РАЗРАБОТЧИКУ.md)."""
 
     def __init__(self, webhook: str, timeout: float = 30):
@@ -206,11 +212,10 @@ class Bitrix:
             stage_id=d.get("STAGE_ID") or "",
             stage_semantic=d.get("STAGE_SEMANTIC_ID") or "P",
             category_id=str(d.get("CATEGORY_ID") or "0"),
-            contact_id=int(d["CONTACT_ID"]) if d.get("CONTACT_ID") else None,
             created_at=_parse_date(d.get("DATE_CREATE")) if d.get("DATE_CREATE") else None,
         )
 
-    async def get_contact(self, contact_id: int) -> tuple[str, list[str]]:
+    async def get_contact(self, contact_id: int) -> Contact:
         """Имя и телефоны контакта (нормализованные, без дублей)."""
         c = await self.call("crm.contact.get", {"id": contact_id})
         phones: list[str] = []
@@ -218,7 +223,24 @@ class Bitrix:
             p = normalize_phone(item.get("VALUE", ""))
             if p and p not in phones:
                 phones.append(p)
-        return (c.get("NAME") or "").strip(), phones
+        return Contact(contact_id, (c.get("NAME") or "").strip(), phones)
+
+    async def deal_contacts(self, deal_id: int) -> list[Contact]:
+        """Все контакты сделки: главный (IS_PRIMARY) первым, остальные — по SORT привязки. Поле сделки CONTACT_ID
+        в документации «Устаревшее», и какой из нескольких контактов в нём — не описано; список привязок —
+        crm.deal.contact.items.get (scope crm, право «чтения» сделок). Компания сделки не читается. Контакт,
+        удалённый между запросами («Not found»), пропускается: привязки к нему уже нет."""
+        rows = await self.call("crm.deal.contact.items.get", {"id": deal_id}) or []
+        order = sorted(enumerate(rows), key=lambda x: (x[1].get("IS_PRIMARY") != "Y", int(x[1].get("SORT") or 0),
+                                                       x[0]))
+        contacts: list[Contact] = []
+        for _, r in order:
+            try:
+                contacts.append(await self.get_contact(int(r["CONTACT_ID"])))
+            except BitrixError as e:
+                if not e.not_found:
+                    raise
+        return contacts
 
     async def deal_ids_after(self, last_id: int, category_id: str | None) -> list[int]:
         """Сделки с ID больше last_id, по возрастанию. Страницы — фильтром по последнему полученному ID и start=-1

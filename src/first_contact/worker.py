@@ -460,14 +460,19 @@ class Worker:
             self.event(deal_id, "пропущена", f"этап {deal.stage_id}")
             return
 
-        name, phones = ("", [])
-        if deal.contact_id:
-            name, phones = await self.bitrix.get_contact(deal.contact_id)
+        # Телефоны всех контактов сделки: главный контакт первым, затем по порядку, без дублей. Имя — того контакта,
+        # у которого номер встретился первым: с ним уходит сообщение на этот номер
+        names: dict[str, str] = {}
+        for contact in await self.bitrix.deal_contacts(deal_id):
+            for p in contact.phones:
+                names.setdefault(p, contact.name)
+        phones = list(names)
         if not phones:
-            await self._no_messenger(deal_id, "no_phone", "в контакте нет телефона", deal.stage_id)
+            await self._no_messenger(deal_id, "no_phone", "у контактов сделки нет телефона", deal.stage_id)
             return
 
         if self.dry_run:
+            name = names[phones[0]]
             text = self.render("first", name, deal.title)
             self.db.update(deal_id, name=name, phone=", ".join(phones), first_text=text)
             self.db.update(deal_id, status="skipped", last_error="DRY_RUN")
@@ -493,12 +498,13 @@ class Worker:
             if await self._first_done(deal_id, row["intent_phone"], res):
                 return
 
-        text = self.render("first", name, deal.title)
-        self.db.update(deal_id, name=name, phone=", ".join(phones), first_text=text)
+        self.db.update(deal_id, name=names[phones[0]], phone=", ".join(phones))
         suffix = f"-r{row['retry_n']}" if row["retry_n"] else ""
         not_found, unchecked, invalid = [], [], []
         unchecked_waits: list[datetime | None] = []
         for phone in phones:
+            name = names[phone]
+            text = self.render("first", name, deal.title)
             for ch in order:
                 if ch not in connected:
                     unchecked.append(f"{ch}: не подключён")
@@ -535,12 +541,14 @@ class Worker:
 
     async def _start(self, deal_id: int, phone: str, channel: str, text: str, key: str,
                      name: str) -> FirstSendResult:
-        """Один запрос «написать первым». Намерение (номер, канал, ключ) пишется в базу ДО запроса и
+        """Один запрос «написать первым». Намерение (номер, канал, ключ) пишется в базу ДО запроса — той же записью,
+        что текст и имя этого запроса (first_text, name): повтор после неизвестного исхода несёт их, а у номеров
+        разных контактов сделки имена разные. Намерение
         стирается, только когда исход определён: отказ Орбиты, по которому точно ничего не ушло, или ответ
         «не найден» / «не проверен» / «номер не принят» — здесь; ушло или могло уйти (201/202) — в _first_done
         той же записью, что и результат (иначе обрыв между двумя записями оставит сделку без намерения и без
         результата). Сбой связи, 5xx, idempotency_in_progress оставляют намерение — повтор пойдёт туда же."""
-        self.db.update(deal_id, intent_phone=phone, intent_channel=channel, intent_key=key)
+        self.db.update(deal_id, intent_phone=phone, intent_channel=channel, intent_key=key, first_text=text, name=name)
         try:
             res = await self.orbita.start_dialog(channel, phone, text, key, name or None)
         except OrbitaAPIError as e:

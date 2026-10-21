@@ -1003,7 +1003,7 @@ def test_stop_while_first_message_in_progress_wins(running, bitrix, orbita):
     """«Остановить», нажатое, пока шаг ждёт Битрикс, не затирается результатом шага."""
     async def scenario():
         running.lock = WatchedLock()
-        gate = Gate(bitrix, "get_contact")
+        gate = Gate(bitrix, "deal_contacts")
         bitrix.new_ids.append(130)
         async with async_panel(running) as panel:
             tick = asyncio.create_task(running.tick())
@@ -1041,7 +1041,7 @@ def test_client_replied_while_followup_in_progress_wins(running, orbita):
 def test_disable_during_pass_stops_remaining_deals(running, bitrix, orbita):
     async def scenario():
         running.lock = WatchedLock()
-        gate = Gate(bitrix, "get_contact")
+        gate = Gate(bitrix, "deal_contacts")
         bitrix.new_ids += [132, 133]
         async with async_panel(running) as panel:
             tick = asyncio.create_task(running.tick())

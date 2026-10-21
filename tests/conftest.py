@@ -20,7 +20,7 @@ from first_contact.orbita_api import OrbitaAPIError
 from first_contact import worker as worker_mod
 from first_contact.app import create_app
 from first_contact.auth import SESSION_COOKIE, Users
-from first_contact.bitrix import BitrixError, Deal
+from first_contact.bitrix import BitrixError, Contact, Deal
 from first_contact.db import DB
 from first_contact.orbita import FirstSendResult, OrbitaError, ReplyResult
 from first_contact.worker import Worker
@@ -85,7 +85,7 @@ def db():
 # ---------- подделки для логики робота ----------
 
 class FakeBitrix:
-    """Битрикс: одна воронка, этап и контакт на все сделки; запоминает комментарии и смены этапа."""
+    """Битрикс: одна воронка, этап и один контакт на все сделки; запоминает комментарии и смены этапа."""
 
     def __init__(self):
         self.notes: list[tuple[int, str]] = []
@@ -103,12 +103,10 @@ class FakeBitrix:
         return [i for i in self.new_ids if i > last]   # фильтр >ID, как в crm.deal.list
 
     async def get_deal(self, deal_id):
-        deal = Deal(deal_id, "Заявка", self.stage, self.semantic, self.category, 1)
-        deal.created_at = self.created
-        return deal
+        return Deal(deal_id, "Заявка", self.stage, self.semantic, self.category, self.created)
 
-    async def get_contact(self, contact_id):
-        return self.name, list(self.phones)
+    async def deal_contacts(self, deal_id):
+        return [Contact(1, self.name, list(self.phones))]
 
     async def set_stage(self, deal_id, stage_id):
         self.stages_set.append((deal_id, stage_id))

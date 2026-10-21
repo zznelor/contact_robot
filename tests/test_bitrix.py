@@ -10,6 +10,7 @@ from conftest import PHONE, run
 from first_contact import config
 from first_contact import bitrix as bitrix_mod
 from first_contact.bitrix import Bitrix, BitrixError
+from first_contact.orbita import FirstSendResult
 from first_contact.worker import Worker
 
 HOOK = "https://p.bitrix24.ru/rest/1/x/"
@@ -216,6 +217,8 @@ class Portal:
         self.fail: dict[str, list[httpx.Response]] = {}
         self.calls: list[str] = []
         self.stage = "NEW"
+        self.contacts: dict[int, tuple[str, list[str]]] = {3: ("Анна", [PHONE])}   # ID → имя, телефоны
+        self.bindings: list[tuple[int, int, str]] = [(3, 10, "Y")]   # привязки к сделке: контакт, SORT, IS_PRIMARY
 
     def __call__(self, req):
         m = method_of(req)
@@ -228,12 +231,19 @@ class Portal:
                 return ok([{"ID": str(self.max_id)}])
             return ok([{"ID": str(i)} for i in self.new_ids if i > int(body["filter"][">ID"])][:50])
         if m == "crm.deal.get":
-            return ok({**DEAL, "ID": str(body["id"]), "STAGE_ID": self.stage})
+            # CONTACT_ID «Устаревшее» (crm-deal-get.md); какой контакт в нём при нескольких — не описано: здесь главный
+            primary = next((c for c, _, p in self.bindings if p == "Y"), None)
+            return ok({**DEAL, "ID": str(body["id"]), "STAGE_ID": self.stage,
+                       "CONTACT_ID": str(primary) if primary else None})
         if m == "crm.deal.contact.items.get":
-            return ok([{"CONTACT_ID": 3, "SORT": 10, "ROLE_ID": 0, "IS_PRIMARY": "Y"}])
+            return ok([{"CONTACT_ID": c, "SORT": sort, "ROLE_ID": 0, "IS_PRIMARY": p} for c, sort, p in self.bindings])
         if m == "crm.contact.get":
-            return ok({"ID": "3", "NAME": "Анна", "PHONE": [{"ID": "1", "VALUE_TYPE": "WORK", "VALUE": PHONE,
-                                                             "TYPE_ID": "PHONE"}]})
+            if body["id"] not in self.contacts:
+                return error(400, "", "Not found")
+            name, phones = self.contacts[body["id"]]
+            return ok({"ID": str(body["id"]), "NAME": name,
+                       "PHONE": [{"ID": str(n), "VALUE_TYPE": "WORK", "VALUE": v, "TYPE_ID": "PHONE"}
+                                 for n, v in enumerate(phones)]})
         if m == "crm.deal.update":
             self.stage = body["fields"]["STAGE_ID"]
             return ok(True)
@@ -327,3 +337,74 @@ def test_stages_only_in_progress(http):
     http(lambda req: ok(DOC_STAGES))
     assert [i for i, _ in run(Bitrix(HOOK).stages("0"))] == [
         "NEW", "PREPARATION", "PREPAYMENT_INVOICE", "EXECUTING", "FINAL_INVOICE"]
+
+
+# ---------- телефон — из всех контактов сделки ----------
+
+def test_deal_contacts_primary_first_then_by_sort(http):
+    """crm.deal.contact.items.get: все контакты сделки, IS_PRIMARY и SORT (CONTACT_ID сделки — «Устаревшее»)."""
+    portal = Portal()
+    portal.contacts = {54: ("Борис", ["8 (999) 000-00-02"]), 55: ("Анна", [PHONE, PHONE]), 56: ("Вера", [])}
+    portal.bindings = [(54, 100, "N"), (55, 200, "Y"), (56, 50, "N")]
+    http(portal)
+    contacts = run(Bitrix(HOOK).deal_contacts(7))
+    assert [(c.name, c.phones) for c in contacts] == [("Анна", [PHONE]), ("Вера", []), ("Борис", ["+79990000002"])]
+
+
+def only_number(orbita, number):
+    """Подделка Орбиты: мессенджер есть только у этого номера."""
+    real = orbita.start_dialog
+
+    async def start(channel, phone, text, key, name=None):
+        if phone != number:
+            orbita.keys.append(key)
+            return FirstSendResult("not_found", channel=channel, raw="not_found")
+        return await real(channel, phone, text, key, name)
+    orbita.start_dialog = start
+
+
+def test_phone_of_second_contact_used_with_its_name(portal_robot, orbita):
+    """У главного контакта телефона нет, у других есть: номера перебираются по порядку контактов, без дублей; имя в
+    сообщении — того контакта, чей номер ушёл; ключ идемпотентности — с номером, как раньше."""
+    portal = Portal()
+    portal.contacts = {3: ("Директор", []), 4: ("Анна", ["+79990000002", PHONE]), 5: ("Борис", [PHONE, "+79990000003"])}
+    portal.bindings = [(5, 30, "N"), (3, 10, "Y"), (4, 20, "N")]
+    w = portal_robot(portal)
+    w.s.tpl_first, w.s.orbita_channels = "{name}: {deal_title}", ["whatsapp"]
+    only_number(orbita, "+79990000003")
+    portal.new_ids = [104]
+    run(w.tick())
+    row = w.db.deal(104)
+    assert orbita.keys == [f"deal-104-first-{p}-whatsapp" for p in ("+79990000002", PHONE, "+79990000003")]
+    assert orbita.first == [("+79990000003", "Борис: Заявка", "deal-104-first-+79990000003-whatsapp")]
+    assert (row["status"], row["name"], row["phone"]) == ("sent_first", "Борис", "+79990000003")
+
+
+def test_duplicate_number_named_after_first_contact_with_it(portal_robot, orbita):
+    portal = Portal()
+    portal.contacts = {3: ("Анна", [PHONE]), 4: ("Борис", [PHONE])}
+    portal.bindings = [(4, 20, "N"), (3, 10, "Y")]
+    w = portal_robot(portal)
+    w.s.tpl_first, w.s.orbita_channels = "{name}", ["whatsapp"]
+    portal.new_ids = [105]
+    run(w.tick())
+    assert orbita.first == [(PHONE, "Анна", f"deal-105-first-{PHONE}-whatsapp")]
+
+
+def test_lost_answer_repeats_with_name_of_that_number(portal_robot, orbita, clock):
+    """Ответ на отправку номеру второго контакта потерян: повтор — тем же телом, с именем этого контакта."""
+    portal = Portal()
+    portal.contacts = {3: ("Анна", ["+79990000002"]), 4: ("Борис", [PHONE])}
+    portal.bindings = [(3, 10, "Y"), (4, 20, "N")]
+    w = portal_robot(portal)
+    w.s.tpl_first, w.s.orbita_channels = "{name}", ["whatsapp"]
+    only_number(orbita, PHONE)
+    orbita.answers["whatsapp"] = "lost"
+    portal.new_ids = [106]
+    run(w.tick())
+    orbita.answers.clear()
+    clock.advance(minutes=3)                            # пауза после сбоя
+    run(w.tick())
+    key = f"deal-106-first-{PHONE}-whatsapp"
+    assert orbita.first == [(PHONE, "Борис", key), (PHONE, "Борис", key)]
+    assert w.db.deal(106)["status"] == "sent_first"
