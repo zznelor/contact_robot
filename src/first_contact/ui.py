@@ -53,11 +53,13 @@ def build_router(ctx: Ctx) -> APIRouter:
         if limiter.blocked(ip):
             return go("/login", "!Слишком много попыток. Подождите 15 минут.")
         user = await users.login_async(email, password)
-        if user is None:
+        # Сессия — только по проверенному паролю, если его не сменили после проверки (смена закрывает все сессии)
+        token = users.new_session(user["id"], pw_hash=user["pw_hash"]) if user is not None else None
+        if token is None:
             limiter.fail(ip)
             return go("/login", "!Неверная почта или пароль")
         resp = go("/")
-        _set_session(resp, request, users.new_session(user["id"]))
+        _set_session(resp, request, token)
         return resp
 
     @router.post("/logout")

@@ -209,3 +209,44 @@ def test_setup_creates_one_admin_from_simultaneous_requests(panel, monkeypatch):
     post_at_once(panel, monkeypatch, "/setup", [{"code": code, "email": m, "password": "12345678"}
                                                 for m in ("a1@x.ru", "a2@x.ru")])
     assert panel.users.count() == 1
+
+
+def sessions_of(panel, uid: int) -> int:
+    return panel.db.conn.execute("SELECT COUNT(*) FROM sessions WHERE user_id=?", (uid,)).fetchone()[0]
+
+
+def test_login_with_old_password_during_password_change_gets_no_session(panel, monkeypatch):
+    """Вход со старым паролем: пока проверяется пароль, администратор сервера задал новый (reset-password закрывает
+    все сессии). Проверка старого пароля, закончившаяся после смены, сессию не выдаёт."""
+    uid = panel.users.create("a@x.ru", "password1", "admin")
+    checked, release = threading.Event(), threading.Event()
+    real = auth.check_password
+
+    def check(password, stored):
+        ok = real(password, stored)
+        checked.set()
+        release.wait(5)
+        return ok
+    monkeypatch.setattr(auth, "check_password", check)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=panel.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver", headers=ORIGIN) as c:
+            login = asyncio.create_task(c.post("/login", data={"email": "a@x.ru", "password": "password1"}))
+            await asyncio.to_thread(checked.wait, 5)
+            panel.users.set_password(uid, "password2")
+            release.set()
+            return await login
+    r = run(scenario())
+    assert is_error(r)
+    assert sessions_of(panel, uid) == 0
+
+
+def test_session_not_created_for_password_changed_after_check(panel):
+    """Пароль проверен, а до создания сессии его сменили из другого процесса (reset-password): сессия по
+    проверенному, уже не действующему паролю не создаётся."""
+    uid = panel.users.create("a@x.ru", "password1", "admin")
+    user = run(panel.users.login_async("a@x.ru", "password1"))
+    panel.users.set_password(uid, "password2")
+    assert panel.users.new_session(uid, pw_hash=user["pw_hash"]) is None
+    assert sessions_of(panel, uid) == 0

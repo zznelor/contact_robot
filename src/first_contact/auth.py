@@ -95,8 +95,12 @@ class Users:
         return cur.lastrowid
 
     def set_password(self, user_id: int, password: str, *, pw_hash: str | None = None) -> None:
-        self.c.execute("UPDATE users SET pw_hash=? WHERE id=?", (pw_hash or hash_password(password), user_id))
-        self.c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+        """Новый пароль и закрытие всех сессий пользователя — одним атомарным переходом: вход, проверивший старый
+        пароль, создаёт сессию либо до него (её закроет смена), либо после (не создаст, см. new_session)."""
+        pw_hash = pw_hash or hash_password(password)
+        with self.db.tx():
+            self.c.execute("UPDATE users SET pw_hash=? WHERE id=?", (pw_hash, user_id))
+            self.c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
 
     # scrypt — десятки миллисекунд процессора. В обработчиках панели он идёт в потоке (asyncio.to_thread),
     # чтобы не останавливать цикл событий: вебхуки, проход робота, другие страницы. База — в цикле событий.
@@ -132,11 +136,17 @@ class Users:
         self.set_password(user_id, password, pw_hash=await asyncio.to_thread(hash_password, password))
 
     async def login_async(self, email: str, password: str):
+        """Пользователь, если пароль верен. Пароль проверяется в потоке; пока шла проверка, его могли сменить —
+        тогда проверен уже не действующий пароль, и входа нет. Сессию по результату создавать только
+        new_session(..., pw_hash=u["pw_hash"]): смена пароля из другого процесса может успеть и после этой сверки."""
         u = self.by_email(email)
         if u is None:
             await asyncio.to_thread(hash_password, password)   # одинаковое время ответа
             return None
-        return u if await asyncio.to_thread(check_password, password, u["pw_hash"]) else None
+        if not await asyncio.to_thread(check_password, password, u["pw_hash"]):
+            return None
+        now_u = self.c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+        return now_u if now_u is not None and now_u["pw_hash"] == u["pw_hash"] else None
 
     def delete(self, user_id: int) -> None:
         self.c.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
@@ -154,13 +164,20 @@ class Users:
             return None
         return u if check_password(password, u["pw_hash"]) else None
 
-    def new_session(self, user_id: int) -> str:
+    def new_session(self, user_id: int, *, pw_hash: str | None = None) -> str | None:
+        """Новая сессия. pw_hash — хэш, по которому проверен пароль при входе: сессия создаётся одной записью
+        только при том же хэше (условный INSERT), иначе None — пароль сменили после проверки, а смена закрыла
+        все сессии (set_password). Без pw_hash — для только что созданного пользователя."""
         self.c.execute("DELETE FROM sessions WHERE expires_at<=?", (now(),))   # заодно чистим истёкшие
         token = secrets.token_urlsafe(32)
         exp = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
-        self.c.execute("INSERT INTO sessions VALUES (?, ?, ?)",
-                       (_token_hash(token), user_id, exp.isoformat(timespec="seconds")))
-        return token
+        if pw_hash is None:
+            self.c.execute("INSERT INTO sessions VALUES (?, ?, ?)",
+                           (_token_hash(token), user_id, exp.isoformat(timespec="seconds")))
+            return token
+        cur = self.c.execute("INSERT INTO sessions SELECT ?, id, ? FROM users WHERE id=? AND pw_hash=?",
+                             (_token_hash(token), exp.isoformat(timespec="seconds"), user_id, pw_hash))
+        return token if cur.rowcount == 1 else None
 
     def by_session(self, token: str | None):
         if not token:
