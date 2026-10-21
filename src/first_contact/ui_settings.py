@@ -137,7 +137,8 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 <h2 style="margin-top:0">Битрикс</h2><p>{status}</p>
 <label class="field"><span>Адрес входящего вебхука</span>
 {_secret_input("webhook", s.bitrix_webhook, "https://ваш-портал.bitrix24.ru/rest/1/abc123…/")}
-<span class="hint">Битрикс → Разработчикам → Другое → Входящий вебхук, права «CRM (crm)». Подробно — docs/НАСТРОЙКА.md.</span></label>
+<span class="hint">Битрикс → Разработчикам → Другое → Входящий вебхук, права «CRM (crm)». Создайте его от сотрудника,
+которому в CRM разрешено читать и изменять сделки этой воронки и читать контакты. Подробно — docs/НАСТРОЙКА.md.</span></label>
 {live}
 <h3>События о новых сделках (по желанию)</h3>
 <p class="hint">Без них робот проверяет Битрикс раз в минуту. С ними — пишет клиенту в ту же секунду.
