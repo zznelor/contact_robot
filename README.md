@@ -26,7 +26,7 @@
 
 Подробно, с нуля — в **[УСТАНОВКА.md](УСТАНОВКА.md)**. Коротко:
 
-**Попробовать на своём компьютере** (нужен [Docker Desktop](https://www.docker.com/products/docker-desktop/)):
+**Попробовать на своём компьютере.** Сначала скачайте и установите бесплатный [Docker Desktop](https://www.docker.com/products/docker-desktop/), запустите его и дождитесь надписи **Engine running** — как это сделать, по шагам в [УСТАНОВКА.md](УСТАНОВКА.md#установить-docker-desktop). Затем:
 
 ```bash
 git clone https://github.com/zznelor/contact_robot.git first-contact && cd first-contact
