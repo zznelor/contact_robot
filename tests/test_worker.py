@@ -171,6 +171,57 @@ def test_retry_after_no_messenger_sends_with_new_idempotency_key(running, bitrix
     assert row["created_at"] == created_at and row["retried_at"]
 
 
+def no_messenger_then_retry(w, bitrix, orbita, deal_id, pending=False):
+    """Мессенджер не нашёлся (этап сменён), человек поправил телефон и нажал «Повторить»."""
+    orbita.mode = "none"
+    start_deal(w, bitrix, deal_id)
+    assert bitrix.stage == "NO_MESSENGER"
+    orbita.mode = "sent"
+    if pending:
+        orbita.answers["whatsapp"] = "pending"
+    run(w.retry(deal_id, "a@x.ru"))
+    run(w.on_deal_added(deal_id))
+
+
+def test_successful_retry_returns_deal_to_previous_stage(running, bitrix, orbita):
+    bitrix.stage = "IN_WORK"
+    no_messenger_then_retry(running, bitrix, orbita, 190)
+    assert running.db.deal(190)["status"] == "sent_first"
+    assert bitrix.stages_set == [(190, "NO_MESSENGER"), (190, "IN_WORK")]
+    assert len([n for d, n in bitrix.notes if d == 190]) >= 3, "о возврате этапа — комментарий в сделке"
+
+
+def test_retry_confirmed_by_webhook_returns_previous_stage(running, bitrix, orbita):
+    bitrix.stage = "IN_WORK"
+    no_messenger_then_retry(running, bitrix, orbita, 191, pending=True)
+    row = running.db.deal(191)
+    assert row["status"] == "pending_first" and bitrix.stages_set == [(191, "NO_MESSENGER")]
+    run(running.on_orbita_event(event("message.sent", request_key=row["request_key"], dialog_id=5)))
+    assert bitrix.stages_set == [(191, "NO_MESSENGER"), (191, "IN_WORK")]
+
+
+def test_retry_does_not_move_deal_the_manager_already_moved(running, bitrix, orbita):
+    bitrix.stage = "IN_WORK"
+    orbita.mode = "none"
+    start_deal(running, bitrix, 192)
+    bitrix.stage = "CALL_BACK"                          # менеджер сам увёл сделку с «Не нашёл мессенджер»
+    orbita.mode = "sent"
+    run(running.retry(192, "a@x.ru"))
+    run(running.on_deal_added(192))
+    assert running.db.deal(192)["status"] == "sent_first"
+    assert bitrix.stages_set == [(192, "NO_MESSENGER")]
+
+
+def test_retry_of_deal_moved_before_update_leaves_stage(running, bitrix, orbita):
+    """Прежний этап сделки, перенесённой версией без этой функции, неизвестен — этап не трогаем."""
+    running.db.add_deal(193)
+    running.db.update(193, status="no_messenger", last_error="мессенджер не найден")
+    bitrix.stage = "NO_MESSENGER"
+    run(running.retry(193, "a@x.ru"))
+    run(running.on_deal_added(193))
+    assert running.db.deal(193)["status"] == "sent_first" and bitrix.stages_set == []
+
+
 def test_retry_rejected_for_deal_in_progress(running, bitrix):
     start_deal(running, bitrix, 120)
     with pytest.raises(ValueError):

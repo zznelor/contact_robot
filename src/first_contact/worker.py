@@ -380,7 +380,7 @@ class Worker:
         if deal.contact_id:
             name, phones = await self.bitrix.get_contact(deal.contact_id)
         if not phones:
-            await self._no_messenger(deal_id, "no_phone", "в контакте нет телефона")
+            await self._no_messenger(deal_id, "no_phone", "в контакте нет телефона", deal.stage_id)
             return
 
         if self.dry_run:
@@ -434,7 +434,8 @@ class Worker:
                 self.event(deal_id, "нет мессенджера на номере", phone)
 
         if len(invalid) == len(phones):
-            await self._no_messenger(deal_id, "no_phone", f"Орбита не приняла номера: {', '.join(invalid)}")
+            await self._no_messenger(deal_id, "no_phone", f"Орбита не приняла номера: {', '.join(invalid)}",
+                                    deal.stage_id)
             return
         if unchecked:
             # Хотя бы один выбранный канал не проверил номер — не утверждаем, что мессенджера нет. Если каждый
@@ -443,7 +444,8 @@ class Worker:
             retry_at = min(waits) if waits and len(waits) == len(unchecked) else None
             raise OrbitaError(f"не найден: {', '.join(not_found) or '—'}; не проверен: {'; '.join(unchecked)}",
                               retry_at)
-        await self._no_messenger(deal_id, "no_messenger", f"мессенджер не найден: {', '.join(phones)}")
+        await self._no_messenger(deal_id, "no_messenger", f"мессенджер не найден: {', '.join(phones)}",
+                                deal.stage_id)
 
     async def _start(self, deal_id: int, phone: str, channel: str, text: str, key: str,
                      name: str) -> FirstSendResult:
@@ -469,6 +471,7 @@ class Worker:
         if res.status == "sent":
             self._mark_sent_first(deal_id, phone, res.dialog_id, res.channel)
             await self.note(deal_id, f"Написал клиенту первым ({res.channel or 'мессенджер'}, {phone}).")
+            await self._restore_stage(deal_id)
             return True
         if res.status == "pending":
             self.db.update(deal_id, status="pending_first", phone=phone, channel=res.channel,
@@ -498,10 +501,39 @@ class Worker:
         self.db.update(deal_id, **fields)
         self.event(deal_id, "первое сообщение отправлено", f"{phone or ''} {channel or ''}")
 
-    async def _no_messenger(self, deal_id: int, status: str, reason: str) -> None:
+    async def _restore_stage(self, deal_id: int) -> None:
+        """Первое сообщение ушло после ручного «Повторить», а сделку раньше робот перенёс на «Не нашёл
+        мессенджер», — вернуть её на прежний этап. Менеджер уже сам передвинул сделку — не трогаем.
+        Сбой Битрикса здесь не повод повторять отправку: сообщение уже ушло, — только лог и журнал."""
+        row = self.db.deal(deal_id)
+        if row is None or not row["stage_before"] or self.dry_run:
+            return
+        before = row["stage_before"]
+        try:
+            deal = await self.bitrix.get_deal(deal_id)
+            if deal.stage_id != self.s.no_messenger_stage:
+                self.db.update(deal_id, stage_before=None)
+                self.event(deal_id, "этап не возвращён", f"менеджер уже перенёс сделку на {deal.stage_id}")
+                return
+            await self.bitrix.set_stage(deal_id, before)
+        except Exception as e:  # noqa: BLE001
+            log.error("сделка %s: не удалось вернуть этап %s: %s: %s", deal_id, before, type(e).__name__, e,
+                      exc_info=e)
+            self.event(deal_id, "не удалось вернуть этап", f"{before}: {type(e).__name__}: {e}")
+            return
+        self.db.update(deal_id, stage_before=None)
+        self.event(deal_id, f"этап возвращён → {before}", "первое сообщение ушло после «Повторить»")
+        await self.note(deal_id, "Первое сообщение ушло — вернул сделку с этапа «Не нашёл мессенджер» на прежний.")
+
+    async def _no_messenger(self, deal_id: int, status: str, reason: str, stage_now: str) -> None:
+        fields: dict = {"status": status, "last_error": reason}
         if not self.dry_run:
             await self.bitrix.set_stage(deal_id, self.s.no_messenger_stage)
-        self.db.update(deal_id, status=status, last_error=reason)
+            if stage_now != self.s.no_messenger_stage:
+                # Запоминаем, откуда увели: после успешного «Повторить» вернём (повтор, когда сделка уже на
+                # «Не нашёл мессенджер», прежний этап не затирает)
+                fields["stage_before"] = stage_now
+        self.db.update(deal_id, **fields)
         self.event(deal_id, "этап → «Не нашёл мессенджер»", reason)
         await self.note(deal_id, f"Не смог написать клиенту: {reason}. Нужен звонок менеджера.")
 
@@ -734,6 +766,7 @@ class Worker:
                 sent_at = _parse_time(data.get("sent_at")) or _ts(row["pending_at"])
                 self._mark_sent_first(deal_id, None, dialog, row["channel"], sent_at)
                 await self.note(deal_id, f"Написал клиенту первым ({row['channel']}, {row['phone']}).")
+                await self._restore_stage(deal_id)
                 # Клиент мог ответить раньше подтверждения: тогда message.received пришёл, когда номер диалога
                 # был ещё неизвестен, и ни к какой сделке не подошёл. Клиент ответил ⇒ первое сообщение дошло
                 if dialog and row["pending_at"]:
