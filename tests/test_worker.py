@@ -602,6 +602,68 @@ def test_followup_202_then_sent_stays_sent_followup(running, orbita):
     assert row["status"] == "sent_followup" and row["followup_sent_at"]
 
 
+def passed_without_confirmation(w, bitrix, orbita, step, deal_id):
+    """Напоминание или ответ по шаблону: Орбита ответила 202 («передано»), вебхука с исходом нет."""
+    orbita.reply_mode = "pending"
+    if step == "followup":
+        due_followup(w, orbita, deal_id)
+    else:
+        w.s.reply_on, w.s.reply_delay_minutes = True, 0
+        client_writes(w, bitrix, orbita, deal_id, lambda first: [out(first), inc(datetime.now(UTC))])
+    run(w.tick())
+    assert len(orbita.replies) == 1
+
+
+@pytest.mark.parametrize("step", ["followup", "reply"])
+def test_unconfirmed_202_needs_check_after_timeout_and_retry_keeps_key(running, bitrix, orbita, clock, step):
+    passed_without_confirmation(running, bitrix, orbita, step, 167)
+    clock.advance(minutes=31)
+    run(running.tick())
+    row = running.db.deal(167)
+    assert row["status"] == "needs_check" and row[f"{step}_request_key"], "ключ сохранён"
+    assert len(orbita.replies) == 1, "новой отправки нет"
+
+    run(running.retry(167, "a@x.ru"))
+    run(running.tick())
+    assert [k for _, _, k in orbita.replies] == [f"deal-167-{step}"] * 2, "повтор — тем же ключом"
+
+
+@pytest.mark.parametrize("step, expected", [("followup", "sent_followup"), ("reply", "replied")])
+def test_late_confirmation_after_timeout_returns_deal(running, bitrix, orbita, clock, step, expected):
+    passed_without_confirmation(running, bitrix, orbita, step, 168)
+    clock.advance(minutes=31)
+    run(running.tick())
+    assert running.db.deal(168)["status"] == "needs_check"
+    run(running.on_orbita_event(event("message.sent", request_key=f"rk-deal-168-{step}", dialog_id="D1")))
+    row = running.db.deal(168)
+    assert row["status"] == expected and not row[f"{step}_request_key"]
+
+
+def test_late_failed_reminder_after_followup_pause_needs_check(running, orbita, clock):
+    """Пауза итога короче подтверждения: итог «молчит» по неподтверждённому напоминанию не выносится,
+    а поздний message.failed по нему зовёт человека."""
+    running.s.followup_hours = 0.05
+    orbita.reply_mode = "pending"
+    due_followup(running, orbita, 169)
+    run(running.tick())
+    clock.advance(minutes=4)
+    run(running.tick())
+    run(running.on_orbita_event(event("message.failed", request_key="rk-deal-169-followup", reason_code="send_failed")))
+    row = running.db.deal(169)
+    assert row["status"] == "needs_check" and not row["followup_sent_at"]
+
+
+def test_failed_reminder_of_finished_deal_needs_check(worker, bitrix):
+    """Итог «не ответил» уже записан (версия до 22.10.2026), а Орбита сообщила, что напоминание не ушло."""
+    worker.db.add_deal(170)
+    worker.db.update(170, status="no_reply", dialog_id="D1", followup_sent_at=ago(hours=30).isoformat(),
+                     followup_request_key="rk-170")
+    run(worker.on_orbita_event(event("message.failed", request_key="rk-170", reason_code="send_failed")))
+    row = worker.db.deal(170)
+    assert row["status"] == "needs_check" and not row["followup_sent_at"]
+    assert bitrix.noted(170)
+
+
 def test_retry_after_failed_followup_resends_with_new_key(running, orbita):
     orbita.reply_mode = "pending"
     due_followup(running, orbita, 162)

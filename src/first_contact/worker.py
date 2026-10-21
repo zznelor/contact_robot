@@ -185,6 +185,8 @@ class Worker:
         elif step == "pending":
             for row in self.db.by_status("pending_first"):
                 await self._guarded(row["deal_id"], self.pending_timeout)
+            for row in self.db.unconfirmed_sends():
+                await self._guarded(row["deal_id"], self.send_timeout)
         elif step == "stages":
             for row in self.db.stages_to_restore():
                 await self._guarded(row["deal_id"], self._restore_stage)
@@ -281,9 +283,13 @@ class Worker:
         row = self.db.deal(deal_id)
         if row is None or row["status"] not in RETRYABLE:
             raise ValueError("эту сделку сейчас нельзя повторить")
+        # Напоминание или ответ по шаблону передан (202), а подтверждения нет: шаг не считается сделанным,
+        # повтор идёт тем же ключом (Орбита вернёт исход прошлого запроса, второе сообщение не уйдёт)
+        followup_unconfirmed = bool(row["followup_sent_at"] and row["followup_request_key"])
+        reply_unconfirmed = bool(row["reply_sent_at"] and row["reply_request_key"])
         if row["client_replied_at"]:
             status = "replied"
-        elif row["followup_sent_at"]:
+        elif row["followup_sent_at"] and not followup_unconfirmed:
             status = "sent_followup"
         elif row["first_sent_at"]:
             status = "sent_first"
@@ -293,12 +299,17 @@ class Worker:
         # Повтор шага после определённого отказа — новый ключ идемпотентности этого шага (-r<n>): с прежним
         # Орбита вернула бы исход прошлой попытки и сообщение не ушло бы. Исход прошлой попытки неизвестен
         # (сохранён followup_key / reply_key) — тот же ключ: если сообщение дошло, Орбита второе не отправит
-        if status == "sent_first" and not row["followup_key"]:
-            fields["followup_retry_n"] = (row["followup_retry_n"] or 0) + 1
-        if status == "replied" and not row["reply_sent_at"] and row["reply_due_at"] and self.s.reply_on:
+        if status == "sent_first":
+            if followup_unconfirmed:
+                fields.update(followup_sent_at=None, followup_request_key=None)
+            elif not row["followup_key"]:
+                fields["followup_retry_n"] = (row["followup_retry_n"] or 0) + 1
+        if status == "replied" and self.s.reply_on and \
+                (reply_unconfirmed or (not row["reply_sent_at"] and row["reply_due_at"])):
             # Ручной повтор продлевает срок: ответ уходит, даже если с сообщения клиента прошло больше 30 мин
-            fields.update(reply_due_at=now(), reply_retried_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
-            if not row["reply_key"]:
+            fields.update(reply_due_at=now(), reply_retried_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                          reply_sent_at=None, reply_request_key=None)
+            if not row["reply_key"] and not reply_unconfirmed:
                 fields["reply_retry_n"] = (row["reply_retry_n"] or 0) + 1
         if status == "new":
             # Прежняя отправка с 202 больше не ждёт исхода: решение человека — новая попытка
@@ -358,6 +369,24 @@ class Worker:
         self.db.update(deal_id, status="needs_check", last_error="нет подтверждения отправки от Орбиты")
         self.event(deal_id, "нет подтверждения отправки", row["request_key"] or "")
         await self.note(deal_id, "Орбита не подтвердила, что первое сообщение ушло. Проверьте переписку.")
+
+    async def send_timeout(self, deal_id: int) -> None:
+        """202 на напоминание или ответ по шаблону, а исхода так и нет — зовём человека, как у первого сообщения.
+        Ключи остаются: поздний вебхук ещё применится, «Повторить» пойдёт тем же ключом, новой отправки нет."""
+        row = self.db.deal(deal_id)
+        if row is None:
+            return
+        for status, column, at, title, text in (
+                ("sent_followup", "followup_request_key", "followup_sent_at", "напоминание", "напоминание ушло"),
+                ("replied", "reply_request_key", "reply_sent_at", "ответ по шаблону", "ответ по шаблону ушёл")):
+            if row["status"] != status or not row[column] or not row[at]:
+                continue
+            if datetime.now(timezone.utc) - _ts(row[at]) <= PENDING_TIMEOUT:
+                return
+            self.db.update(deal_id, status="needs_check", last_error=f"нет подтверждения от Орбиты: {title}")
+            self.event(deal_id, f"{title}: нет подтверждения отправки", row[column])
+            await self.note(deal_id, f"Орбита не подтвердила, что {text}. Проверьте переписку.")
+            return
 
     # ---------- первое сообщение и «нет мессенджера» ----------
 
@@ -650,6 +679,10 @@ class Worker:
             return
         if datetime.now(timezone.utc) < _ts(row["followup_sent_at"]) + timedelta(hours=self.s.followup_hours):
             return
+        if row["followup_request_key"]:
+            # Напоминание передано (202), доставка не подтверждена: итог «молчит» по нему не выносим. Ждём
+            # message.sent / message.failed; не придёт — «проверить вручную» по таймауту (send_timeout)
+            return
         replied = client_replied(await self.orbita.history(row["dialog_id"], _ts(row["first_sent_at"])), _ts(row["first_sent_at"])) \
             if row["dialog_id"] else None
         if replied:
@@ -736,7 +769,8 @@ class Worker:
         key = row["reply_key"] or f"deal-{deal_id}-reply" + (f"-r{row['reply_retry_n']}" if row["reply_retry_n"] else "")
         res = await self._send_step(deal_id, "reply_key", key, row["dialog_id"], text, "ответ по шаблону")
         pending = res.status == "pending"
-        self.db.update(deal_id, reply_sent_at=now(), reply_due_at=None, attempts=0,
+        self.db.update(deal_id, reply_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                       reply_due_at=None, attempts=0,
                        reply_request_key=res.request_key if pending else None)
         if pending:
             self.event(deal_id, "ответ по шаблону передан, ждём подтверждения", res.request_key or "")
@@ -838,15 +872,21 @@ class Worker:
             if row is None:
                 continue
             deal_id = row["deal_id"]
+            waiting = "sent_followup" if step == "followup" else "replied"
             if ok:
-                self.db.update(deal_id, **{column: None})
+                fields: dict = {column: None}
+                if row["status"] == "needs_check":
+                    # «Проверить вручную» по таймауту этой отправки (другого needs_check при неснятом ключе нет):
+                    # подтверждение пришло позже — шаг сделан, сделка возвращается туда, где ждала
+                    fields.update(status=waiting, last_error=None)
+                self.db.update(deal_id, **fields)
                 self.event(deal_id, f"{title}: мессенджер подтвердил доставку")
                 return
             # Сообщение не ушло: шаг не сделан, намерение снято. Человек решает, повторять ли («Повторить» —
-            # с новым ключом)
-            fields: dict = {column: None, f"{step}_key": None}
-            expected = "sent_followup" if step == "followup" else "replied"
-            if row["status"] == expected:
+            # с новым ключом). Итог «не ответил» по недоставленному напоминанию тоже снимается
+            fields = {column: None, f"{step}_key": None}
+            act = row["status"] in (waiting, "needs_check") or (step == "followup" and row["status"] == "no_reply")
+            if act:
                 fields.update(status="needs_check", last_error=f"{title} не доставлен(о): {reason}")
                 if step == "followup":
                     fields["followup_sent_at"] = None
@@ -854,7 +894,7 @@ class Worker:
                     fields.update(reply_sent_at=None, reply_due_at=now())   # ответ всё ещё нужен
             self.db.update(deal_id, **fields)
             self.event(deal_id, f"{title} не доставлен(о)", reason)
-            if row["status"] == expected:
+            if act:
                 await self.note(deal_id, f"Не удалось доставить {title} ({reason}). Проверьте переписку; "
                                          "«Повторить» в панели робота отправит заново.")
             return

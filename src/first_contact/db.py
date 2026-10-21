@@ -264,6 +264,13 @@ class DB:
             "SELECT * FROM deals WHERE stage_before IS NOT NULL AND first_sent_at IS NOT NULL ORDER BY deal_id"
         ).fetchall()
 
+    def unconfirmed_sends(self) -> list[sqlite3.Row]:
+        """Напоминание или ответ по шаблону переданы с ответом 202, а исхода (вебхука) ещё нет."""
+        return self.conn.execute(
+            "SELECT * FROM deals WHERE (status='sent_followup' AND followup_request_key IS NOT NULL)"
+            " OR (status='replied' AND reply_request_key IS NOT NULL) ORDER BY deal_id"
+        ).fetchall()
+
     def replies_due(self, at: str) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM deals WHERE status='replied' AND reply_due_at IS NOT NULL AND reply_sent_at IS NULL"
