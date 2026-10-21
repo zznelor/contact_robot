@@ -507,6 +507,8 @@ class Worker:
         try:
             res = await self.orbita.start_dialog(channel, phone, text, key, name or None)
         except OrbitaAPIError as e:
+            if e.key_reused:                            # прежний запрос с этим ключом мог отправить — нужен человек
+                raise UnknownOutcome(f"{phone} ({channel}): {e}") from e
             if e.definite:
                 self.db.update(deal_id, intent_phone=None, intent_channel=None, intent_key=None)
             raise
@@ -649,10 +651,8 @@ class Worker:
                                      "Напоминание выключено — дальше вручную.")
             return
 
-        text = self.render("followup", row["name"] or "", deal.title)
-        key = row["followup_key"] or \
-            f"deal-{deal_id}-followup" + (f"-r{row['followup_retry_n']}" if row["followup_retry_n"] else "")
-        res = await self._send_step(deal_id, "followup_key", key, row["dialog_id"], text, "напоминание")
+        res = await self._send_step(row, "followup", self.render("followup", row["name"] or "", deal.title),
+                                    "напоминание")
         pending = res.status == "pending"
         self.db.update(deal_id, status="sent_followup", followup_request_key=res.request_key if pending else None,
                        followup_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -664,17 +664,27 @@ class Worker:
             self.event(deal_id, "напоминание отправлено")
             await self.note(deal_id, f"Клиент не ответил за {self.s.followup_hours:g} ч — отправил напоминание.")
 
-    async def _send_step(self, deal_id: int, column: str, key: str, dialog_id: str, text: str,
-                         title: str) -> ReplyResult:
-        """Напоминание или ответ по шаблону. Ключ (намерение) пишется в column до запроса и стирается только
-        при определённом отказе Орбиты: тогда «Повторить» выпустит новый -r<n>. Сбой связи, 5xx и непредвиденный
-        сбой ключ оставляют — повтор (автоматический и ручной) идёт тем же ключом."""
-        self.db.update(deal_id, **{column: key})
+    async def _send_step(self, row, step: str, fresh_text: str, title: str) -> ReplyResult:
+        """Напоминание или ответ по шаблону. Намерение — ключ и текст (<step>_key, <step>_text) — пишется до запроса
+        и стирается только при определённом отказе Орбиты: тогда «Повторить» выпустит новый -r<n>. Сбой связи, 5xx
+        и непредвиденный сбой намерение оставляют — повтор (автоматический и ручной) идёт тем же ключом и с тем же
+        текстом, даже если шаблон или название сделки с тех пор поменялись. fresh_text — только для нового ключа
+        (и для ключа, сохранённого версией без текста)."""
+        deal_id = row["deal_id"]
+        key_col, text_col = f"{step}_key", f"{step}_text"
+        if row[key_col]:
+            key, text = row[key_col], row[text_col] or fresh_text
+        else:
+            n = row[f"{step}_retry_n"]
+            key, text = f"deal-{deal_id}-{step}" + (f"-r{n}" if n else ""), fresh_text
+        self.db.update(deal_id, **{key_col: key, text_col: text})
         try:
-            return await self.orbita.send_reply(dialog_id, text, key)
+            return await self.orbita.send_reply(row["dialog_id"], text, key)
         except OrbitaAPIError as e:
+            if e.key_reused:        # прежний запрос с этим ключом мог отправить — исход выясняет человек
+                raise UnknownOutcome(f"{title}: {e}") from e
             if e.definite:
-                self.db.update(deal_id, **{column: None})
+                self.db.update(deal_id, **{key_col: None, text_col: None})
             raise
         except OrbitaError:
             raise
@@ -774,9 +784,7 @@ class Worker:
             self.db.update(deal_id, reply_due_at=None)
             self.event(deal_id, "ответ по шаблону не отправлен", "опоздал с ответом больше чем на 30 мин")
             return
-        text = self.render("reply", row["name"] or "")
-        key = row["reply_key"] or f"deal-{deal_id}-reply" + (f"-r{row['reply_retry_n']}" if row["reply_retry_n"] else "")
-        res = await self._send_step(deal_id, "reply_key", key, row["dialog_id"], text, "ответ по шаблону")
+        res = await self._send_step(row, "reply", self.render("reply", row["name"] or ""), "ответ по шаблону")
         pending = res.status == "pending"
         self.db.update(deal_id, reply_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                        reply_due_at=None, attempts=0,
@@ -895,7 +903,7 @@ class Worker:
                 return
             # Сообщение не ушло: шаг не сделан, намерение снято. Человек решает, повторять ли («Повторить» —
             # с новым ключом). Итог «не ответил» по недоставленному напоминанию тоже снимается
-            fields = {column: None, f"{step}_key": None}
+            fields = {column: None, f"{step}_key": None, f"{step}_text": None}
             act = mine and (row["status"] in (waiting, "needs_check")
                             or (step == "followup" and row["status"] == "no_reply"))
             if act:

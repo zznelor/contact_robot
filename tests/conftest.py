@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from first_contact import config, ui_settings
 from first_contact import orbita_api as orbita_api_mod
+from first_contact.orbita_api import OrbitaAPIError
 from first_contact import worker as worker_mod
 from first_contact.app import create_app
 from first_contact.auth import SESSION_COOKIE, Users
@@ -121,7 +122,8 @@ class FakeBitrix:
 
 class FakeOrbita:
     """Орбита: mode — sent | none (номера нигде нет) | boom (Орбита отказала, 503).
-    connected — подключённые каналы (по умолчанию все); answers[канал] — исход в этом канале вместо mode."""
+    connected — подключённые каналы (по умолчанию все); answers[канал] — исход в этом канале вместо mode
+    (ещё pending — 202, reused — 422 idempotency_key_reused)."""
 
     def __init__(self):
         self.mode = "sent"
@@ -142,6 +144,8 @@ class FakeOrbita:
         how = self.answers.get(channel) or {"sent": "sent", "none": "not_found", "boom": "boom"}[self.mode]
         if how == "boom":
             raise OrbitaError("HTTP 503: Орбита недоступна")
+        if how == "reused":
+            raise OrbitaAPIError(422, "idempotency_key_reused", {"code": "idempotency_key_reused"})
         if how in ("not_found", "unchecked", "invalid_phone"):
             return FirstSendResult(how, channel=channel, raw=how)
         self.first.append((phone, text, key))
@@ -151,10 +155,13 @@ class FakeOrbita:
 
     async def send_reply(self, dialog_id, text, key):
         """reply_mode: sent — 201 (Telegram подтвердил); pending — 202, исход придёт вебхуком с request_key;
-        lost — Орбита приняла запрос, а ответ до робота не дошёл (обрыв связи)."""
+        lost — Орбита приняла запрос, а ответ до робота не дошёл (обрыв связи); reused — 422
+        idempotency_key_reused: этот ключ уже приходил с другим телом."""
         self.replies.append((dialog_id, text, key))
         if self.reply_mode == "lost":
             raise OrbitaError("POST /messages: ReadTimeout: ответ не дошёл")
+        if self.reply_mode == "reused":
+            raise OrbitaAPIError(422, "idempotency_key_reused", {"code": "idempotency_key_reused"})
         if self.reply_mode == "pending":
             return ReplyResult("pending", f"rk-{key}")
         return ReplyResult("sent")

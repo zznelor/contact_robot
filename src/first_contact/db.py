@@ -129,6 +129,10 @@ MIGRATIONS = [
     # повторяет этот ключ, а не выпускает новый -r<n> (иначе клиент может получить второе), 22.10.2026
     ("deals", "followup_key", "TEXT"),
     ("deals", "reply_key", "TEXT"),
+    # Текст отправки под этим ключом: повтор тем же ключом несёт ровно его (шаблон или название сделки могли
+    # поменяться, а с другим телом Орбита ответит idempotency_key_reused), 22.10.2026
+    ("deals", "followup_text", "TEXT"),
+    ("deals", "reply_text", "TEXT"),
     # Ручной «Повторить» ответа по шаблону: срок отправки (REPLY_MAX_LATE) отсчитывается и от этого момента
     ("deals", "reply_retried_at", "TEXT"),
     ("deals", "stage_attempts", "INTEGER NOT NULL DEFAULT 0"),

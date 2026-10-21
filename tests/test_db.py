@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from conftest import PHONE, midday_tz, run
 from first_contact import config
 from first_contact.db import DB, service_lock
+from first_contact.orbita import Message
 from first_contact.worker import Worker
 
 
@@ -83,3 +84,24 @@ def test_old_unconfirmed_first_message_accepts_late_confirmation(bitrix, orbita)
     run(w.on_orbita_event({"type": "message.sent", "data": {"request_key": "rk-300", "dialog_id": 5}}))
     row = w.db.deal(300)
     assert row["status"] == "sent_first" and row["first_sent_at"] == sent
+
+
+def test_step_key_saved_without_text_is_repeated(bitrix, orbita):
+    """База версии, где у намерения напоминания был только ключ (без текста): исход прошлой отправки неизвестен,
+    «Повторить» идёт тем же ключом; текст этой отправки запоминается для следующих повторов."""
+    db = DB(config.env().db_path)
+    for col in ("followup_text", "reply_text"):
+        db.conn.execute(f"ALTER TABLE deals DROP COLUMN {col}")
+    db.add_deal(301)
+    day_ago = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(timespec="seconds")
+    db.update(301, status="error", dialog_id="D1", first_sent_at=day_ago, followup_due_at=day_ago,
+              followup_key="deal-301-followup")
+    db.conn.close()
+
+    orbita.history_items["D1"] = [Message("", "", datetime.fromisoformat(day_ago), True)]   # клиент молчит
+    w = robot_on(bitrix, orbita)
+    assert run(w.retry(301, "a@x.ru")) == "sent_first"
+    run(w.tick())
+    (_, text, key), = orbita.replies
+    assert key == "deal-301-followup"
+    assert w.db.deal(301)["followup_text"] == text

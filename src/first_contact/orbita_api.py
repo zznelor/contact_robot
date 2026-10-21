@@ -59,16 +59,21 @@ def wait_until(code: str, retry_after_header, detail) -> datetime | None:
 
 
 class OrbitaAPIError(OrbitaError):
-    """Орбита ответила ошибкой. definite — Орбита точно ничего не отправила по этому запросу (4xx);
-    5xx и idempotency_in_progress — исход неизвестен."""
+    """Орбита ответила ошибкой. definite — по этому ключу идемпотентности точно ничего не отправлено (4xx);
+    5xx и idempotency_in_progress — исход неизвестен; key_reused (idempotency_key_reused) — ключ уже приходил
+    с другим телом: тот, прежний запрос мог отправить сообщение, повтор с этим телом исхода не узнает."""
 
     def __init__(self, status: int, code: str, detail, retry_at: datetime | None = None):
         super().__init__(f"HTTP {status} {code}: {detail}", retry_at)
         self.status, self.code, self.detail = status, code, detail
 
     @property
+    def key_reused(self) -> bool:
+        return self.code == "idempotency_key_reused"
+
+    @property
     def definite(self) -> bool:
-        return self.status < 500 and self.code != "idempotency_in_progress"
+        return self.status < 500 and self.code != "idempotency_in_progress" and not self.key_reused
 
 
 class OrbitaAPI:

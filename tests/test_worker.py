@@ -192,6 +192,15 @@ def test_lost_result_write_keeps_intent_retry_goes_to_same_channel(running, bitr
     assert restarted.db.deal(195)["status"] == expected
 
 
+def test_first_message_key_reused_needs_check(running, bitrix, orbita):
+    """422 idempotency_key_reused на «написать первым»: ключ уже приходил в Орбиту, прошлый запрос мог отправить
+    сообщение — не отказ, а «проверить вручную»; намерение остаётся до решения человека."""
+    orbita.answers["whatsapp"] = "reused"
+    row = start_deal(running, bitrix, 174)
+    assert row["status"] == "needs_check" and row["intent_key"] == f"deal-174-first-{PHONE}-whatsapp"
+    assert orbita.keys == [f"deal-174-first-{PHONE}-whatsapp"], "в другой канал не писали"
+
+
 def no_messenger_then_retry(w, bitrix, orbita, deal_id, pending=False):
     """Мессенджер не нашёлся (этап сменён), человек поправил телефон и нажал «Повторить»."""
     orbita.mode = "none"
@@ -724,6 +733,49 @@ def test_retry_after_lost_template_reply_answer_repeats_same_key(replying, bitri
     assert run(replying.retry(165, "a@x.ru")) == "replied"
     run(replying.tick())
     assert [k for _, _, k in orbita.replies] == ["deal-165-reply"] * 2
+
+
+def lost_step_answer(w, bitrix, orbita, step, deal_id):
+    """Напоминание или ответ по шаблону ушли в Орбиту, ответ до робота не дошёл (исход неизвестен), сделка
+    остановилась на ручной проверке."""
+    orbita.reply_mode = "lost"
+    if step == "followup":
+        due_followup(w, orbita, deal_id)
+    else:
+        w.s.reply_on, w.s.reply_delay_minutes = True, 0
+        client_writes(w, bitrix, orbita, deal_id, lambda first: [out(first), inc(datetime.now(UTC))])
+    run(w.tick())
+    w.db.update(deal_id, status="error")                # как после пяти сбоев подряд
+    orbita.reply_mode = "sent"
+
+
+@pytest.mark.parametrize("step", ["followup", "reply"])
+def test_retry_with_same_key_repeats_original_text(running, bitrix, orbita, step):
+    """Шаблон поменяли, пока исход прошлой отправки неизвестен: повтор тем же ключом несёт прежний текст —
+    иначе Орбита ответит idempotency_key_reused, а исход прошлого запроса так и не узнаем."""
+    lost_step_answer(running, bitrix, orbita, step, 172)
+    running.s.tpl_followup = running.s.tpl_reply = "Новый текст, {name}"
+    run(running.retry(172, "a@x.ru"))
+    run(running.tick())
+    (_, first_text, first_key), (_, again_text, again_key) = orbita.replies
+    assert (again_key, again_text) == (first_key, first_text)
+    assert "Новый текст" not in again_text
+
+
+@pytest.mark.parametrize("step", ["followup", "reply"])
+def test_key_reused_is_not_a_definite_failure(running, bitrix, orbita, step):
+    """422 idempotency_key_reused: этот ключ уже приходил в Орбиту — прошлый запрос мог отправить сообщение.
+    Это не отказ: человек проверяет переписку, намерение остаётся, «Повторить» — тем же ключом."""
+    lost_step_answer(running, bitrix, orbita, step, 173)
+    run(running.retry(173, "a@x.ru"))
+    orbita.reply_mode = "reused"
+    run(running.tick())
+    row = running.db.deal(173)
+    assert row["status"] == "needs_check" and row[f"{step}_key"] == f"deal-173-{step}"
+    orbita.reply_mode = "sent"
+    run(running.retry(173, "a@x.ru"))
+    run(running.tick())
+    assert [k for _, _, k in orbita.replies] == [f"deal-173-{step}"] * 3
 
 
 def test_template_reply_202_then_failed_needs_check_and_retry_resends(replying, bitrix, orbita):
