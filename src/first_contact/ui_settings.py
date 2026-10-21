@@ -191,12 +191,14 @@ def build_settings_router(ctx: Ctx) -> APIRouter:
 {block("tpl_first", "1. Первое сообщение", s.tpl_first, None, True,
        "Уходит клиенту, как только в Битриксе появилась сделка (в пределах окна отправки).")}
 {block("tpl_followup", "2. Напоминание, если клиент молчит", s.tpl_followup, "followup_on", s.followup_on,
-       "Уходит один раз, если клиент не ответил на первое сообщение.")}
+       "Уходит один раз, если клиент не ответил на первое сообщение. Не уходит, если его срок прошёл больше "
+       "48 часов назад (робот был выключен).")}
 <label class="field" style="max-width:280px"><span>Через сколько часов напоминать</span>
 <input type="number" name="followup_hours" min="0.05" max="720" step="0.05" value="{s.followup_hours:g}"></label>
 {block("tpl_reply", "3. Ответ на первое сообщение клиента", s.tpl_reply, "reply_on", s.reply_on,
        "Уходит один раз, когда клиент впервые написал в ответ. Не уходит, если менеджер успел ответить сам "
-       "за время паузы, и если клиент написал больше 30 минут назад. {deal_title} здесь пустой.")}
+       "за время паузы, и если робот опоздал с ответом больше чем на 30 минут после паузы (например, был выключен). "
+       "{deal_title} здесь пустой.")}
 <label class="field" style="max-width:280px"><span>Пауза перед ответом, минут</span>
 <input type="number" name="reply_delay_minutes" min="0" max="60" step="0.5" value="{s.reply_delay_minutes:g}"></label>
 <label class="field" style="max-width:420px"><span>Обращение, если в контакте нет имени</span>

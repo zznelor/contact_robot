@@ -267,6 +267,21 @@ def test_followup_with_incoming_without_time_needs_check(running, orbita):
     assert orbita.replies == []
 
 
+@pytest.mark.parametrize("history, expected", [
+    ([out(ago(days=4))], "no_reply"),                     # молчит — напоминание через трое суток не шлём
+    ([out(ago(days=4)), inc(ago(days=3))], "replied"),    # ответил — фиксируем ответ
+])
+def test_followup_overdue_more_than_48h_not_sent(running, orbita, history, expected):
+    """Робот или Орбита стояли: срок напоминания прошёл больше 48 ч назад."""
+    running.db.add_deal(126)
+    running.db.update(126, status="sent_first", dialog_id="D1", first_sent_at=ago(days=4).isoformat(),
+                      followup_due_at=ago(days=3).isoformat())
+    orbita.history_items["D1"] = history
+    run(running.tick())
+    assert running.db.deal(126)["status"] == expected
+    assert orbita.replies == []
+
+
 # ---------- клиент ответил: ответ по шаблону ----------
 
 @pytest.fixture
@@ -323,6 +338,18 @@ def test_no_template_reply_when_client_wrote_long_ago(replying, bitrix, orbita):
     run(replying.tick())
     assert orbita.replies == []
     assert not replying.db.deal(104)["reply_due_at"]
+
+
+def test_long_reply_pause_still_answers(replying, orbita):
+    """Пауза ответа 30 мин (форма разрешает до 60): проход опоздал на 40 с — ответ всё равно уходит."""
+    replying.s.reply_delay_minutes = 30
+    replying.db.add_deal(127)
+    replying.db.update(127, status="replied", dialog_id="D1", first_sent_at=ago(minutes=40).isoformat(),
+                       client_replied_at=ago(minutes=30, seconds=40).isoformat(),
+                       reply_due_at=ago(seconds=40).isoformat())
+    orbita.history_items["D1"] = [out(ago(minutes=40)), inc(ago(minutes=30, seconds=40))]
+    run(replying.tick())
+    assert [k for _, _, k in orbita.replies] == ["deal-127-reply"]
 
 
 def test_reply_by_template_off_not_planned(running, bitrix, orbita):

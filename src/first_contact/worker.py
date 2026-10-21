@@ -535,6 +535,13 @@ class Worker:
         if replied:
             await self._client_replied(deal_id, "по истории")
             return
+        if datetime.now(timezone.utc) - _ts(row["followup_due_at"]) > MAX_AGE:
+            # Робот или Орбита стояли: «напоминаю о заявке» через несколько суток — хуже, чем ничего
+            self.db.update(deal_id, status="no_reply", last_error="напоминание просрочено больше чем на 48 ч")
+            self.event(deal_id, "клиент не ответил", "напоминание не отправлено: просрочено больше чем на 48 ч")
+            await self.note(deal_id, "Клиент не ответил. Напоминание не отправлял: его срок прошёл больше 48 ч "
+                                     "назад — дальше вручную.")
+            return
         if not self.s.followup_on:
             self.db.update(deal_id, status="no_reply")
             self.event(deal_id, "клиент не ответил", "напоминание выключено")
@@ -637,9 +644,12 @@ class Worker:
             self.db.update(deal_id, reply_due_at=None)
             self.event(deal_id, "ответ по шаблону не нужен", "менеджер уже ответил")
             return
-        if datetime.now(timezone.utc) - client_msg.at > REPLY_MAX_LATE:
+        # Отсечка — от момента, когда робот должен был ответить (сообщение клиента + пауза из настроек), а не
+        # от самого сообщения: иначе при паузе от 30 мин ответ почти никогда не уходил бы
+        should_answer_at = client_msg.at + timedelta(minutes=self.s.reply_delay_minutes)
+        if datetime.now(timezone.utc) - should_answer_at > REPLY_MAX_LATE:
             self.db.update(deal_id, reply_due_at=None)
-            self.event(deal_id, "ответ по шаблону не отправлен", "клиент написал больше 30 мин назад")
+            self.event(deal_id, "ответ по шаблону не отправлен", "опоздал с ответом больше чем на 30 мин")
             return
         text = self.render("reply", row["name"] or "")
         key = f"deal-{deal_id}-reply" + (f"-r{row['reply_retry_n']}" if row["reply_retry_n"] else "")
