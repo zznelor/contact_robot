@@ -49,7 +49,48 @@ def test_stages_all_pages(http):
     assert len(stages) == 60 and stages[-1] == ("S59", "Этап 59")
 
 
-def test_new_deals_all_pages(http):
-    handler, _ = paged([{"ID": str(i)} for i in range(101, 154)])
-    http(handler)
-    assert run(Bitrix(HOOK).deal_ids_after(100, "0")) == list(range(101, 154))
+
+class DealList:
+    """crm.deal.list по документации (settings/performance/huge-data.md, list-methods-pecularities.md): фильтр >ID и
+    CATEGORY_ID, сортировка ID ASC, страница — 50 строк. start=-1 — до 50 строк без подсчёта total и без next;
+    start>=0 — смещение, next — откуда следующая страница. after_first — что поменялось в портале после первого
+    запроса (удалили сделку, отобрали права)."""
+
+    def __init__(self, ids, after_first=None):
+        self.ids, self.after_first, self.requests = list(ids), after_first, []
+
+    def __call__(self, req):
+        assert method_of(req) == "crm.deal.list"
+        body = json.loads(req.content)
+        self.requests.append(body)
+        rows = sorted(i for i in self.ids if i > int(body["filter"].get(">ID", 0)))
+        start = int(body.get("start", 0))
+        if start == -1:
+            page, out = rows[:50], {"total": 0}
+        else:
+            page, out = rows[start:start + 50], {"total": len(rows)}
+            if start + 50 < len(rows):
+                out["next"] = start + 50
+        if len(self.requests) == 1 and self.after_first:
+            self.after_first(self.ids)
+        return httpx.Response(200, json={"result": [{"ID": str(i)} for i in page], **out})
+
+
+def test_new_deals_survive_deletion_between_pages(http):
+    """Сделку с первой страницы удалили, пока робот читал вторую: следующая за страницей сделка не теряется
+    (по смещению start=50 она оказалась бы первой строкой «прочитанной» страницы и выпала навсегда)."""
+    portal = DealList(range(101, 161), after_first=lambda ids: ids.remove(101))
+    http(portal)
+    assert run(Bitrix(HOOK).deal_ids_after(100, "0")) == list(range(101, 161))
+    assert [r["start"] for r in portal.requests] == [-1, -1], "без подсчёта total, страница — фильтром >ID"
+    assert [r["filter"][">ID"] for r in portal.requests] == [100, 150]
+    assert all(r["order"] == {"ID": "ASC"} and r["filter"]["CATEGORY_ID"] == "0" for r in portal.requests)
+
+
+@pytest.mark.parametrize("count, requests", [(0, 1), (49, 1), (50, 2), (100, 3)])
+def test_new_deals_read_until_short_page(http, count, requests):
+    """Повторять, пока метод не вернёт меньше 50 элементов (huge-data.md)."""
+    portal = DealList(range(101, 101 + count))
+    http(portal)
+    assert run(Bitrix(HOOK).deal_ids_after(100, "0")) == list(range(101, 101 + count))
+    assert len(portal.requests) == requests

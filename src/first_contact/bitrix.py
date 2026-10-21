@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 import httpx
 
 
+# Размер страницы списочных методов: «всегда статичный — 50 записей» (list-methods-pecularities.md)
+PAGE = 50
+
+
 class BitrixError(RuntimeError):
     pass
 
@@ -70,7 +74,9 @@ class Bitrix:
         return (await self._raw(method, params))["result"]
 
     async def call_all(self, method: str, params: dict) -> list:
-        """Списочный метод целиком: Битрикс отдаёт по 50 строк и номер следующей страницы в next."""
+        """Списочный метод целиком по смещению: Битрикс отдаёт по 50 строк и номер следующей страницы в next.
+        Только для коротких справочников (этапы воронки): строка, удалённая между запросами страниц, сдвигает
+        смещение. Новые сделки читает deal_ids_after — фильтром по ID."""
         rows: list = []
         start = 0
         while True:
@@ -123,11 +129,26 @@ class Bitrix:
         return (c.get("NAME") or "").strip(), phones
 
     async def deal_ids_after(self, last_id: int, category_id: str | None) -> list[int]:
-        flt: dict = {">ID": last_id}
-        if category_id is not None:
-            flt["CATEGORY_ID"] = category_id
-        rows = await self.call_all("crm.deal.list", {"filter": flt, "select": ["ID"], "order": {"ID": "ASC"}})
-        return [int(r["ID"]) for r in rows]
+        """Сделки с ID больше last_id, по возрастанию. Страницы — фильтром по последнему полученному ID и start=-1
+        (settings/performance/huge-data.md), а не смещением: удаление сделки или потеря прав на неё между запросами
+        страниц сдвигает смещение, и следующая сделка выпала бы из выборки навсегда (курсор опроса уйдёт дальше неё).
+        Повтор, пока страница полная (PAGE строк); total при start=-1 не считается."""
+        ids: list[int] = []
+        after = last_id
+        while True:
+            flt: dict = {">ID": after}
+            if category_id is not None:
+                flt["CATEGORY_ID"] = category_id
+            rows = await self.call("crm.deal.list", {"filter": flt, "select": ["ID"], "order": {"ID": "ASC"},
+                                                     "start": -1}) or []
+            page = [int(r["ID"]) for r in rows]
+            ids += page
+            if len(page) < PAGE:
+                return ids
+            if max(page) <= after:
+                # Полная страница без роста ID — фильтр >ID не применился; дальше цикл не кончился бы
+                raise BitrixError(f"crm.deal.list: фильтр >ID не применён (страница после ID {after})")
+            after = max(page)
 
     async def max_deal_id(self) -> int:
         rows = await self.call("crm.deal.list", {"select": ["ID"], "order": {"ID": "DESC"}, "start": -1})
