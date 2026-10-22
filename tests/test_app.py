@@ -1,8 +1,12 @@
 """HTTP-входы app.py: вебхуки Орбиты и Битрикса, /healthz и /ready. Логика событий — test_worker.py."""
 
+import asyncio
+import gc
 import logging
 import time
+import weakref
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -161,3 +165,99 @@ def test_bitrix_event_processing_failure_logged(client, worker, monkeypatch, cap
         assert r.status_code == 200
         wait_for(lambda: worker.db.events(5))
     assert any(rec.name == "first_contact" and rec.levelno == logging.ERROR and rec.exc_info for rec in caplog.records)
+
+
+# ---------- фоновые задачи вебхука и проход робота (в одном цикле событий с тестом, без второго потока) ----------
+
+DEAL_ADD = {"auth[application_token]": "T", "event": "ONCRMDEALADD", "data[FIELDS][ID]": "5"}
+
+
+async def settle() -> None:
+    """Дать циклу событий доделать готовое: шаги фоновых задач и их done-колбэки."""
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+def post_deal_add(worker, during=None):
+    """Событие Битрикса о сделке 5 в приложение в том же цикле событий; during() — после ответа, внутри цикла."""
+    worker.s.bitrix_app_token = "T"
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=create_app(worker))
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            r = await c.post("/bitrix/deal-add", data=DEAL_ADD)
+        await settle()
+        if during is not None:
+            await during()
+        return r
+    return run(scenario())
+
+
+@pytest.mark.parametrize("fails", [True, False])
+def test_background_failure_recorded_in_deal_journal(worker, monkeypatch, caplog, fails):
+    """Событие принято (200), обработка в фоне упала — ошибка в логе с трассировкой и в журнале этой сделки, с типом
+    исключения. Не упала — ни записи в журнале, ни ошибки в логе."""
+    async def on_deal_added(deal_id):
+        if fails:
+            raise RuntimeError("database is locked")
+    monkeypatch.setattr(worker, "on_deal_added", on_deal_added)
+    with caplog.at_level(logging.ERROR, logger="first_contact"):
+        assert post_deal_add(worker).status_code == 200
+    errors = [rec for rec in caplog.records if rec.name == "first_contact" and rec.levelno >= logging.ERROR]
+    events = worker.db.events(5)
+    if fails:
+        assert len(events) == 1 and "RuntimeError" in events[0]["detail"]
+        assert len(errors) == 1 and errors[0].exc_info and errors[0].exc_info[0] is RuntimeError
+    else:
+        assert (events, errors) == ([], [])
+
+
+def test_background_task_kept_until_done_then_released(worker, monkeypatch):
+    """Фоновую задачу, пока она ждёт, не собирает сборщик мусора (цикл событий держит задачи только слабой
+    ссылкой); закончив, она не остаётся в памяти приложения."""
+    pending, finished, tasks = [], [], []
+
+    async def on_deal_added(deal_id):
+        fut = asyncio.get_running_loop().create_future()     # на будущее ссылается только сама задача
+        pending.append(weakref.ref(fut))
+        await fut
+        finished.append(deal_id)
+    monkeypatch.setattr(worker, "on_deal_added", on_deal_added)
+
+    async def during():
+        loop = asyncio.get_running_loop()
+        tasks.extend(weakref.ref(t) for t in asyncio.all_tasks(loop) if t is not asyncio.current_task())
+        gc.collect()
+        fut = pending[0]()
+        assert fut is not None, "ждущая фоновая задача собрана сборщиком мусора"
+        fut.set_result(None)
+        del fut
+        await settle()
+        gc.collect()
+    post_deal_add(worker, during)
+    assert finished == [5]
+    assert tasks and all(t() is None for t in tasks), "закончившаяся фоновая задача удерживается"
+
+
+def test_lifespan_runs_robot_pass_again_and_again(worker, monkeypatch):
+    """Пока сервис работает, проход робота повторяется каждые POLL_SECONDS (docs/РАЗРАБОТЧИКУ.md)."""
+    monkeypatch.setattr(worker.env, "poll_seconds", 0)
+    app = create_app(worker)
+
+    async def scenario():
+        passes, again = [], asyncio.Event()
+
+        async def tick():
+            passes.append(1)
+            if len(passes) >= 3:
+                again.set()
+        monkeypatch.setattr(worker, "tick", tick)
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(again.wait(), 5)
+    run(scenario())
+
+
+@pytest.mark.parametrize("path", ["/openapi.json", "/docs", "/redoc"])
+def test_framework_api_pages_not_served(worker, path):
+    """Наружу открыты только панель (после входа), вебхуки и проверки: схемы API и страниц FastAPI нет."""
+    assert TestClient(create_app(worker)).get(path, follow_redirects=False).status_code == 404
