@@ -61,7 +61,8 @@ def robot(db, settings, bitrix, http):
 
 @pytest.mark.parametrize("change", ["disconnected", "reordered"])
 def test_retry_after_lost_answer_never_goes_to_another_channel(robot, bitrix, change, clock):
-    """WhatsApp отправил, ответ потерян; к повтору WhatsApp отключился или порядок каналов сменили."""
+    """WhatsApp отправил, ответ потерян; к повтору WhatsApp отключился (сделка ждёт его подключения) или порядок
+    каналов сменили."""
     orbita = Orbita({"whatsapp", "max"}, {"whatsapp": "lost", "max": 201})
     w = robot(orbita, ["whatsapp", "max"])
     bitrix.new_ids.append(140)
@@ -77,7 +78,7 @@ def test_retry_after_lost_answer_never_goes_to_another_channel(robot, bitrix, ch
     run(w.tick())
 
     assert [ch for ch, _ in orbita.posts] == ["whatsapp"] * len(orbita.posts), "в Max второе первое не ушло"
-    expected = "needs_check" if change == "disconnected" else "sent_first"
+    expected = "new" if change == "disconnected" else "sent_first"
     assert w.db.deal(140)["status"] == expected
     assert len({key for _, key in orbita.posts}) == 1, "повтор — с тем же ключом"
 

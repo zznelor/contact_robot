@@ -479,6 +479,60 @@ def test_unfinished_send_found_not_sent_then_ordinary_rules(running, bitrix, orb
     assert len(orbita.keys) == 2, "исход выяснен — запрос не повторяется"
 
 
+@pytest.mark.parametrize("connected", [set(), {"max", "telegram"}], ids=["no_channels", "other_channels"])
+def test_unfinished_first_send_waits_for_its_channel_without_spending_attempts(running, bitrix, orbita, clock,
+                                                                                connected):
+    """Исход первого сообщения в WhatsApp неизвестен (ответ потерян), а WhatsApp отключили — вместе с остальными
+    каналами или один. Робот ждёт подключения именно этого канала: попытки не тратит, в другой канал не пишет, в
+    журнале «ждём подключения канала» один раз. Канал вернулся — после паузы повтор тем же ключом и телом."""
+    orbita.answers["whatsapp"] = "lost"
+    start_deal(running, bitrix, 240)
+    attempts = running.db.deal(240)["attempts"]
+    orbita.connected, orbita.answers = connected, {}
+    for _ in range(10):
+        clock.advance(minutes=30)
+        run(running.tick())
+    row = running.db.deal(240)
+    assert (row["status"], row["attempts"]) == ("new", attempts), "ожидание канала попыток не тратит"
+    assert row["last_error"], "причина ожидания — в карточке"
+    assert datetime.fromisoformat(row["next_attempt_at"]) > datetime.now(UTC) + clock.shift
+    assert [e for e, _ in journal(running.db, 240)].count("ждём подключения канала") == 1
+    assert orbita.keys == [f"deal-240-first-{PHONE}-whatsapp"], "в другой канал не писали"
+
+    orbita.connected = set(config.CHANNELS)
+    run(running.tick())
+    assert len(orbita.keys) == 1, "до конца паузы канал не проверяется"
+    clock.advance(minutes=3)
+    run(running.tick())
+    assert running.db.deal(240)["status"] == "sent_first"
+    assert orbita.keys == [f"deal-240-first-{PHONE}-whatsapp"] * 2
+    assert orbita.first[1] == orbita.first[0], "повтор — тем же телом"
+
+
+def test_unfinished_first_send_needs_check_when_its_channel_not_back_in_48h(running, bitrix, orbita, clock):
+    """Канал незавершённой отправки так и не подключили: через 48 ч от появления сделки повтора нет — «проверить
+    вручную» с причиной и комментарием в сделку; канал, подключённый позже, ничего не отправляет."""
+    orbita.answers["whatsapp"] = "lost"
+    start_deal(running, bitrix, 241)
+    orbita.connected, orbita.answers = {"max"}, {}
+    clock.advance(minutes=3)
+    run(running.tick())
+    clock.advance(hours=47)
+    run(running.tick())
+    assert running.db.deal(241)["status"] == "new", "до 48 ч — ждём канал"
+    notes = len(notes_of(bitrix, 241))
+
+    clock.advance(hours=2)
+    run(running.tick())
+    row = running.db.deal(241)
+    assert row["status"] == "needs_check" and row["last_error"]
+    assert len(notes_of(bitrix, 241)) == notes + 1, "комментарий в сделку"
+    orbita.connected = set(config.CHANNELS)
+    clock.advance(minutes=3)
+    run(running.tick())
+    assert orbita.keys == [f"deal-241-first-{PHONE}-whatsapp"]
+
+
 def no_messenger_then_retry(w, bitrix, orbita, deal_id, pending=False):
     """Мессенджер не нашёлся (этап сменён), человек поправил телефон и нажал «Повторить»."""
     orbita.mode = "none"

@@ -142,6 +142,24 @@ def test_old_install_reminder_key_reused_retries_with_new_key(bitrix, orbita):
     assert [k for _, _, k in orbita.replies] == ["deal-303-followup", "deal-303-followup-r1"]
 
 
+def test_unfinished_first_send_waits_for_its_channel_after_upgrade(bitrix, orbita):
+    """База версии без channel_wait_at: исход первого сообщения в WhatsApp неизвестен, а WhatsApp отключён. После
+    обновления сделка ждёт подключения канала, попыток не тратя и в другой канал не пиша, — колонка появляется сама."""
+    db = DB(config.env().db_path)
+    db.conn.execute("ALTER TABLE deals DROP COLUMN channel_wait_at")
+    db.add_deal(304)
+    db.update(304, status="new", name="Анна", first_text="Здравствуйте", intent_phone=PHONE, intent_channel="whatsapp",
+              intent_key=f"deal-304-first-{PHONE}-whatsapp")
+    db.conn.close()
+
+    orbita.connected = {"max"}
+    w = robot_on(bitrix, orbita)
+    run(w.tick())
+    row = w.db.deal(304)
+    assert (row["status"], row["attempts"]) == ("new", 0) and row["channel_wait_at"] and row["next_attempt_at"]
+    assert orbita.keys == []
+
+
 # ---------- поиск сделок ----------
 
 @pytest.mark.parametrize("status, q, ids, total", [

@@ -30,6 +30,10 @@ RETRY_PAUSE = timedelta(minutes=2)
 MAX_AGE = timedelta(hours=48)
 # У контактов новой сделки нет телефона — ждём столько от её появления: контакт могут привязать позже
 PHONE_WAIT = timedelta(minutes=10)
+# Незавершённая отправка первого сообщения (намерение), а её канал отключён: робот ждёт именно этот канал (в другой
+# писать нельзя — клиент получит два первых), не тратя попыток, и проверяет его так часто. Пауза — как первая после
+# сбоя: проверка — один дешёвый запрос списка каналов, а первое сообщение после подключения не должно ждать долго
+CHANNEL_WAIT = RETRY_PAUSE
 # Орбита ответила 202 на «написать первым», а вебхука с исходом нет так долго — зовём человека
 PENDING_TIMEOUT = timedelta(minutes=30)
 # Ответ по шаблону имеет смысл, только пока клиент ещё в разговоре
@@ -48,11 +52,11 @@ RETRYABLE = {"error", "needs_check", "skipped", "no_messenger", "no_phone"}
 
 class UnknownOutcome(Exception):
     """Отправка могла уйти, а могла и нет. Повторять нельзя — нужен человек. fields — что записать той же записью,
-    что ставит «проверить вручную»."""
+    что ставит «проверить вручную»; note — комментарий в сделку вместо общего «не уверен, ушло ли»."""
 
-    def __init__(self, message: str, **fields):
+    def __init__(self, message: str, note: str | None = None, **fields):
         super().__init__(message)
-        self.fields = fields
+        self.note, self.fields = note, fields
 
 
 @dataclass
@@ -271,7 +275,7 @@ class Worker:
         except UnknownOutcome as e:
             self.db.update(deal_id, status="needs_check", last_error=str(e), **e.fields)
             self.event(deal_id, "исход отправки неизвестен", str(e))
-            await self.note(deal_id, "Не уверен, ушло ли сообщение клиенту. Проверьте переписку в Орбите.")
+            await self.note(deal_id, e.note or "Не уверен, ушло ли сообщение клиенту. Проверьте переписку в Орбите.")
         except Exception as e:  # noqa: BLE001
             retry_at = getattr(e, "retry_at", None)
             if retry_at is not None:
@@ -505,7 +509,8 @@ class Worker:
             return
 
         if connected is None:
-            connected = await self._connected()
+            connected = await self.orbita.connected_channels()
+        self._require_connected(connected)
         order = list(self.s.orbita_channels)
 
         self.db.update(deal_id, name=names[phones[0]], phone=", ".join(phones))
@@ -549,37 +554,59 @@ class Worker:
         await self._no_messenger(deal_id, "no_messenger", f"мессенджер не найден: {', '.join(phones)}",
                                 deal.stage_id)
 
-    async def _connected(self) -> set[str]:
-        connected = await self.orbita.connected_channels()
+    def _require_connected(self, connected: set[str]) -> None:
+        """Новая отправка: подключён хотя бы один канал из настроек."""
         order = list(self.s.orbita_channels)
         if not connected & set(order):
             # Не «мессенджер не найден»: иначе живой клиент уйдёт на этап NO_MESSENGER
             raise OrbitaError(f"нет подключённых каналов из {order}")
-        return connected
 
     async def _resume_first(self, deal_id: int, row) -> tuple[bool, set[str]]:
-        """Узнать исход прерванной отправки первого сообщения повтором того же запроса. True — отправка завершена
-        (201 / 202, исход сопоставлен в _first_done); False — исход определён и сообщение не ушло (намерение снято
-        в _start), дальше — обычная новая отправка по свежим данным.
+        """Узнать исход прерванной отправки первого сообщения повтором того же запроса. True — по сделке в этот раз
+        больше ничего: отправка завершена (201 / 202, исход сопоставлен в _first_done) или ждём канал намерения;
+        False — исход определён и сообщение не ушло (намерение снято в _start), дальше — обычная новая отправка по
+        свежим данным. Возвращает и подключённые каналы — новой отправке они нужны те же.
 
         До повтора — только то, что запрещает сам повтор: сделка ещё в работе робота (status new — ни ручной
         остановки, ни пропуска), окно отправки (проверяет вызывающий) и 48 ч. Повтор тем же ключом не шлёт второе
         сообщение, только если Орбита первый запрос получила; не получила — повтор и есть отправка, а писать
         «вы оставили заявку» спустя двое суток нельзя. Поэтому за 48 ч повтора нет, а сделка не пропускается молча
-        (сообщение могло уйти) — «проверить вручную»."""
+        (сообщение могло уйти) — «проверить вручную».
+
+        Канал намерения не подключён (отключили его один или все каналы) — в другой нельзя: клиент получит два
+        первых. Сделка ждёт подключения этого канала, проверяя его раз в CHANNEL_WAIT, попыток не тратит
+        (channel_wait_at — с какого момента ждём); каналы из настроек для повтора не важны — нужен только этот. Не
+        вернулся за те же 48 ч — «проверить вручную» с причиной «канал не подключился» и комментарием в сделку."""
+        channel, phone = row["intent_channel"], row["intent_phone"]
+        start = max(filter(None, (_ts(row["created_at"]), _ts(row["retried_at"]))))
         if self._expired(row, _ts(row["created_at"])):
-            raise UnknownOutcome(f"исход отправки в {row['intent_channel']} ({row['intent_phone']}) неизвестен, "
+            if row["channel_wait_at"]:
+                raise UnknownOutcome(
+                    f"исход отправки в {channel} ({phone}) неизвестен, а канал {channel} не подключён с "
+                    f"{row['channel_wait_at']} и за 48 ч не вернулся — повтор не отправляю",
+                    note=f"Не уверен, ушло ли первое сообщение клиенту: канал {channel} отключён и за 48 ч не "
+                         "подключился, повтор не отправлял. Проверьте переписку в Орбите.")
+            raise UnknownOutcome(f"исход отправки в {channel} ({phone}) неизвестен, "
                                  "а заявка уже старше 48 ч — повтор не отправляю")
-        connected = await self._connected()
-        # В другой канал нельзя — клиент получит два первых. Тело — исходное целиком: канал, номер, ключ, текст и имя
-        # (first_text и name записаны той же попыткой до запроса); имя из Битрикса могли поправить, а с другим телом
-        # Орбита ответит idempotency_key_reused
-        if row["intent_channel"] not in connected:
-            raise UnknownOutcome(f"исход отправки в {row['intent_channel']} ({row['intent_phone']}) неизвестен, "
-                                 f"а канал сейчас не подключён")
-        res = await self._start(deal_id, row["intent_phone"], row["intent_channel"], row["first_text"],
-                                row["intent_key"], row["name"] or "")
-        return await self._first_done(deal_id, row["intent_phone"], res), connected
+        connected = await self.orbita.connected_channels()
+        if channel not in connected:
+            until = (start + MAX_AGE).isoformat(timespec="seconds")
+            reason = (f"исход отправки в {channel} ({phone}) неизвестен, а канал не подключён — ждём его до {until}, "
+                      "в другой канал не пишу")
+            waiting = datetime.now(timezone.utc) + CHANNEL_WAIT
+            fields: dict = dict(next_attempt_at=waiting.isoformat(timespec="seconds"), last_error=reason)
+            if not row["channel_wait_at"]:
+                fields["channel_wait_at"] = now()
+            self.db.update(deal_id, **fields)
+            if not row["channel_wait_at"]:
+                self.event(deal_id, "ждём подключения канала", reason)
+            return True, connected
+        if row["channel_wait_at"]:
+            self.event(deal_id, "канал подключён", f"{channel}: повторяю отправку")
+        # Тело — исходное целиком: канал, номер, ключ, текст и имя (first_text и name записаны той же попыткой до
+        # запроса); имя из Битрикса могли поправить, а с другим телом Орбита ответит idempotency_key_reused
+        res = await self._start(deal_id, phone, channel, row["first_text"], row["intent_key"], row["name"] or "")
+        return await self._first_done(deal_id, phone, res), connected
 
     async def _start(self, deal_id: int, phone: str, channel: str, text: str, key: str,
                      name: str) -> FirstSendResult:
@@ -590,7 +617,8 @@ class Worker:
         «не найден» / «не проверен» / «номер не принят» — здесь; ушло или могло уйти (201/202) — в _first_done
         той же записью, что и результат (иначе обрыв между двумя записями оставит сделку без намерения и без
         результата). Сбой связи, 5xx, idempotency_in_progress оставляют намерение — повтор пойдёт туда же."""
-        self.db.update(deal_id, intent_phone=phone, intent_channel=channel, intent_key=key, first_text=text, name=name)
+        self.db.update(deal_id, intent_phone=phone, intent_channel=channel, intent_key=key, first_text=text, name=name,
+                       channel_wait_at=None)
         try:
             res = await self.orbita.start_dialog(channel, phone, text, key, name or None)
         except OrbitaAPIError as e:
