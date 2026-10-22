@@ -174,6 +174,30 @@ def test_query_limit_pause_increases_and_resets(http, monkeypatch):
     assert pauses[2] == pauses[0], "после успешного ответа — снова с короткой паузы"
 
 
+def test_long_query_limit_pause_stays_within_30_minutes(http, monkeypatch):
+    """Лимит держится сутки (соседи по IP выбирают его постоянно), успешных ответов нет: каждый отказ — ошибка лимита
+    со сроком не дальше 30 минут (LIMIT_PAUSE_MAX в docs/РАЗРАБОТЧИКУ.md), а не сбой, тратящий попытки шага."""
+    refusals = 60                                       # сутки по 30 минут — дальше, чем помещается удвоение минуты
+    portal = Script(*[QUERY_LIMIT] * refusals)
+    http(portal)
+    shift = {"now": datetime.now(timezone.utc)}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return shift["now"]
+    monkeypatch.setattr(bitrix_mod, "datetime", Clock)
+    b = Bitrix(HOOK)
+    pauses = []
+    for _ in range(refusals):
+        with pytest.raises(BitrixError) as e:
+            run(b.get_deal(7))
+        pauses.append(e.value.retry_at - shift["now"])
+        shift["now"] = e.value.retry_at
+    assert len(portal.requests) == refusals
+    assert max(pauses) == timedelta(minutes=30) and pauses[-1] == timedelta(minutes=30)
+
+
 def test_operation_time_limit_waits_for_reset_from_last_success(http):
     """OPERATION_TIME_LIMIT: «для первой повторной попытки ориентироваться на operating_reset_at из последнего
     успешного ответа» этого метода (limits.md)."""

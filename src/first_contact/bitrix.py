@@ -20,6 +20,9 @@ LIMIT_CODES = {"QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT"}
 # пороге 50 (тариф «Прочие», limits.md) — минута с запасом; рост — на случай соседей по IP с тем же порталом
 LIMIT_PAUSE = timedelta(minutes=1)
 LIMIT_PAUSE_MAX = timedelta(minutes=30)
+# Показатель удвоения, на котором пауза уже не меньше LIMIT_PAUSE_MAX: дальше он не растёт. Иначе при долгом лимите
+# без успешных ответов LIMIT_PAUSE * 2 ** n выходит за предел timedelta (OverflowError) раньше, чем min его ограничит
+LIMIT_DOUBLINGS = (LIMIT_PAUSE_MAX // LIMIT_PAUSE).bit_length()
 # Повтор не поможет: нет доступа, вебхук не найден или без нужных прав, метода нет, портал закрыт
 # (_includes/system-errors.md; NOT_FOUND / ACCESS_DENIED — crm.timeline.comment.add, crm.deal.contact.items.get).
 # OVERLOAD_LIMIT — «ручная индивидуальная блокировка», снимает только поддержка Битрикса, ожиданием не проходит
@@ -169,7 +172,7 @@ class Bitrix:
     def _limit_wait(self, method: str, code: str, reset: datetime | None, now: datetime) -> datetime:
         """Срок после ошибки лимита; запоминается, и до него клиент Битрикс не вызывает."""
         self._limit_streak += 1
-        until = now + min(LIMIT_PAUSE * 2 ** (self._limit_streak - 1), LIMIT_PAUSE_MAX)
+        until = now + min(LIMIT_PAUSE * 2 ** min(self._limit_streak - 1, LIMIT_DOUBLINGS), LIMIT_PAUSE_MAX)
         if code == "OPERATION_TIME_LIMIT":
             # Срок сброса корзины — из этого ответа, если Битрикс его прислал, иначе из последнего успешного ответа
             # метода. Уже прошёл (ошибка повторилась после него) — ждём следующий сброс нарастающей задержкой
