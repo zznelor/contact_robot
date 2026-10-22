@@ -440,6 +440,18 @@ class Worker:
         row = self.db.deal(deal_id)
         if row is None or row["status"] != "new":
             return
+        connected: set[str] | None = None
+        if row["intent_key"] and not self.dry_run:
+            # Прошлая попытка оборвалась с неизвестным исходом: сообщение могло уйти, а его исход (message.sent /
+            # message.failed) мог уже прийти и ждать ключа. Исход выясняется ДО решений по свежим данным Битрикса
+            # (контакты, телефоны, этап, воронка): это не новая отправка, а завершение переданной, и отвязанный
+            # контакт или закрытая сделка не отменяют того, что клиент мог уже получить сообщение
+            if not self.in_window():
+                return                                  # повтор может оказаться и первой отправкой — только в окно
+            done, connected = await self._resume_first(deal_id, row)
+            if done:
+                return
+            row = self.db.deal(deal_id)                 # исход определён и это не отправка — намерение снято
         # 48 ч — от создания сделки в Битриксе (DATE_CREATE; пока не спросили Битрикс — от момента, когда
         # робот её увидел, это не раньше) или от ручного повтора / «Взять в работу», что позже
         if self._too_old(deal_id, row, _ts(row["created_at"])):
@@ -492,24 +504,9 @@ class Worker:
             self.event(deal_id, "DRY_RUN: отправил бы первое", f"{phones} → {text!r}")
             return
 
-        connected = await self.orbita.connected_channels()
+        if connected is None:
+            connected = await self._connected()
         order = list(self.s.orbita_channels)
-        if not connected & set(order):
-            # Не «мессенджер не найден»: иначе живой клиент уйдёт на этап NO_MESSENGER
-            raise OrbitaError(f"нет подключённых каналов из {order}")
-
-        if row["intent_key"]:
-            # Прошлая попытка оборвалась с неизвестным исходом: сообщение могло уйти. Узнаём исход повтором
-            # того же запроса — в другой канал нельзя, клиент получит два первых. Тело — исходное целиком: канал,
-            # номер, ключ, текст и имя (first_text и name записаны той же попыткой до запроса); имя из Битрикса
-            # могли поправить, а с другим телом Орбита ответит idempotency_key_reused
-            if row["intent_channel"] not in connected:
-                raise UnknownOutcome(f"исход отправки в {row['intent_channel']} ({row['intent_phone']}) неизвестен, "
-                                     f"а канал сейчас не подключён")
-            res = await self._start(deal_id, row["intent_phone"], row["intent_channel"], row["first_text"],
-                                    row["intent_key"], row["name"] or "")
-            if await self._first_done(deal_id, row["intent_phone"], res):
-                return
 
         self.db.update(deal_id, name=names[phones[0]], phone=", ".join(phones))
         suffix = f"-r{row['retry_n']}" if row["retry_n"] else ""
@@ -551,6 +548,38 @@ class Worker:
                               retry_at)
         await self._no_messenger(deal_id, "no_messenger", f"мессенджер не найден: {', '.join(phones)}",
                                 deal.stage_id)
+
+    async def _connected(self) -> set[str]:
+        connected = await self.orbita.connected_channels()
+        order = list(self.s.orbita_channels)
+        if not connected & set(order):
+            # Не «мессенджер не найден»: иначе живой клиент уйдёт на этап NO_MESSENGER
+            raise OrbitaError(f"нет подключённых каналов из {order}")
+        return connected
+
+    async def _resume_first(self, deal_id: int, row) -> tuple[bool, set[str]]:
+        """Узнать исход прерванной отправки первого сообщения повтором того же запроса. True — отправка завершена
+        (201 / 202, исход сопоставлен в _first_done); False — исход определён и сообщение не ушло (намерение снято
+        в _start), дальше — обычная новая отправка по свежим данным.
+
+        До повтора — только то, что запрещает сам повтор: сделка ещё в работе робота (status new — ни ручной
+        остановки, ни пропуска), окно отправки (проверяет вызывающий) и 48 ч. Повтор тем же ключом не шлёт второе
+        сообщение, только если Орбита первый запрос получила; не получила — повтор и есть отправка, а писать
+        «вы оставили заявку» спустя двое суток нельзя. Поэтому за 48 ч повтора нет, а сделка не пропускается молча
+        (сообщение могло уйти) — «проверить вручную»."""
+        if self._expired(row, _ts(row["created_at"])):
+            raise UnknownOutcome(f"исход отправки в {row['intent_channel']} ({row['intent_phone']}) неизвестен, "
+                                 "а заявка уже старше 48 ч — повтор не отправляю")
+        connected = await self._connected()
+        # В другой канал нельзя — клиент получит два первых. Тело — исходное целиком: канал, номер, ключ, текст и имя
+        # (first_text и name записаны той же попыткой до запроса); имя из Битрикса могли поправить, а с другим телом
+        # Орбита ответит idempotency_key_reused
+        if row["intent_channel"] not in connected:
+            raise UnknownOutcome(f"исход отправки в {row['intent_channel']} ({row['intent_phone']}) неизвестен, "
+                                 f"а канал сейчас не подключён")
+        res = await self._start(deal_id, row["intent_phone"], row["intent_channel"], row["first_text"],
+                                row["intent_key"], row["name"] or "")
+        return await self._first_done(deal_id, row["intent_phone"], res), connected
 
     async def _start(self, deal_id: int, phone: str, channel: str, text: str, key: str,
                      name: str) -> FirstSendResult:
@@ -594,9 +623,13 @@ class Worker:
             return True
         return False
 
-    def _too_old(self, deal_id: int, row, created: datetime | None) -> bool:
+    @staticmethod
+    def _expired(row, created: datetime | None) -> bool:
         start = max(filter(None, (created, _ts(row["retried_at"]))), default=None)
-        if start is None or datetime.now(timezone.utc) - start <= MAX_AGE:
+        return start is not None and datetime.now(timezone.utc) - start > MAX_AGE
+
+    def _too_old(self, deal_id: int, row, created: datetime | None) -> bool:
+        if not self._expired(row, created):
             return False
         self.db.update(deal_id, status="skipped", last_error="заявка старше 48 ч")
         self.event(deal_id, "пропущена", "заявка старше 48 ч")

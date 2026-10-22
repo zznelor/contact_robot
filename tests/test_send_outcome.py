@@ -179,3 +179,52 @@ def test_outcomes_older_than_30_days_removed(worker):
     db.conn.execute("UPDATE send_outcomes SET at=? WHERE request_key='rk-old'", (ago(days=31).isoformat(timespec="seconds"),))
     run(worker.tick())
     assert (db.outcome("rk-old"), bool(db.outcome("rk-new"))) == (None, True)
+
+
+def lost_first_answer(w, bitrix, orbita, ok):
+    """Первое сообщение: Орбита приняла запрос, ответ до робота не дошёл (в сделке — намерение, request_key пуст);
+    исход пришёл раньше, чем робот узнал request_key. Повтор того же запроса снова получит 202 с тем же ключом."""
+    handed_over(w, bitrix, orbita, "first", "lost")
+    row = w.db.deal(D)
+    assert row["intent_key"] == KEY["first"] and not row["request_key"]
+    outcome(w, "first", ok)
+    accept_again(orbita, "first")
+
+
+@pytest.mark.parametrize("ok", [True, False], ids=["sent", "failed"])
+@pytest.mark.parametrize("change", ["contact_removed", "deal_closed", "other_funnel", "no_messenger_stage"])
+def test_unfinished_first_send_restored_before_fresh_bitrix_data(running, bitrix, orbita, clock, change, ok):
+    """Исход незавершённой отправки первого сообщения выясняется повтором того же запроса раньше, чем робот решает
+    по свежим данным Битрикса: менеджер отвязал контакт, закрыл сделку, перенёс её в другую воронку или на этап
+    «Не нашёл мессенджер» — сообщение, которое могло уйти, всё равно сопоставляется со своим исходом."""
+    lost_first_answer(running, bitrix, orbita, ok)
+    if change == "contact_removed":
+        bitrix.phones = []
+    elif change == "deal_closed":
+        bitrix.semantic = "F"
+    elif change == "other_funnel":
+        bitrix.category = "5"
+    else:
+        bitrix.stage = "NO_MESSENGER"
+    w = Worker(config.env(), running.s, running.db, bitrix, orbita)
+    clock.advance(minutes=11)                           # и 10 минут ожидания телефона прошли
+    run(w.tick())
+
+    row = w.db.deal(D)
+    assert w.db.outcome(f"rk-{KEY['first']}")["applied_at"], "исход сопоставлен с отправкой"
+    assert bool(row["first_sent_at"]) is ok
+    assert row["status"] == ("sent_first" if ok else "needs_check")
+    assert not row["request_key"] and not row["intent_key"]
+    assert orbita.keys == [KEY["first"], KEY["first"]], "повтор — тот же запрос, нового нет"
+    assert bitrix.stages_set == [], "уже переданную заявку не уводят на «Не нашёл мессенджер»"
+
+
+def test_unfinished_first_send_older_than_48h_goes_to_human(running, bitrix, orbita, clock):
+    """Незавершённая отправка, повтор которой выпал бы за 48 ч: повтор мог бы стать первой отправкой спустя двое
+    суток, поэтому его нет, — но и молча пропускать сделку нельзя: сообщение могло уйти. «Проверить вручную»."""
+    handed_over(running, bitrix, orbita, "first", "lost")
+    clock.advance(hours=49)
+    run(running.tick())
+    row = running.db.deal(D)
+    assert row["status"] == "needs_check" and row["intent_key"] == KEY["first"]
+    assert orbita.keys == [KEY["first"]]
