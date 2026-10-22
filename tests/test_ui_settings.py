@@ -181,17 +181,30 @@ def test_message_shown_escaped(admin):
 
 # ---------- формы настроек: что на странице, то и сохраняется ----------
 
+VARIANTS = {
+    # Значения нарочно не первые и не последние в своих списках формы (кроме воронки — её два варианта ниже): форма,
+    # которая потеряла отметку selected или отметила всё, отправит другое значение
+    "a": dict(deal_category_id="3", no_messenger_stage="C3:NEW", orbita_channels=["max"], followup_on=True,
+              reply_on=True, tz_name="Europe/Moscow"),
+    # Часовой пояс не из списка панели (задан до панели, переменной TZ_NAME), флажки сняты
+    "b": dict(deal_category_id="0", no_messenger_stage="NEW", orbita_channels=["telegram", "whatsapp"],
+              followup_on=False, reply_on=False, tz_name="Etc/GMT-3"),
+}
+
+
+def fill(panel, variant: str = "a"):
+    """Все разделы настроек заполнены непохожими на умолчания значениями; включены не все мессенджеры."""
+    panel.worker.save(
+        bitrix_app_token="app-token-1", orbita_webhook_secret="whsec_saved",
+        tpl_first="{name}, добрый день!\nЭто первое.", tpl_followup="{name}, напоминаем о {deal_title}",
+        tpl_reply="Спасибо, {name}!", tpl_no_name="Добрый день", followup_hours=2.5, reply_delay_minutes=0.5,
+        window_start="07:30", window_end="19:45", **VARIANTS[variant])
+    return panel
+
+
 @pytest.fixture
 def filled(configured, admin):
-    """Все разделы настроек заполнены непохожими на умолчания значениями; включены не все мессенджеры, часовой
-    пояс — не из списка панели (задан до панели, переменной TZ_NAME)."""
-    configured.worker.save(
-        deal_category_id="3", no_messenger_stage="C3:LOST", bitrix_app_token="app-token-1",
-        orbita_channels=["max"], orbita_webhook_secret="whsec_saved",
-        tpl_first="{name}, добрый день!\nЭто первое.", tpl_followup="{name}, напоминаем о {deal_title}",
-        tpl_reply="Спасибо, {name}!", tpl_no_name="Добрый день", followup_on=True, reply_on=True,
-        followup_hours=2.5, reply_delay_minutes=0.5, window_start="07:30", window_end="19:45", tz_name="Etc/GMT-3")
-    return configured
+    return fill(configured)
 
 
 SAVED = ("deal_category_id", "no_messenger_stage", "bitrix_webhook", "bitrix_app_token", "orbita_api_key",
@@ -204,17 +217,18 @@ def saved(panel) -> dict:
     return {k: getattr(s, k) for k in SAVED}
 
 
+@pytest.mark.parametrize("variant", sorted(VARIANTS))
 @pytest.mark.parametrize("action", ["/settings/bitrix", "/settings/orbita", "/settings/messages", "/settings/schedule"])
-def test_form_saved_without_changes_keeps_settings(filled, admin, action):
+def test_form_saved_without_changes_keeps_settings(configured, admin, action, variant):
     """«Сохранить» без правок ничего не меняет: форма показывает сохранённые значения и отправляет их же."""
-    before = saved(filled)
+    before = saved(fill(configured, variant))
     r = submit(admin, action)
     assert r.status_code == 303 and not is_error(r)
-    assert saved(filled) == before
+    assert saved(configured) == before
 
 
 @pytest.mark.parametrize("action, changes, expected", [
-    ("/settings/bitrix", {"stage": "C3:NEW"}, {"no_messenger_stage": "C3:NEW"}),
+    ("/settings/bitrix", {"stage": "C3:LOST"}, {"no_messenger_stage": "C3:LOST"}),
     ("/settings/bitrix", {"webhook": "https://p.bitrix24.ru/rest/1/other"},
      {"bitrix_webhook": "https://p.bitrix24.ru/rest/1/other/"}),
     ("/settings/bitrix", {"app_token": "app-token-2"}, {"bitrix_app_token": "app-token-2"}),
