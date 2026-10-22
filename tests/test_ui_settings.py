@@ -1,6 +1,7 @@
 """Панель: настройки Битрикса, Орбиты, сообщений, расписания; тест, включение, отключение."""
 
 import re
+from html.parser import HTMLParser
 
 import pytest
 
@@ -17,6 +18,71 @@ GOOD_WEBHOOK = "https://p.bitrix24.ru/rest/1/good"
 KEY = "orb_pk_secret123456"
 MESSAGES = {"tpl_first": "{name}, здравствуйте!", "tpl_followup": "x", "tpl_reply": "Спасибо, {name}!",
             "followup_hours": "24", "reply_delay_minutes": "2", "reply_on": "1"}
+
+
+class _Forms(HTMLParser):
+    """Поля форм страницы так, как их отправит браузер: {action: (значения, имена всех полей)}.
+    Непомеченный флажок не отправляется; у списка без selected уходит первый вариант."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms: dict[str, tuple[dict, set]] = {}
+        self._form = self._select = self._textarea = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            self._form = self.forms.setdefault(a.get("action", ""), ({}, set()))
+        elif self._form is None or "name" not in a and tag != "option":
+            return
+        elif tag == "input":
+            values, names = self._form
+            names.add(a["name"])
+            if a.get("type") != "checkbox" or "checked" in a:
+                values[a["name"]] = a.get("value", "")
+        elif tag == "textarea":
+            self._textarea = a["name"]
+            self._form[1].add(a["name"])
+            self._form[0][a["name"]] = ""
+        elif tag == "select":
+            self._select = [a["name"], None, None]       # имя, первый вариант, выбранный
+            self._form[1].add(a["name"])
+        elif tag == "option" and self._select is not None:
+            value = a.get("value", "")
+            if self._select[1] is None:
+                self._select[1] = value
+            if "selected" in a:
+                self._select[2] = value
+
+    def handle_data(self, data):
+        if self._textarea is not None:
+            self._form[0][self._textarea] += data
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self._form = None
+        elif tag == "textarea":
+            self._textarea = None
+        elif tag == "select" and self._select is not None:
+            name, first, chosen = self._select
+            if chosen is not None or first is not None:
+                self._form[0][name] = chosen if chosen is not None else first
+            self._select = None
+
+
+def submit(client, action: str, **changes):
+    """Открыть настройки и отправить форму action, как браузер: поля как на странице, плюс changes (None — снять
+    флажок). Менять можно только поля, которые на странице есть."""
+    parser = _Forms()
+    parser.feed(client.get("/settings").text)
+    values, names = parser.forms[action]
+    assert set(changes) <= names, f"в форме {action} нет полей {set(changes) - names}"
+    for k, v in changes.items():
+        if v is None:
+            values.pop(k, None)
+        else:
+            values[k] = v
+    return client.post(action, data=values, follow_redirects=False)
 
 
 def onboarding_shown(client) -> bool:
@@ -42,6 +108,15 @@ def test_bitrix_webhook_saved_stage_not_yet(panel, admin):
     page = admin.get("/settings").text
     assert 'value="NO_MESSENGER"' in page, "этапы из Битрикса в списке"
     assert "rest/1/good" not in page, "вебхук целиком не показан"
+    assert 'id="stage-problem"' not in page, "этап ещё не выбран — это не ошибка настройки"
+
+
+def test_settings_open_when_bitrix_gives_no_stages(panel, admin):
+    """Битрикс не отдал этапы — страница настроек открывается, а сохранённый этап ошибкой не объявляется:
+    проверить его нечем."""
+    panel.worker.save(bitrix_webhook="https://p.bitrix24.ru/rest/1/nostages/", no_messenger_stage="NO_MESSENGER")
+    r = admin.get("/settings")
+    assert r.status_code == 200 and 'id="stage-problem"' not in r.text
 
 
 def test_bitrix_webhook_saved_when_stages_unavailable(panel, admin):
@@ -77,6 +152,86 @@ def test_orbita_key_channels_secret_saved(panel, admin):
     assert config.load(panel.db).orbita_api_key == KEY, "сохранено в базе"
     page = admin.get("/settings").text
     assert KEY not in page and KEY[:10] in page, "ключ показан только началом"
+    assert "whsec_1" not in page, "секрет вебхуков целиком не показан"
+
+
+@pytest.mark.parametrize("secret", ["Zq9x", "Zq9xW7kP3m", "Zq9xW7kP3mT5vR", "Zq9xW7kP3mT5vRa"])   # 4, 10, 14, 15
+def test_saved_secret_not_shown_whole(panel, admin, secret):
+    """Секреты после сохранения не показываются целиком (ui_settings.py) — при любой длине."""
+    panel.worker.save(bitrix_webhook=f"https://p.bitrix24.ru/rest/1/{secret}/", bitrix_app_token=secret,
+                      orbita_api_key=secret, orbita_webhook_secret=secret)
+    assert secret not in admin.get("/settings").text
+
+
+@pytest.mark.parametrize("headers, base", [
+    ({}, "http://testserver"),
+    ({"X-Forwarded-Proto": "https", "X-Forwarded-Host": "robot.company.ru"}, "https://robot.company.ru"),
+])
+def test_webhook_addresses_shown_for_this_panel(panel, admin, headers, base):
+    """docs/НАСТРОЙКА.md: адреса исходящего вебхука Битрикса и вебхука Орбиты берут из настроек панели."""
+    page = admin.get("/settings", headers=headers).text
+    assert f"{base}/bitrix/deal-add" in page and f"{base}/orbita/webhook" in page
+
+
+def test_message_shown_escaped(admin):
+    """Сообщение после формы приходит в адресе — его может подставить и чужая ссылка: выводится как текст."""
+    page = admin.get("/settings", params={"msg": '!<img src=x onerror="alert(1)">'}).text
+    assert "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;" in page and "<img src=x" not in page
+
+
+# ---------- формы настроек: что на странице, то и сохраняется ----------
+
+@pytest.fixture
+def filled(configured, admin):
+    """Все разделы настроек заполнены непохожими на умолчания значениями; включены не все мессенджеры, часовой
+    пояс — не из списка панели (задан до панели, переменной TZ_NAME)."""
+    configured.worker.save(
+        deal_category_id="3", no_messenger_stage="C3:LOST", bitrix_app_token="app-token-1",
+        orbita_channels=["max"], orbita_webhook_secret="whsec_saved",
+        tpl_first="{name}, добрый день!\nЭто первое.", tpl_followup="{name}, напоминаем о {deal_title}",
+        tpl_reply="Спасибо, {name}!", tpl_no_name="Добрый день", followup_on=True, reply_on=True,
+        followup_hours=2.5, reply_delay_minutes=0.5, window_start="07:30", window_end="19:45", tz_name="Etc/GMT-3")
+    return configured
+
+
+SAVED = ("deal_category_id", "no_messenger_stage", "bitrix_webhook", "bitrix_app_token", "orbita_api_key",
+         "orbita_channels", "orbita_webhook_secret", "tpl_first", "tpl_followup", "tpl_reply", "tpl_no_name",
+         "followup_on", "reply_on", "followup_hours", "reply_delay_minutes", "window_start", "window_end", "tz_name")
+
+
+def saved(panel) -> dict:
+    s = config.load(panel.db)
+    return {k: getattr(s, k) for k in SAVED}
+
+
+@pytest.mark.parametrize("action", ["/settings/bitrix", "/settings/orbita", "/settings/messages", "/settings/schedule"])
+def test_form_saved_without_changes_keeps_settings(filled, admin, action):
+    """«Сохранить» без правок ничего не меняет: форма показывает сохранённые значения и отправляет их же."""
+    before = saved(filled)
+    r = submit(admin, action)
+    assert r.status_code == 303 and not is_error(r)
+    assert saved(filled) == before
+
+
+@pytest.mark.parametrize("action, changes, expected", [
+    ("/settings/bitrix", {"stage": "C3:NEW"}, {"no_messenger_stage": "C3:NEW"}),
+    ("/settings/bitrix", {"webhook": "https://p.bitrix24.ru/rest/1/other"},
+     {"bitrix_webhook": "https://p.bitrix24.ru/rest/1/other/"}),
+    ("/settings/bitrix", {"app_token": "app-token-2"}, {"bitrix_app_token": "app-token-2"}),
+    ("/settings/bitrix", {"app_token_clear": "1"}, {"bitrix_app_token": ""}),
+    ("/settings/orbita", {"place_telegram": "2"}, {"orbita_channels": ["max", "telegram"]}),
+    ("/settings/orbita", {"api_key": "orb_pk_other123456"}, {"orbita_api_key": "orb_pk_other123456"}),
+    ("/settings/orbita", {"webhook_secret": "whsec_new"}, {"orbita_webhook_secret": "whsec_new"}),
+    ("/settings/orbita", {"webhook_secret_clear": "1"}, {"orbita_webhook_secret": ""}),
+    ("/settings/messages", {"followup_on": None, "tpl_reply": "Ответим, {name}"},
+     {"followup_on": False, "tpl_reply": "Ответим, {name}"}),
+])
+def test_form_field_reaches_saved_setting(filled, admin, action, changes, expected):
+    """Поле формы на странице меняет ту настройку, которую называет."""
+    before = saved(filled)
+    r = submit(admin, action, **changes)
+    assert r.status_code == 303 and not is_error(r)
+    assert saved(filled) == {**before, **expected}
 
 
 def places_shown(page: str) -> dict[str, str]:
@@ -242,7 +397,8 @@ def test_saved_closing_stage_is_setup_error(real_bitrix, admin):
     assert 'id="stage-problem"' in admin.get("/settings").text
     r = admin.post("/settings/enable", follow_redirects=False)
     assert is_error(r) and not real_bitrix.s.enabled
-    real_bitrix.worker.save(no_messenger_stage="NO_MESSENGER")
+    assert not is_error(submit(admin, "/settings/bitrix", stage="NO_MESSENGER")), "исправляется в той же форме"
+    assert real_bitrix.s.no_messenger_stage == "NO_MESSENGER"
     assert 'id="stage-problem"' not in admin.get("/settings").text
     admin.post("/settings/enable")
     assert real_bitrix.s.enabled

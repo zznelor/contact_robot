@@ -7,6 +7,7 @@ import pytest
 from conftest import FakeBitrix, FakeOrbita, ago, midday_tz, run
 from first_contact.orbita import Message
 
+from test_auth import process_tz
 from test_ui_auth import is_error
 
 
@@ -25,6 +26,15 @@ def deals(configured):
                                   "/events", "/status", "/account", "/settings", "/team"])
 def test_pages_open(deals, admin, path):
     assert admin.get(path).status_code == 200
+
+
+def test_times_shown_in_robot_timezone(deals, admin):
+    """Время в панели — в часовом поясе из настроек робота, а не машины, где он запущен (ui_base.when)."""
+    deals.worker.save(tz_name="Asia/Novosibirsk")                     # UTC+7
+    deals.db.update(41, first_sent_at="2030-01-02T03:04:00+00:00")
+    with process_tz("UTC"):
+        page = admin.get("/deal/41").text
+    assert "10:04" in page and "03:04" not in page
 
 
 def test_stop_on_replied_cancels_template_reply(deals, admin):
