@@ -57,6 +57,8 @@ def mask(secret: str) -> str:
     """Секрет в интерфейсе — только начало."""
     if not secret:
         return ""
+    if len(secret) <= 3:
+        return "…"                      # «начало» короткого ключа — весь ключ
     return secret[:10] + "…" if len(secret) > 14 else secret[:3] + "…"
 
 

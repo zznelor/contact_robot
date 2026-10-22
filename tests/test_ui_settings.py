@@ -6,7 +6,7 @@ from html.parser import HTMLParser
 import pytest
 
 from conftest import run
-from first_contact import config, ui_settings
+from first_contact import config, ui_base, ui_settings
 from first_contact import worker as worker_mod
 from first_contact.bitrix import Bitrix
 
@@ -161,6 +161,12 @@ def test_saved_secret_not_shown_whole(panel, admin, secret):
     panel.worker.save(bitrix_webhook=f"https://p.bitrix24.ru/rest/1/{secret}/", bitrix_app_token=secret,
                       orbita_api_key=secret, orbita_webhook_secret=secret)
     assert secret not in admin.get("/settings").text
+
+
+@pytest.mark.parametrize("secret", ["k", "k7", "k7Q"])
+def test_short_secret_not_shown_whole(secret):
+    """Секрет в интерфейсе — только начало (ui_base.mask): и у ключа короче 4 символов, где «начало» — весь ключ."""
+    assert secret not in ui_base.mask(secret)
 
 
 @pytest.mark.parametrize("headers, base", [
