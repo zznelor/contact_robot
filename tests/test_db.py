@@ -1,7 +1,10 @@
 """Схема и миграции SQLite (db.py): установка старой версии обновляется при запуске, данные целы."""
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from conftest import PHONE, midday_tz, run
 from first_contact import config
@@ -137,3 +140,40 @@ def test_old_install_reminder_key_reused_retries_with_new_key(bitrix, orbita):
     run(w.retry(303, "a@x.ru"))
     run(w.tick())
     assert [k for _, _, k in orbita.replies] == ["deal-303-followup", "deal-303-followup-r1"]
+
+
+# ---------- поиск сделок ----------
+
+@pytest.mark.parametrize("status, q, ids, total", [
+    ("sent_first", "", [3, 2], 2),
+    ("sent_first", "анна", [2], 1),
+    ("", "анна", [2, 1], 2),
+])
+def test_find_by_status_and_text(status, q, ids, total):
+    """Поиск сделок по статусу, по строке (ID, имя, телефон) и по обоим сразу: (первые, всего), новые первыми."""
+    db = DB(config.env().db_path)
+    for deal_id, st, name in ((1, "new", "Анна"), (2, "sent_first", "Анна"), (3, "sent_first", "Борис")):
+        db.add_deal(deal_id)
+        db.update(deal_id, status=st, name=name)
+    rows, found = db.find(status, q)
+    assert ([r["deal_id"] for r in rows], found) == (ids, total)
+
+
+# ---------- ответ клиента по принятым вебхукам ----------
+
+def received(direction: str, dialog_id: int = 501) -> str:
+    """Тело message.received (спецификация: data — Message, обязательны id, dialog_id, channel, direction)."""
+    return json.dumps({"type": "message.received", "data": {"id": 1, "dialog_id": dialog_id, "channel": "whatsapp",
+                                                            "direction": direction}})
+
+
+@pytest.mark.parametrize("bodies, expected", [
+    ([received("incoming")], True),
+    ([received("outgoing")], False),                    # direction — enum incoming | outgoing: наше — не ответ
+    (["не JSON", received("incoming")], True),          # испорченное тело не скрывает следующее событие
+])
+def test_incoming_since_counts_only_client_messages(bodies, expected):
+    db = DB(config.env().db_path)
+    for n, body in enumerate(bodies):
+        db.accept_event(f"ev-{n}", "message.received", body, "501")
+    assert db.incoming_since("501", "2000-01-01T00:00:00+00:00") is expected
