@@ -10,7 +10,8 @@ from first_contact import config
 from first_contact.bitrix import BitrixError
 from first_contact.orbita import OrbitaError
 from first_contact.worker import RETRYABLE, Worker
-from test_worker import client_writes, due_followup, event, inc, out, passed_without_confirmation
+from test_worker import (client_writes, due_followup, event, inc, journal, notes_of, out,
+                         passed_without_confirmation)
 
 D = 180
 KEY = {"first": f"deal-{D}-first-{PHONE}-whatsapp", "followup": f"deal-{D}-followup", "reply": f"deal-{D}-reply"}
@@ -274,3 +275,100 @@ def test_unfinished_template_reply_late(running, bitrix, orbita, clock, late, re
     else:
         assert sends(orbita, "reply") == [KEY["reply"]]
         assert row["status"] == "needs_check" and row["reply_key"] == KEY["reply"]
+
+
+# Журнал исхода: «мессенджер подтвердил доставку» (напоминание, ответ), причина отказа; при ручном решении —
+# «статус … не меняется» (docs/РАЗРАБОТЧИКУ.md, «Исход отправки по request_key»)
+JOURNAL_CASES = [
+    # step, path, ok, запись с этим в названии события (None — не задана документом), «не меняется»
+    ("first", "needs_check", True, None, False),
+    ("first", "needs_check", False, None, False),
+    ("first", "stop", True, "мессенджер подтвердил доставку", True),
+    ("first", "stop", False, None, True),
+    ("followup", "needs_check", True, "мессенджер подтвердил доставку", False),
+    ("followup", "needs_check", False, None, False),
+    ("followup", "stop", True, "мессенджер подтвердил доставку", True),
+    ("followup", "stop", False, None, True),
+    ("reply", "needs_check", True, "мессенджер подтвердил доставку", False),
+    ("reply", "needs_check", False, None, False),
+    ("reply", "stop", False, None, True),
+]
+
+
+@pytest.mark.parametrize("step, path, ok, named, unchanged", JOURNAL_CASES)
+def test_outcome_recorded_in_deal_journal(running, bitrix, orbita, clock, step, path, ok, named, unchanged):
+    w = reach(running, bitrix, orbita, clock, step, path, ok)
+    entries = journal(w.db, D)
+    if named:
+        assert any(named in e for e, _ in entries)
+    if not ok:
+        assert any("send_failed" in e + d for e, d in entries), "причина отказа — в журнале сделки"
+    assert any("не меняется" in d for _, d in entries) is unchanged
+
+
+@pytest.mark.parametrize("step", ["first", "followup", "reply"])
+def test_failure_reason_shown_in_card(running, bitrix, orbita, clock, step):
+    w = reach(running, bitrix, orbita, clock, step, "needs_check", False)
+    assert "send_failed" in w.db.deal(D)["last_error"]
+
+
+@pytest.mark.parametrize("status", ["no_messenger", "skipped"])
+def test_late_confirmation_does_not_undo_decision_of_new_attempt(worker, status):
+    """«Не нашёл мессенджер» новой попытки или пропуск — решение, которое исход прежней отправки не отменяет;
+    факт доставки записывается."""
+    worker.db.add_deal(D)
+    worker.db.update(D, status=status, request_key="rk-x", pending_at=ago(hours=1).isoformat(timespec="seconds"),
+                     channel="whatsapp", phone=PHONE)
+    run(worker.on_orbita_event(event("message.sent", request_key="rk-x", dialog_id="D1")))
+    row = worker.db.deal(D)
+    assert row["status"] == status and row["first_sent_at"] and not row["request_key"]
+
+
+def test_repeated_confirmation_of_recorded_first_message_releases_key(worker):
+    """Факт доставки уже записан, а ключ ждёт исхода (строка старой версии): исход применён ⇒ ключ снят."""
+    worker.db.add_deal(D)
+    worker.db.update(D, status="sent_first", first_sent_at=ago(hours=1).isoformat(timespec="seconds"),
+                     dialog_id="D1", request_key="rk-old")
+    run(worker.on_orbita_event(event("message.sent", request_key="rk-old", dialog_id="D1")))
+    assert not worker.db.deal(D)["request_key"] and worker.db.outcome("rk-old")["applied_at"]
+
+
+@pytest.mark.parametrize("pending_at", [None, ago(minutes=5).isoformat(timespec="seconds")],
+                         ids=["old_version_row", "no_dialog_in_event"])
+def test_confirmation_without_time_or_dialog_then_reminder(running, bitrix, orbita, clock, pending_at):
+    """Подтверждение без времени отправки и без номера диалога (строка версии до pending_at; событие без
+    dialog_id): первое засчитано, напоминание уходит в свой срок."""
+    running.db.add_deal(D)
+    running.db.update(D, status="needs_check", request_key="rk-old", channel="whatsapp", phone=PHONE,
+                      pending_at=pending_at, dialog_id="D1" if pending_at else None)
+    ev = event("message.sent", request_key="rk-old")
+    if pending_at is None:
+        ev["data"]["dialog_id"] = "D1"
+    run(running.on_orbita_event(ev))
+    assert running.db.deal(D)["status"] == "sent_first"
+    orbita.history_items["D1"] = [out(datetime.now(UTC))]            # наше первое; клиент молчит
+    clock.advance(hours=running.s.followup_hours, minutes=1)
+    run(running.tick())
+    assert running.db.deal(D)["status"] == "sent_followup"
+
+
+def test_outcome_received_before_key_comments_first_message(running, bitrix, orbita, clock):
+    """Исход первого сообщения пришёл раньше, чем робот узнал request_key: при записи ключа — комментарий в сделку."""
+    lost_first_answer(running, bitrix, orbita, True)
+    notes = len(notes_of(bitrix, D))
+    w = Worker(config.env(), running.s, running.db, bitrix, orbita)
+    clock.advance(minutes=3)
+    run(w.tick())
+    assert w.db.deal(D)["status"] == "sent_first" and len(notes_of(bitrix, D)) > notes
+
+
+def test_failure_received_before_key_comments_template_reply(running, bitrix, orbita, clock):
+    """Отказ ответа по шаблону пришёл раньше ключа: при записи ключа — комментарии «передал» и «не доставлен»."""
+    handed_over(running, bitrix, orbita, "reply", "lost")
+    outcome(running, "reply", False)
+    accept_again(orbita, "reply")
+    notes = len(notes_of(bitrix, D))
+    w = Worker(config.env(), running.s, running.db, bitrix, orbita)
+    clock.advance(minutes=3)
+    run(w.tick())
+    assert w.db.deal(D)["status"] == "needs_check" and len(notes_of(bitrix, D)) == notes + 2
