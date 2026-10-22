@@ -867,25 +867,40 @@ class Worker:
         if not self.s.reply_on:
             self.db.update(deal_id, reply_due_at=None)
             return
-        history = await self.orbita.history(row["dialog_id"], _ts(row["first_sent_at"]))
-        client_msg = first_incoming(history, _ts(row["first_sent_at"]))
-        if client_msg is None:
-            self.db.update(deal_id, reply_due_at=None)
-            self.event(deal_id, "ответ по шаблону не нужен", "не нашёл сообщение клиента в истории")
-            return
-        if answered_after(history, client_msg.at):
-            self.db.update(deal_id, reply_due_at=None)
-            self.event(deal_id, "ответ по шаблону не нужен", "менеджер уже ответил")
-            return
-        # Отсечка — от момента, когда робот должен был ответить (сообщение клиента + пауза из настроек), а не
-        # от самого сообщения: иначе при паузе от 30 мин ответ почти никогда не уходил бы. После ручного
-        # «Повторить» — от него, если он позже
-        should_answer_at = max(filter(None, (client_msg.at + timedelta(minutes=self.s.reply_delay_minutes),
-                                             _ts(row["reply_retried_at"]))))
-        if datetime.now(timezone.utc) - should_answer_at > REPLY_MAX_LATE:
-            self.db.update(deal_id, reply_due_at=None)
-            self.event(deal_id, "ответ по шаблону не отправлен", "опоздал с ответом больше чем на 30 мин")
-            return
+        if row["reply_key"]:
+            # Прошлая отправка ответа оборвалась с неизвестным исходом (намерение reply_key сохранено, ответа 201 /
+            # 202 нет): ответ мог уйти, а его исход — уже прийти и ждать ключа. Исход выясняется повтором того же
+            # запроса ДО проверок по истории: в истории этот ответ уже может быть исходящим после сообщения клиента,
+            # и «менеджер уже ответил» отменило бы выяснение навсегда. История направление и время даёт, автора — нет.
+            # REPLY_MAX_LATE — правило для новой отправки, не для выяснения переданной. Граница повтора — 48 ч от
+            # срока ответа (или от ручного «Повторить», что позже), как у первого сообщения: не получи Орбита первый
+            # запрос, повтор и есть отправка. Позже — не отменяем молча (ответ мог уйти), а «проверить вручную»
+            start = max(filter(None, (_ts(row["reply_due_at"]), _ts(row["reply_retried_at"]))))
+            if datetime.now(timezone.utc) - start > MAX_AGE:
+                raise UnknownOutcome("ответ по шаблону: исход прошлой отправки неизвестен, а срок ответа прошёл "
+                                     "больше 48 ч назад — повтор не отправляю")
+        else:
+            history = await self.orbita.history(row["dialog_id"], _ts(row["first_sent_at"]))
+            client_msg = first_incoming(history, _ts(row["first_sent_at"]))
+            if client_msg is None:
+                self.db.update(deal_id, reply_due_at=None)
+                self.event(deal_id, "ответ по шаблону не нужен", "не нашёл сообщение клиента в истории")
+                return
+            if answered_after(history, client_msg.at):
+                # Своих сообщений робота после сообщения клиента здесь нет: незавершённый ответ идёт веткой выше,
+                # завершённый (reply_sent_at) сюда не доходит
+                self.db.update(deal_id, reply_due_at=None)
+                self.event(deal_id, "ответ по шаблону не нужен", "менеджер уже ответил")
+                return
+            # Отсечка — от момента, когда робот должен был ответить (сообщение клиента + пауза из настроек), а не
+            # от самого сообщения: иначе при паузе от 30 мин ответ почти никогда не уходил бы. После ручного
+            # «Повторить» — от него, если он позже
+            should_answer_at = max(filter(None, (client_msg.at + timedelta(minutes=self.s.reply_delay_minutes),
+                                                 _ts(row["reply_retried_at"]))))
+            if datetime.now(timezone.utc) - should_answer_at > REPLY_MAX_LATE:
+                self.db.update(deal_id, reply_due_at=None)
+                self.event(deal_id, "ответ по шаблону не отправлен", "опоздал с ответом больше чем на 30 мин")
+                return
         res = await self._send_step(row, "reply", self.render("reply", row["name"] or ""), "ответ по шаблону")
         sent = dict(reply_sent_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), reply_due_at=None,
                     attempts=0)

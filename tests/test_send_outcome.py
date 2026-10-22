@@ -8,6 +8,7 @@ import pytest
 from conftest import PHONE, UTC, ago, run
 from first_contact import config
 from first_contact.bitrix import BitrixError
+from first_contact.orbita import OrbitaError
 from first_contact.worker import RETRYABLE, Worker
 from test_worker import client_writes, due_followup, event, inc, out, passed_without_confirmation
 
@@ -54,11 +55,15 @@ def accept_again(orbita, step):
 
 
 def step_fails(w, bitrix, orbita, step):
-    """Шаг падает до отправки (Битрикс или история Орбиты недоступны)."""
+    """Шаг падает: Битрикс недоступен до отправки; ответ по шаблону с незавершённой отправкой Битрикс и историю не
+    читает (повтор идёт сразу) — у него Орбита недоступна на отправке, исход повтора неизвестен."""
     async def down(*a):
         raise BitrixError("HTTP 503")
+
+    async def orbita_down(*a):
+        raise OrbitaError("HTTP 503: Орбита недоступна")
     if step == "reply":
-        orbita.history = down
+        orbita.send_reply = orbita_down
     else:
         bitrix.get_deal = down
 
@@ -95,7 +100,7 @@ def reach(w, bitrix, orbita, clock, step, path, ok):
                 clock.advance(minutes=20)
             assert w.db.deal(D)["status"] == "error"
             vars(bitrix).pop("get_deal", None)
-            vars(orbita).pop("history", None)
+            vars(orbita).pop("send_reply", None)
     outcome(w, step, ok)
     return w
 
@@ -228,3 +233,44 @@ def test_unfinished_first_send_older_than_48h_goes_to_human(running, bitrix, orb
     row = running.db.deal(D)
     assert row["status"] == "needs_check" and row["intent_key"] == KEY["first"]
     assert orbita.keys == [KEY["first"]]
+
+
+@pytest.mark.parametrize("ok", [True, False], ids=["sent", "failed"])
+def test_unfinished_template_reply_restored_although_own_message_in_history(running, bitrix, orbita, clock, ok):
+    """Ответ по шаблону: Орбита приняла запрос, ответ потерян; исход пришёл раньше, чем робот узнал request_key, а
+    в истории диалога после сообщения клиента уже есть исходящее — это сам ответ робота, а не менеджера. Повтор того
+    же запроса выясняет request_key, и исход сопоставляется: свой ответ не отменяет его как «менеджер уже ответил»."""
+    handed_over(running, bitrix, orbita, "reply", "lost")
+    row = running.db.deal(D)
+    assert row["reply_key"] == KEY["reply"] and not row["reply_request_key"]
+    orbita.history_items["D1"].append(out(datetime.now(UTC)))
+    outcome(running, "reply", ok)
+    accept_again(orbita, "reply")
+    w = Worker(config.env(), running.s, running.db, bitrix, orbita)
+    clock.advance(minutes=3)
+    run(w.tick())
+
+    row = w.db.deal(D)
+    assert w.db.outcome(f"rk-{KEY['reply']}")["applied_at"], "исход сопоставлен с отправкой"
+    assert bool(row["reply_sent_at"]) is ok
+    assert row["status"] == ("replied" if ok else "needs_check")
+    assert not row["reply_request_key"]
+    assert sends(orbita, "reply") == [KEY["reply"], KEY["reply"]], "повтор — тот же запрос"
+
+
+@pytest.mark.parametrize("late, resent", [({"minutes": 40}, True), ({"hours": 49}, False)], ids=["40min", "49h"])
+def test_unfinished_template_reply_late(running, bitrix, orbita, clock, late, resent):
+    """Незавершённый ответ по шаблону, а робот вернулся к нему позже 30 минут от срока ответа: отсечка «опоздал»
+    отменяет новую отправку, а не выяснение переданной — повтор тем же ключом. Позже 48 ч повтор мог бы стать первой
+    отправкой спустя двое суток — его нет, но и молча отменять нельзя: ответ мог уйти. «Проверить вручную»."""
+    handed_over(running, bitrix, orbita, "reply", "lost")
+    accept_again(orbita, "reply")
+    clock.advance(**late)
+    run(running.tick())
+    row = running.db.deal(D)
+    if resent:
+        assert sends(orbita, "reply") == [KEY["reply"], KEY["reply"]]
+        assert row["status"] == "replied" and row["reply_request_key"] == f"rk-{KEY['reply']}"
+    else:
+        assert sends(orbita, "reply") == [KEY["reply"]]
+        assert row["status"] == "needs_check" and row["reply_key"] == KEY["reply"]
