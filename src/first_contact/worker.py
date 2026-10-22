@@ -352,8 +352,11 @@ class Worker:
                 fields.update(followup_sent_at=None)
             elif not row["followup_key"]:
                 fields["followup_retry_n"] = (row["followup_retry_n"] or 0) + 1
-        if status == "replied" and self.s.reply_on and \
-                (reply_unconfirmed or (not row["reply_sent_at"] and row["reply_due_at"])):
+        # Ответ по шаблону не ушёл (или не подтверждён) — планируется заново, в том числе после «Остановить», которое
+        # сняло план: решение человека — продолжить. В retryable-статус с ответом клиента сделка попадает только с
+        # неотправленным ответом шага робота (сбои, таймаут, отказ, остановка): «не нужен» и «опоздал» оставляют
+        # replied, который «Повторить» не берёт.
+        if status == "replied" and self.s.reply_on and (reply_unconfirmed or not row["reply_sent_at"]):
             # Ручной повтор продлевает срок: ответ уходит, даже если с сообщения клиента прошло больше 30 мин
             fields.update(reply_due_at=now(), reply_retried_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                           reply_sent_at=None)

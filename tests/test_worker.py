@@ -14,7 +14,7 @@ from first_contact import worker as worker_mod
 from first_contact.app import create_app
 from first_contact.auth import Users
 from first_contact.bitrix import BitrixError
-from first_contact.orbita import FirstSendResult, Message
+from first_contact.orbita import FirstSendResult, Message, OrbitaError
 from first_contact.orbita_api import OrbitaAPIError
 from first_contact.worker import Worker, render
 
@@ -1039,6 +1039,35 @@ def test_stop_cancels_template_reply_of_failing_deal(replying, bitrix, orbita, c
     run(replying.stop(234, "a@x.ru"))
     row = replying.db.deal(234)
     assert row["status"] == "skipped" and not row["reply_due_at"]
+
+
+@pytest.mark.parametrize("refused, key", [(False, "deal-242-reply"), (True, "deal-242-reply-r1")],
+                         ids=["outcome_unknown", "refused"])
+def test_retry_after_stop_of_failing_template_reply_sends_it(replying, bitrix, orbita, clock, refused, key):
+    """Ответ по шаблону раз за разом не уходит — «ошибка»; оператор нажал «Остановить», затем, спустя часы после
+    сообщения клиента, «Повторить». Ответ не ушёл — он планируется заново, срок продлён от повтора. Исход последней
+    отправки неизвестен (обрыв связи) — тот же ключ; на последней Орбита отказала определённо (4xx) — новый -r1."""
+    async def failing(dialog_id, text, k):
+        orbita.replies.append((dialog_id, text, k))
+        if refused and len(orbita.replies) == 5:
+            raise OrbitaAPIError(403, "forbidden", {"code": "forbidden"})
+        raise OrbitaError("POST /messages: ReadTimeout: ответ не дошёл")
+    orbita.send_reply = failing
+    client_writes(replying, bitrix, orbita, 242, lambda first: [out(first), inc(datetime.now(UTC))])
+    for _ in range(5):
+        run(replying.tick())
+        clock.advance(hours=1)
+    assert replying.db.deal(242)["status"] == "error"
+    run(replying.stop(242, "a@x.ru"))
+    vars(orbita).pop("send_reply", None)
+    orbita.reply_mode = "sent"
+
+    sent_before = len(orbita.replies)
+    assert run(replying.retry(242, "a@x.ru")) == "replied"
+    run(replying.tick())
+    row = replying.db.deal(242)
+    assert [k for _, _, k in orbita.replies[sent_before:]] == [key]
+    assert row["status"] == "replied" and row["reply_sent_at"] and not row["manual_stop_at"]
 
 
 def test_stop_after_unconfirmed_reply_survives_late_failure(replying, bitrix, orbita, clock):
