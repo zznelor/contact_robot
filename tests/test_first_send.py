@@ -168,3 +168,18 @@ def test_retry_after_lost_answer_repeats_whole_original_request(robot, bitrix, c
     run(w.tick())
     assert w.db.deal(147)["status"] == "sent_first"
     assert len(orbita.posts) == 2
+    assert orbita.bodies[orbita.posts[0][1]].get("name") == "Анна", "имя контакта — в поле name запроса"
+
+
+def test_retry_after_lost_answer_for_contact_without_name(robot, bitrix, clock):
+    """У контакта нет имени: запрос уходит без name, и повтор после потерянного ответа — тоже без него (тело то же,
+    Орбита возвращает исход первого вызова, а не idempotency_key_reused)."""
+    bitrix.name = ""
+    orbita = Orbita({"whatsapp"}, {"whatsapp": "lost"})
+    w = robot(orbita, ["whatsapp"])
+    bitrix.new_ids.append(148)
+    run(w.tick())
+    clock.advance(minutes=3)
+    run(w.tick())
+    assert w.db.deal(148)["status"] == "sent_first"
+    assert "name" not in orbita.bodies[orbita.posts[0][1]]
